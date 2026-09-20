@@ -27,6 +27,10 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Read-only network-state check: lets the app detect offline mode and
+         strip the cloud-only recognizer extras (language auto-detect) that
+         fail without connectivity. No data leaves the device. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- File access for model loading from public Downloads directory (Android 10 and below) -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
     <!-- Android 11+ all-files access for reading model from Downloads -->

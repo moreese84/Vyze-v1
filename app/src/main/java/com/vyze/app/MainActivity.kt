@@ -22,6 +22,8 @@ import android.util.Log
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -1226,6 +1228,29 @@ class MainActivity : AppCompatActivity() {
         return stored.takeIf { it.language == "ms" || it.language == "zh" }
     }
 
+    /**
+     * True when the device has no usable connectivity. Gates the cloud-only
+     * recognizer extras (EXTRA_ENABLE_LANGUAGE_DETECTION / _SWITCH): those
+     * are server-side features that fail the whole session offline (network
+     * error → silence), so offline sessions run the on-device acoustic model
+     * instead — with the app's own detectLocaleFromText as the language
+     * authority. Requires VALIDATED, not just a connected interface: an
+     * unvalidated network fails Google's cloud recognizer all the same.
+     *
+     * Conservative by design: any ConnectivityManager absence or anomaly
+     * counts as offline — the on-device path is the safe fallback.
+     */
+    private fun isDeviceOffline(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return true
+        val caps = try {
+            cm.getNetworkCapabilities(cm.activeNetwork) ?: return true
+        } catch (_: SecurityException) {
+            return true
+        }
+        return !(caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+    }
+
     // ── Transcript plausibility helpers (Phase 3) ─────────────────
 
     /**
@@ -1380,11 +1405,28 @@ class MainActivity : AppCompatActivity() {
                         RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE,
                         SUPPORTED_RECOGNITION_LANGUAGES
                     )
+                    // ── OFFLINE GATE ────────────────────────────────────
+                    // The language auto-detect/switch extras are a SERVER-side
+                    // feature of Google's recognizer: offline they fail the
+                    // whole session (network/server error → silence). When
+                    // the device has no connectivity, strip them and prefer
+                    // the on-device acoustic model; the app's own
+                    // detectLocaleFromText (which runs on every result anyway)
+                    // is the language authority offline. This restores the
+                    // pre-Jev-era offline behavior: English recognition via
+                    // the device's downloaded offline pack, with the Gemma
+                    // model-ASR rescue covering what the pack cannot.
+                    val offline = isDeviceOffline()
+                    if (offline) {
+                        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+                        Log.i(TAG, "OFFLINE MODE: recognizer extras stripped to on-device path")
+                        CrashLogFile.log(TAG, "OFFLINE RECOGNIZER: prefer-offline, auto-detect extras skipped")
+                    }
                     // API 34+: ask the engine to auto-detect the spoken
                     // language from the supported set (en-US, ms-MY, zh-CN)
                     // and switch mid-session — this is what makes first-contact
                     // Malay/Chinese queries work on English-default phones.
-                    if (android.os.Build.VERSION.SDK_INT >= 34) {
+                    if (android.os.Build.VERSION.SDK_INT >= 34 && !offline) {
                         putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
                         putExtra(
                             RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,

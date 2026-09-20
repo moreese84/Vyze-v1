@@ -46,6 +46,14 @@ class TranscriptAutoExportProvider : ContentProvider() {
             } catch (t: Throwable) {
                 android.util.Log.w(TAG, "Auto-export crashed: ${t.javaClass.simpleName}: ${t.message}")
             }
+            // Also dump the app's own recent logcat — the failing session's
+            // flow logs (TTS/ASR/VLM) survive in the ring buffer and land in
+            // Downloads for diagnosis without adb.
+            try {
+                DiagnosticsLogExporter.exportToDownloads(appContext)
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "Diag export crashed: ${t.javaClass.simpleName}: ${t.message}")
+            }
         }
         return true
     }
