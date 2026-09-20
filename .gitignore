@@ -87,3 +87,6 @@ tools/*
 # AI-tool local config dirs
 .commandcode/
 .claude/
+
+# Secrets — never commit (Typesafe API key etc.)
+.env

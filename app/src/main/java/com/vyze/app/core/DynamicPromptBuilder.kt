@@ -124,7 +124,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 // block, never adjacent to the generation boundary.
                 sb.appendLine("Recent conversation (context only — never repeat, echo, or quote these lines):")
                 sb.appendLine(dialogueContext)
-                sb.appendLine("This is a follow-up in an ongoing conversation. Resolve words like 'it', 'that', 'the one' using the conversation above. Answer the follow-up directly in the user's language — do NOT re-describe the whole scene, and NEVER repeat or echo the user's question at the start of your answer.")
+                sb.appendLine("This is a follow-up in an ongoing conversation. Resolve words like 'it', 'that', 'the one' using the conversation above. Answer the follow-up directly in the language named in the [OUTPUT LANGUAGE] tag — do NOT re-describe the whole scene, and NEVER repeat or echo the user's question at the start of your answer.")
                 sb.appendLine()
             }
 
@@ -516,20 +516,40 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
          * REMEMBER line, AND in the engine/agent system directives
          * (VlmEngineManager, VyzeMasterAgent) so no refactor can silently
          * drop it again.
+         *
+         * TAG-AUTHORITY FIX (v3): the old wording made the QUERY's detected
+         * language the authority ("detect the language of the user's query").
+         * In the ASR-garble rescue path the detector says Malay (correct) but
+         * the garbled query TEXT reads like English — the 2B model followed
+         * the query text, answered English, and the Malay TTS voice read it
+         * with a Malay accent (user-reported). The [OUTPUT LANGUAGE] tag is
+         * now the SINGLE authority in this path; query-mirroring is only the
+         * fallback for prompts without a tag (agent lanes).
          */
         private const val LANGUAGE_MIRRORING_MANDATE =
-            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and " +
-            "respond strictly in that exact same language (e.g., Malay query -> Malay " +
-            "response, English query -> English response, Chinese query -> Chinese " +
-            "response). Never revert to default English if the user speaks another language."
+            "LANGUAGE MIRRORING: Respond in the language named in the " +
+            "[OUTPUT LANGUAGE] tag — the tag is the authority on the answer " +
+            "language. If no tag is present, detect the language of the user's " +
+            "query and respond strictly in that exact same language (e.g., " +
+            "Malay query -> Malay response, English query -> English response, " +
+            "Chinese query -> Chinese response). Never revert to default English " +
+            "if the user speaks another language. Even when the query text " +
+            "itself reads like English, the tag names the user's actual spoken " +
+            "language — answer in the tag's language."
 
         /**
          * Output contract placed DIRECTLY under the current query — the last
          * words the model reads before the generation boundary, where the
          * echo behavior used to trigger.
+         *
+         * TAG-AUTHORITY FIX (v3): says the [OUTPUT LANGUAGE] tag, not "the
+         * user's language" — sitting directly under a garbled English-looking
+         * query, "the user's language" re-invoked exactly the query-text
+         * reading the mandate fix removes.
          */
         private const val TASK_OUTPUT_CONTRACT =
             "Respond with the answer only: never repeat, echo, or quote the question, " +
-            "never restate the task, and write every word in the user's language."
+            "never restate the task, and write every word in the language named in " +
+            "the [OUTPUT LANGUAGE] tag."
     }
 }

@@ -133,6 +133,7 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
                 "lane": lane_of(item),
                 "audit_echoed_noul": None, "audit_language_match_noul": None,
                 "audit_relevance_level": None, "audit_relevance_probabilities": None,
+                "jev_query_language": None, "jev_query_language_confidence": None,
                 "error": "dry-run",
             })
         return rows
@@ -159,6 +160,7 @@ def audit_transcripts(items: list[dict], *, live: bool, model: str = MODEL_DEFAU
                     "audit_echoed_noul": None, "audit_language_match_noul": None,
                     "audit_relevance_level": None,
                     "audit_relevance_probabilities": None,
+                    "jev_query_language": None, "jev_query_language_confidence": None,
                     "echoed_flag": None, "language_mismatch_flag": None,
                     "error": f"{type(exc).__name__}: {exc}"[:300],
                 })

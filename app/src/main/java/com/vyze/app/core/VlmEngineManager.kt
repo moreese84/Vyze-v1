@@ -1807,10 +1807,14 @@ class VlmEngineManager(
             "If past conversation turns are provided, refer to them when relevant. " +
             "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the start " +
             "of your response. Begin immediately with the direct answer. " +
-            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
-            "strictly in that exact same language (Malay query -> Malay response, English " +
-            "query -> English response, Chinese query -> Chinese response). Never revert to " +
-            "default English if the user speaks another language. " +
+            "LANGUAGE MIRRORING: Respond in the language named in the [OUTPUT LANGUAGE] " +
+            "tag of the user's instructions — the tag is the authority on the answer " +
+            "language. Even when the query text itself reads like English, the tag names " +
+            "the user's actual spoken language — answer in the tag's language. If no tag " +
+            "is present, detect the language of the user's query and respond strictly in " +
+            "that exact same language (Malay query -> Malay response, English query -> " +
+            "English response, Chinese query -> Chinese response); Never revert to default " +
+            "English if the user speaks another language. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
@@ -1845,6 +1849,16 @@ class VlmEngineManager(
          * turn via [perspectiveClauseFor] in the ACTIVE language; the
          * `[OUTPUT LANGUAGE: …]` / `REMEMBER: Respond only in …` wrappers from
          * DynamicPromptBuilder stay strictly enforced on every turn.
+         *
+         * TAG-AUTHORITY FIX (v3): both directives below make the
+         * [OUTPUT LANGUAGE] tag the single authority on answer language. The
+         * old "detect the language of the user's query" wording conflicted
+         * with the tag in the ASR-garble rescue path — detector says Malay,
+         * garbled query text reads English, and the 2B model followed the
+         * query text: English answer, Malay TTS voice (user-reported "English
+         * with a Malay accent"). The tag is always present here because
+         * VlmEngineManager only ever receives DynamicPromptBuilder output,
+         * which opens with it.
          */
         private const val SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
@@ -1868,11 +1882,15 @@ class VlmEngineManager(
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
             "number signs, underscores, or emoji, and never use lists or headings. " +
             "Write plain spoken sentences only. " +
-            "LANGUAGE MIRRORING: You MUST detect the language of the user's query and respond " +
-            "strictly in that exact same language (Malay query -> Malay response, English " +
-            "query -> English response, Chinese query -> Chinese response). Never revert to " +
-            "default English if the user speaks another language. " +
-            "On follow-up turns answer only what is new, in the user's language, and never " +
+            "LANGUAGE MIRRORING: Respond in the language named in the [OUTPUT LANGUAGE] " +
+            "tag of the user's instructions — the tag is the authority on the answer " +
+            "language. Even when the query text itself reads like English, the tag names " +
+            "the user's actual spoken language — answer in the tag's language. If no tag " +
+            "is present, detect the language of the user's query and respond strictly in " +
+            "that exact same language (Malay query -> Malay response, English query -> " +
+            "English response, Chinese query -> Chinese response); Never revert to default " +
+            "English if the user speaks another language. " +
+            "On follow-up turns answer only what is new, in the tag's language, and never " +
             "speak the user's question back to them. " +
             "Describe what you see directly without cross-translating or outputting " +
             "internal reasoning chains."

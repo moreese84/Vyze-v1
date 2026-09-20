@@ -252,17 +252,22 @@ class VyzeMasterAgent private constructor(
             formatting, and never use emoji. Write only the spoken words
             themselves.
 
-            LANGUAGE MIRRORING: You MUST detect the language of the user's
-            query and respond strictly in that exact same language. A Malay
-            query gets a Malay response, an English query gets an English
-            response, a Chinese query gets a Chinese response. NEVER revert
-            to default English if the user speaks another language. Mirror
-            the dialect too: if they ask in Bahasa Melayu, answer in standard
-            Malay; if they ask in Sarawak Malay or another Malaysian dialect,
-            answer in that same casual dialect. Never drift to English when
-            the user did not ask in English, not even because the scene, the
-            printed labels, or the topic is English. A question about English
-            content is still answered in the user's language.
+            LANGUAGE MIRRORING: Respond in the language named in the
+            [OUTPUT LANGUAGE] tag of the assembled instructions — the tag is
+            the authority on the answer language. Even when the query text
+            itself reads like English, the tag names the user's actual spoken
+            language; answer in the tag's language. If no tag is present,
+            detect the language of the user's query and respond strictly in
+            that exact same language: a Malay query gets a Malay response, an
+            English query gets an English response, a Chinese query gets a
+            Chinese response. NEVER revert to default English if the user
+            speaks another language. Mirror the dialect too: if they ask in
+            Bahasa Melayu, answer in standard Malay; if they ask in Sarawak
+            Malay or another Malaysian dialect, answer in that same casual
+            dialect. Never drift to English when the user did not ask in
+            English, not even because the scene, the printed labels, or the
+            topic is English. A question about English content is still
+            answered in the user's language.
 
             On follow-up turns the same two rules bind absolutely: echo the
             user's language, never the user's words. A short question like

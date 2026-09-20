@@ -100,3 +100,37 @@ RELEVANCE_LEVELS = [
 
 # Ordered levels → numeric value for averaging (0 = irrelevant, 2 = direct).
 RELEVANCE_NUMERIC = {level: idx for idx, level in enumerate(RELEVANCE_LEVELS)}
+
+# Choice criteria for the query-language (langid) judgment in the audit
+# pass. Vyze's mirror contract covers exactly these three languages; the
+# exporter emits the same vocabulary (InteractionLogRow.inferLanguage), so
+# Jev labels drop straight into the per-language compliance buckets. A
+# tap-lane screen instruction carries no spoken language; 'unknown' is the
+# explicit no-match outcome per the TypeSafe candidate-coverage rule.
+QUERY_LANGUAGE_CRITERIA = {
+    "en": (
+        "English: Latin script with English vocabulary or English question "
+        "forms (what, where, is, the)."
+    ),
+    "ms": (
+        "Malay (Bahasa Malaysia): Latin script with Malay vocabulary or "
+        "question forms (apa, ini, itu, saya, mana, baca). Includes ASR "
+        "garble of Malay speech whose tokens are not plausible English."
+    ),
+    "zh": (
+        "Chinese: Han script (CJK characters), or romanized Mandarin "
+        "utterances that are not plausible English or Malay."
+    ),
+    "unknown": (
+        "No spoken language to identify: a screen-tap instruction, pure "
+        "numbers/symbols, or text with no decidable language evidence."
+    ),
+}
+
+# Jev Choice confidence below which a langid label is treated as AMBIGUOUS:
+# the row cannot be graded for mirror compliance because neither a match
+# nor a mismatch is decidable evidence. This is a run parameter, NOT a
+# universal rule — sweep it on real corpora (the baseline device audit put
+# genuinely ambiguous garble at 0.31 and confident labels at 0.98+, so the
+# midpoint bar cleanly separates them).
+LANGID_CONFIDENCE_BAR = 0.5

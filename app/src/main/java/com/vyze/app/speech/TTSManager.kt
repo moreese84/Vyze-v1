@@ -207,6 +207,15 @@ class TTSManager private constructor(context: Context) {
      * connection — always safest from the main looper.
      */
     private fun bootstrapEngine() {
+        // Self-heal: a teardown path (onDestroy on the shared singleton) can
+        // leave isInitialized=false while the stale engine reference still
+        // blocks reconstruction below. Rebuild the engine so onInit fires
+        // again — otherwise every speak() buffers forever and the app is mute.
+        if (engine != null && !isInitialized && !engineInitInFlight) {
+            Log.w(TAG, "bootstrapEngine: stale de-initialized engine — rebuilding")
+            try { engine?.shutdown() } catch (_: Throwable) {}
+            engine = null
+        }
         if (engine != null || engineInitInFlight) return
         engineInitInFlight = true
         mainHandler.post {

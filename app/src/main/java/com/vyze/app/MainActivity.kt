@@ -845,7 +845,10 @@ class MainActivity : AppCompatActivity() {
      * Detect language from transcribed text using Unicode character ranges.
      * Fallback for devices where SpeechRecognizer doesn't return EXTRA_LANGUAGE.
      */
-    private fun detectLocaleFromText(text: String): java.util.Locale {
+    private fun detectLocaleFromText(
+        text: String,
+        rescueImplausibleAsMsZh: Boolean = false,
+    ): java.util.Locale {
         if (text.isBlank()) return java.util.Locale.US
 
         val lower = text.lowercase()
@@ -1029,7 +1032,37 @@ class MainActivity : AppCompatActivity() {
             return java.util.Locale("ms", "MY")
         }
 
-        // ── Step 3: Fallback — device default locale ────────────
+        // ── Step 3: Implausible-transcript rescue (garble, no English skeleton) ─
+        // First-contact hole: the locale-protection tier downstream
+        // (lastSpokenMsZhLocale) can only rescue a garbled transcript AFTER a
+        // ms/zh query has already succeeded this session. On the VERY FIRST
+        // query — the reported "broke again" case — there is no spoken ms/zh
+        // history, so old Step 3 fell through to the DEVICE default (en-US on
+        // English-default phones) and the answer came back English.
+        // The suspect-ladder's implausibility gate already encodes exactly the
+        // evidence we need (no ms/zh text signal AND no English function-word
+        // skeleton ≤ 6 words = force-translated Malay phonemes), so reuse it
+        // here: hand the ms locale onward instead of the device default. The
+        // prompt directives make the model mirror the QUERY, so a Malay-intent
+        // locale with garbled query text still yields a Malay answer (verified
+        // by ir_7: ASR garble "APA Ini" → correct Malay output once the locale
+        // said ms). English with an intact English skeleton is untouched.
+        //
+        // GATED to the main delivery path (rescueImplausibleAsMsZh=true):
+        // other call sites must keep the old fallback. isAmbientChat relies on
+        // this detector saying "not ms/zh" to drop low-confidence ENGLISH
+        // chatter — a garble rescue there would wave real chatter through as
+        // Malay. The Gemma model-ASR rescue/replay paths keep it too: Gemma's
+        // transcription is itself the best language evidence, and changing
+        // only the directive language on a garbled Gemma transcript helps
+        // nothing.
+        if (rescueImplausibleAsMsZh && isImplausibleEnglishTranscript(text)) {
+            Log.d(TAG, "detectLocaleFromText: no ms/zh signal but implausible English " +
+                "garble → last spoken ms/zh (${lastSpokenMsZhLocale()}) or ms-MY")
+            return lastSpokenMsZhLocale() ?: java.util.Locale("ms", "MY")
+        }
+
+        // ── Step 4: Fallback — device default locale ────────────
         val deviceLocale = java.util.Locale.getDefault()
         Log.d(TAG, "detectLocaleFromText: no strong signal → device default $deviceLocale")
         return deviceLocale
@@ -1634,7 +1667,7 @@ class MainActivity : AppCompatActivity() {
                 // 2. SpeechRecognizer returns 'en' even for Malay/Chinese speech
                 //    (common on English-default phones where the recognizer ignores
                 //     the EXTRA_LANGUAGE_PREFERENCE hint)
-                val textDetectedLocale = detectLocaleFromText(bestMatch)
+                val textDetectedLocale = detectLocaleFromText(bestMatch, rescueImplausibleAsMsZh = true)
                 val finalLocale = if (detectedLocale != null &&
                     detectedLocale.language in listOf("ms", "zh")
                 ) {
@@ -1813,6 +1846,13 @@ class MainActivity : AppCompatActivity() {
          * where, this, ...). The garble plausibility test requires the
          * transcript to contain at least one of these — real questions do;
          * force-translated Malay phonemes ("any uppa", "inni apa") rarely do.
+         *
+         * NOTE (mirroring fix review): Vyze domain words ("read", "look",
+         * "front", ...) deliberately STAY in this set. Removing them would
+         * reclassify terse real-English commands ("read label") as garble;
+         * garble that lands ON a domain word is instead caught by the
+         * suspect ladder's low-confidence trigger (SUSPECT_TRANSCRIPT_CONFIDENCE
+         * band — where English-model transcriptions of ms/zh speech land).
          */
         private val ENGLISH_FUNCTION_WORDS = setOf(
             "the", "is", "are", "what", "where", "when", "who", "how",

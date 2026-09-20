@@ -9,6 +9,10 @@
 
         adb shell am broadcast \
             -n com.vyze.app/.debug.InteractionLogExportReceiver
+
+    The provider auto-exports the same transcripts to PUBLIC Downloads at
+    every cold app start, for users who move files by USB transfer
+    (no adb). It is a no-op without the storage grant.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
@@ -22,6 +26,17 @@
         <receiver
             android:name="com.vyze.app.debug.InteractionLogExportReceiver"
             android:exported="true" />
+
+        <!--
+            Auto-export provider (debug only). initOrder default; no
+            authorities — every stub method returns null/0, nothing can
+            query it. Multiprocess=false (default) keeps the export in the
+            main process.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.TranscriptAutoExportProvider"
+            android:authorities="${applicationId}.debug.transcriptautoexport"
+            android:exported="false" />
     </application>
 
 </manifest>

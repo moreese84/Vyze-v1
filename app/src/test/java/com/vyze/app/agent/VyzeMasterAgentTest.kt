@@ -106,6 +106,10 @@ class VyzeMasterAgentTest {
     fun `master instruction carries the mandatory language mirroring rule`() {
         val i = VyzeMasterAgent.MASTER_INSTRUCTION.replace(Regex("\\s+"), " ").lowercase()
         assertTrue(i.contains("language mirroring"))
+        // TAG-AUTHORITY (v3): the [OUTPUT LANGUAGE] tag outranks the query
+        // text — the garble-rescue path depends on this precedence.
+        assertTrue(i.contains("the tag is the authority"))
+        assertTrue(i.contains("even when the query text itself reads like english"))
         assertTrue(i.contains("respond strictly in that exact same language"))
         assertTrue(i.contains("never revert to default english"))
     }
@@ -117,6 +121,9 @@ class VyzeMasterAgentTest {
         for (d in listOf(persona, style)) {
             assertTrue(d.contains("NEVER repeat, echo, or quote the user's query or question"))
             assertTrue(d.contains("LANGUAGE MIRRORING"))
+            // TAG-AUTHORITY (v3): tag outranks query text in both directives.
+            assertTrue(d.contains("the tag is the authority on the answer language"))
+            assertTrue(d.contains("Even when the query text itself reads like English"))
             assertTrue(d.contains("Never revert to default English"))
         }
     }

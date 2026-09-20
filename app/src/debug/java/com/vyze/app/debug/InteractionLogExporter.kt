@@ -44,7 +44,25 @@ object InteractionLogExporter {
      */
     suspend fun export(context: Context): File? {
         val db = VyzeDatabase.getInstance(context)
+        val rows = collectRows(db)
+        if (rows.isEmpty()) return null
 
+        val dir = File(context.getExternalFilesDir(null), "jev_export")
+        if (!dir.exists() && !dir.mkdirs()) {
+            Log.w(TAG, "Export: cannot create ${dir.absolutePath}")
+            return null
+        }
+        val outFile = File(dir, "interactions_${System.currentTimeMillis()}.jsonl")
+        return writeRows(rows, outFile)
+    }
+
+    /**
+     * Collect + thread all exportable rows (SHARED pipeline). Both the
+     * app-scoped export (adb pull) and the Downloads export (USB transfer)
+     * build rows through here, so the two outputs are always identical
+     * apart from their location.
+     */
+    suspend fun collectRows(db: VyzeDatabase): List<InteractionLogRow> {
         // Source 1: interaction_records (camera/VLM lane). The stored
         // `prompt` is the FULL built prompt; only rows whose built prompt
         // carries the raw spoken query are usable, so marker-less rows
@@ -95,7 +113,7 @@ object InteractionLogExporter {
 
         if (stamped.isEmpty()) {
             Log.i(TAG, "Export: no speech interactions recorded yet — nothing to write")
-            return null
+            return emptyList()
         }
 
         // Newest-first sources → chronological order, then thread dialogue
@@ -105,32 +123,27 @@ object InteractionLogExporter {
         val sorted = stamped.sortedBy { it.ts }.take(MAX_ROWS)
         var lastTs = Long.MIN_VALUE
         var lastQuery: String? = null
-        val rows = sorted.map { s ->
+        return sorted.map { s ->
             val adjacent = lastQuery != null && (s.ts - lastTs) in 1..ADJACENCY_WINDOW_MS
             val row = if (adjacent) s.row.copy(previous = lastQuery) else s.row
             lastTs = s.ts
             lastQuery = s.row.query
             row
         }
+    }
 
-        val dir = File(context.getExternalFilesDir(null), "jev_export")
-        if (!dir.exists() && !dir.mkdirs()) {
-            Log.w(TAG, "Export: cannot create ${dir.absolutePath}")
-            return null
-        }
-        val outFile = File(dir, "interactions_${System.currentTimeMillis()}.jsonl")
-        return try {
-            outFile.bufferedWriter(Charsets.UTF_8).use { w ->
-                for (row in rows) {
-                    w.write(row.toJson())
-                    w.write("\n")
-                }
+    /** Write rows to a file — shared writer for both export targets. */
+    private fun writeRows(rows: List<InteractionLogRow>, outFile: File): File? = try {
+        outFile.bufferedWriter(Charsets.UTF_8).use { w ->
+            for (row in rows) {
+                w.write(row.toJson())
+                w.write("\n")
             }
-            Log.i(TAG, "Export: wrote ${rows.size} rows → ${outFile.absolutePath}")
-            outFile
-        } catch (t: Throwable) {
-            Log.w(TAG, "Export: write failed: ${t.message}")
-            null
         }
+        Log.i(TAG, "Export: wrote ${rows.size} rows → ${outFile.absolutePath}")
+        outFile
+    } catch (t: Throwable) {
+        Log.w(TAG, "Export: write failed: ${t.message}")
+        null
     }
 }

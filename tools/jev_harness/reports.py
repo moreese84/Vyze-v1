@@ -10,7 +10,7 @@ evidence:
   - echo rate + language-mirror compliance (prompt-pipeline health)
 """
 
-from .taxonomy import RELEVANCE_NUMERIC, SPEECH_ROUTABLE
+from .taxonomy import LANGID_CONFIDENCE_BAR, RELEVANCE_NUMERIC, SPEECH_ROUTABLE
 
 
 def routing_report(rows: list[dict]) -> str:
@@ -108,7 +108,23 @@ def audit_report(rows: list[dict]) -> str:
     # are excluded from the mirror denominator entirely (lane missing on
     # pre-v2 result files → treated as voice, backward compatible).
     voice = [r for r in ok if r.get("lane") != "tap"]
-    lang_ok = sum(1 for r in voice if not r["language_mismatch_flag"])
+
+    # v3: split AMBIGUOUS-GARBLE rows out of the compliance denominator.
+    # When Jev itself cannot confidently identify the query's language
+    # (Choice confidence below the bar), neither a match nor a mismatch is
+    # decidable evidence — the on-device answer to "Chika Sama" cannot be
+    # graded against a language nobody (model included) can name. Ungraded
+    # rows are listed separately so they stay visible as telemetry instead
+    # of silently dragging compliance down (baseline audit: ir_8 at 0.41
+    # confidence dropped ms compliance to 1/3 = 33.3% though the app's
+    # behavior there was already optimal).
+    ambiguous = [
+        r for r in voice
+        if r.get("jev_query_language_confidence") is not None
+        and r["jev_query_language_confidence"] < LANGID_CONFIDENCE_BAR
+    ]
+    graded = [r for r in voice if r not in ambiguous]
+    lang_ok = sum(1 for r in graded if not r["language_mismatch_flag"])
 
     # Ordered relevance levels → numeric average.
     rel_vals = []
@@ -123,11 +139,21 @@ def audit_report(rows: list[dict]) -> str:
         f"  audited transcripts:         {n} ({len(voice)} voice, {n - len(voice)} tap)",
         f"  echo rate (Noul ≥ 0.5):      {echoed}/{n} = {echoed / n:.1%}",
     ]
-    if voice:
+    if graded:
         lines.append(
-            f"  language-mirror compliance:  {lang_ok}/{len(voice)} = "
-            f"{lang_ok / len(voice):.1%} (voice rows only)"
+            f"  language-mirror compliance:  {lang_ok}/{len(graded)} = "
+            f"{lang_ok / len(graded):.1%} (voice rows, confident langid)"
         )
+        if ambiguous:
+            lines.append(
+                f"  ambiguous-garble rows:       {len(ambiguous)} "
+                f"excluded from compliance (Jev langid confidence < {LANGID_CONFIDENCE_BAR:.2f})"
+            )
+            for r in ambiguous[:10]:
+                lines.append(
+                    f"    [{r['id']}] conf={r['jev_query_language_confidence']:.2f} "
+                    f"\"{r['query'][:48]}\""
+                )
     else:
         lines.append(
             "  language-mirror compliance:  n/a (tap-only corpus — no spoken language)"
@@ -145,16 +171,44 @@ def audit_report(rows: list[dict]) -> str:
                 f"a=\"{r['answer'][:40]}\" noul={r['audit_echoed_noul']:.2f}"
             )
 
-    # Per-language compliance (voice rows only — tap rows have no language;
-    # the v2 exporter infers lang per query instead of the old 'unknown').
-    voice_langs = sorted({r["lang"] for r in voice if r["lang"]})
+    # Per-language compliance (graded voice rows only — tap rows have no
+    # language, ambiguous-garble rows are excluded above).
+    # Group by the Jev langid label when present (live rows), falling back to
+    # the exporter's inferred lang — old result files predate the Jev label.
+    def eff_lang(r: dict) -> str | None:
+        return r.get("jev_query_language") or r.get("lang")
+
+    voice_langs = sorted({l for l in (eff_lang(r) for r in graded) if l})
     if voice_langs:
-        lines.append("  per-language mirror compliance (voice rows):")
+        lines.append("  per-language mirror compliance (graded voice rows):")
         for lang in voice_langs:
-            sub = [r for r in voice if r["lang"] == lang]
+            sub = [r for r in graded if eff_lang(r) == lang]
             good = sum(1 for r in sub if not r["language_mismatch_flag"])
-            lines.append(f"    {lang}: {good}/{len(sub)} = {good / len(sub):.1%}")
+            label = " (Jev-labeled)" if any(r.get("jev_query_language") == lang for r in sub) else ""
+            lines.append(f"    {lang}{label}: {good}/{len(sub)} = {good / len(sub):.1%}")
     else:
-        lines.append("  per-language mirror compliance: n/a (no voice rows)")
+        lines.append("  per-language mirror compliance: n/a (no graded voice rows)")
+
+    # Langid disagreements — exporter says one language, Jev another. This is
+    # the detector-miss signal: a garbled Malay query the on-device exporter
+    # labeled 'en'/'unknown' while Jev (and the user's ear) say 'ms'. Only
+    # CONFIDENT Jev labels count — an ambiguous label is not a disagreement,
+    # it is undecidable (those rows are excluded above).
+    disagreed = [
+        r for r in graded
+        if r.get("jev_query_language") and r.get("lang")
+        and r["jev_query_language"] != r["lang"]
+        and "unknown" not in (r["jev_query_language"], r["lang"])
+    ]
+    if disagreed:
+        lines.append(
+            f"  langid disagreements:        {len(disagreed)} "
+            "(exporter vs Jev — detector misses / distillation signal)"
+        )
+        for r in disagreed[:10]:
+            lines.append(
+                f"    [{r['id']}] exporter={r['lang']} jev={r['jev_query_language']} "
+                f"\"{r['query'][:48]}\""
+            )
 
     return "\n".join(lines)

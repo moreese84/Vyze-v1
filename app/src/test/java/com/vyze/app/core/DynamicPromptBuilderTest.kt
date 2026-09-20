@@ -82,7 +82,10 @@ class DynamicPromptBuilderTest {
 
     @Test
     fun `language mirroring mandate is present for every locale and mode`() = runBlocking {
-        val mandate = "LANGUAGE MIRRORING: You MUST detect the language of the user's query"
+        // TAG-AUTHORITY contract (v3): the mandate names the [OUTPUT LANGUAGE]
+        // tag as the answer-language authority, with query-detection only as
+        // the no-tag fallback.
+        val mandate = "LANGUAGE MIRRORING: Respond in the language named in the"
         val locales = listOf(Locale.US, Locale("ms"), Locale("zh"), Locale("ja"))
         for (loc in locales) {
             for (queryOverride in listOf(null, "apa ini?")) {
@@ -92,6 +95,10 @@ class DynamicPromptBuilderTest {
                     continuousMode = queryOverride == null,
                 )
                 assertTrue("missing mirror mandate for $loc", p.contains(mandate))
+                assertTrue("missing tag-authority clause for $loc",
+                    p.contains("the tag is the authority on the answer language"))
+                assertTrue("missing garble clause for $loc",
+                    p.contains("Even when the query text itself reads like English"))
                 assertTrue("missing English-drift ban for $loc", p.contains("Never revert to default English"))
                 assertTrue("missing bottom mirror for $loc", p.contains("REMEMBER: Respond only in"))
             }

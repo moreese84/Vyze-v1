@@ -9,13 +9,21 @@ contract dimensions the prompt pipeline was hardened for, plus relevance:
   language_matches_query Noul — is the answer in the same language and
                          script as the query (en / ms / zh mirroring)?
   relevance              Score — does the answer actually answer the query?
+  query_language         Choice — WHICH language the query is (en/ms/zh/
+                         unknown), labeled independently of the exporter's
+                         text-based `lang` field. Device audits keep failing
+                         on langid (ASR garble: "inipula appa" is Malay),
+                         so Jev supplies the per-language ground truth the
+                         compliance report groups by — and labeled rows
+                         double as distillation data for an on-device
+                         student detector (same pattern as the router).
 
-Jev is text-only, so this audits TRANSCRIPTS, never audio. The three
+Jev is text-only, so this audits TRANSCRIPTS, never audio. The four
 questions are independent judgments over one state → one batched request
 per pair (parallel questions, one call), per SKILL.md guidance.
 """
 
-from .taxonomy import RELEVANCE_LEVELS
+from .taxonomy import QUERY_LANGUAGE_CRITERIA, RELEVANCE_LEVELS
 
 # CameraFragment submits screen-tap queries as "User tapped at position
 # (x, y)…" — they carry NO spoken language, so language-mirror grading is
@@ -36,7 +44,7 @@ def lane_of(item: dict) -> str:
 def audit_questions() -> dict:
     """Fresh question objects per call (never reuse SDK objects across requests)."""
     # Lazy SDK import: dry-run mode must work without typesafe-sdk installed.
-    from typesafe_sdk import Noul, Score
+    from typesafe_sdk import Choice, Noul, Score
 
     return {
         "echoed_question": Noul(
@@ -68,6 +76,19 @@ def audit_questions() -> dict:
                 ),
             },
         ),
+        "query_language": Choice(
+            instructions=(
+                "Which language is the user's query written in? This is the "
+                "language the assistant must MIRROR in its answer. Judge the "
+                "query text on its own: script, vocabulary, and question "
+                "forms. ASR garble of non-English speech still counts as "
+                "that language when its tokens are not plausible English "
+                "(for example 'inipula appa' is Malay: 'ini pula apa' run "
+                "together through an English recognizer). Tap-lane screen "
+                "instructions with no spoken words are 'unknown'."
+            ),
+            criteria=QUERY_LANGUAGE_CRITERIA,
+        ),
         "relevance": Score(
             instructions=(
                 "How well does the assistant's answer address the user's "
@@ -94,9 +115,12 @@ def build_state(item: dict) -> dict:
 def extract(result) -> dict:
     """Pull audit fields from a system_one response."""
     relevance = result.scores["relevance"]
+    lang = result.choices["query_language"]
     return {
         "audit_echoed_noul": result.nouls["echoed_question"].noul,
         "audit_language_match_noul": result.nouls["language_matches_query"].noul,
         "audit_relevance_level": relevance.score,
         "audit_relevance_probabilities": dict(getattr(relevance, "probabilities", {}) or {}),
+        "jev_query_language": lang.choice,
+        "jev_query_language_confidence": lang.confidence,
     }

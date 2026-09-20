@@ -773,7 +773,13 @@ class CameraFragment : Fragment() {
             coreController.destroy()
         }
 
-        if (this::ttsManager.isInitialized) ttsManager.onDestroy()
+        // Session audio hygiene ONLY: stop() silences current speech WITHOUT
+        // de-initializing the process-wide TTS singleton. Calling onDestroy()
+        // here reset isInitialized on the shared engine while the stale engine
+        // reference kept blocking reconstruction — after exit + reopen,
+        // bootstrapEngine() no-op'd, onInit never fired again, and every
+        // speak() buffered into a queue nobody drained → app relaunched mute.
+        if (this::ttsManager.isInitialized) ttsManager.stop()
         if (this::hapticManager.isInitialized) hapticManager.cancel()
 
         cameraSetup.destroy()
