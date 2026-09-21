@@ -2388,7 +2388,9 @@ class VyzeCoreController(
      * when Android's SpeechRecognizer fails or hears ambient chatter,
      * capture the user's speech with [AudioCapture] and feed it here.
      *
-     * @param audioBytes Raw 16 kHz mono float32 PCM (from [AudioCapture])
+     * @param audioBytes Raw 16 kHz mono float32 PCM (from [AudioCapture];
+     *        the WAV container LiteRT-LM's decoder requires is added by the
+     *        engine manager)
      * @return The transcription, or null if nothing was understood
      */
     suspend fun transcribeAudio(audioBytes: ByteArray): String? {

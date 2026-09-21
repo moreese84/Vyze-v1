@@ -11,10 +11,12 @@ import java.nio.ByteOrder
 /**
  * Captures speech audio for Gemma 4 E2B's NATIVE audio encoder.
  *
- * Gemma's audio spec: mono, 16 kHz, 32-bit float samples in [-1, 1],
- * delivered as RAW bytes (no WAV header). [AudioRecord] with
- * [AudioFormat.ENCODING_PCM_FLOAT] at 16 kHz mono produces exactly that
- * format — we just need to serialize the floats little-endian.
+ * Gemma's audio spec: mono, 16 kHz, 32-bit float samples in [-1, 1].
+ * [AudioRecord] with [AudioFormat.ENCODING_PCM_FLOAT] at 16 kHz mono
+ * produces exactly that — we serialize the floats little-endian as RAW
+ * bytes. (The WAV container LiteRT-LM's decoder requires is added by
+ * [VlmEngineManager.transcribeAudio] at the engine boundary — never
+ * store or send these bytes as audio elsewhere.)
  *
  * Used as Vyze's offline ASR fallback: when Android's SpeechRecognizer
  * fails in a noisy room, capture a short clip here and hand the bytes to
@@ -64,7 +66,8 @@ object AudioCapture {
 
     /**
      * Record speech from the microphone and return raw 16 kHz mono float32
-     * PCM bytes ready for [VlmEngineManager.transcribeAudio].
+     * PCM bytes ready for [VlmEngineManager.transcribeAudio] (which adds the
+     * WAV container LiteRT-LM's decoder requires).
      *
      * Blocks until the user stops speaking (silence timeout), the max
      * duration is reached, or an error occurs. Returns null on failure

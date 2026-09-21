@@ -54,6 +54,15 @@ class TranscriptAutoExportProvider : ContentProvider() {
             } catch (t: Throwable) {
                 android.util.Log.w(TAG, "Diag export crashed: ${t.javaClass.simpleName}: ${t.message}")
             }
+            // And the app's own continuous crash/flow log (vyze_crash.log) —
+            // every cold start refreshes the Downloads copy so the session
+            // verdict lines (GEMMA-PRIMARY CAPTURE/SKIP, Speech error, etc.)
+            // are always pullable without adb.
+            try {
+                com.vyze.app.util.CrashLogFile.exportToDownloads(appContext)
+            } catch (t: Throwable) {
+                android.util.Log.w(TAG, "Crash-log export crashed: ${t.javaClass.simpleName}: ${t.message}")
+            }
         }
         return true
     }

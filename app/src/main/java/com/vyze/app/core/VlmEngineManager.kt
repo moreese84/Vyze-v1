@@ -37,8 +37,11 @@ import kotlinx.coroutines.withTimeoutOrNull
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.SimilarInteraction
 import java.io.ByteArrayOutputStream
+import com.vyze.app.device.AudioCapture
 import java.io.Closeable
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -1073,11 +1076,18 @@ class VlmEngineManager(
      * Android's SpeechRecognizer fails or hears ambient chatter: capture
      * the user's speech with AudioRecord and feed it straight to the model.
      *
-     * Per the Gemma audio spec the bytes must be raw mono 16 kHz float32
-     * PCM (samples in [-1, 1]) with NO WAV header. Audio is charged at
-     * 25 tokens per second against the context window (max 30s clip).
+     * LiteRT-LM routes Content.AudioBytes through a miniaudio DECODER that
+     * requires a headered container (WAV). Headerless raw PCM fails decoder
+     * init with "Failed to initialize miniaudio decoder, error code: -10"
+     * (MA_INVALID_FILE) before the audio encoder ever runs — so the PCM is
+     * wrapped in a 44-byte WAV header here ([wrapPcmInWav]).
      *
-     * @param audioBytes Raw 16 kHz mono float32 PCM audio
+     * Gemma audio spec: mono 16 kHz float32 PCM, samples in [-1, 1]. Audio
+     * is charged at 25 tokens per second against the context window (max
+     * 30s clip).
+     *
+     * @param audioBytes Raw 16 kHz mono float32 PCM audio (NO header — from
+     *                   [AudioCapture.recordSpeech])
      * @param prompt     ASR instruction ("Transcribe the following speech...")
      * @param sessionId  Session gating ID for callbacks
      * @param maxTokens  Output cap — transcriptions are short
@@ -1089,16 +1099,52 @@ class VlmEngineManager(
         sessionId: String = "",
         maxTokens: Int = ASR_MAX_TOKENS
     ): String? = withContext(Dispatchers.Default) {
-        CrashLogFile.log(TAG, "=== TRANSCRIBE AUDIO (${audioBytes.size} bytes) ===")
+        val wav = wrapPcmInWav(audioBytes)
+        CrashLogFile.log(TAG, "=== TRANSCRIBE AUDIO (${audioBytes.size} PCM bytes -> ${wav.size} WAV bytes) ===")
         val formattedPrompt = buildGemmaTurnPrompt(prompt, "")
         runConversation(
             contents = Contents.of(
-                Content.AudioBytes(audioBytes),
+                Content.AudioBytes(wav),
                 Content.Text(formattedPrompt)
             ),
             maxTokens = maxTokens,
             sessionId = sessionId
         )
+    }
+
+    /**
+     * Wrap raw 16 kHz mono float32 PCM bytes in a minimal 44-byte WAV (RIFF)
+     * header so LiteRT-LM's miniaudio decoder accepts them.
+     *
+     * WAV accepts IEEE-float encoding (format tag 3), so the captured float
+     * samples are written as-is — no conversion, just 4 header bytes per
+     * field. A trailing odd byte is impossible (4-byte samples), but the
+     * data-size field is still clamped to the actual payload.
+     */
+    private fun wrapPcmInWav(pcm: ByteArray): ByteArray {
+        val sampleRate = AudioCapture.SAMPLE_RATE_HZ
+        val numChannels = 1
+        val bytesPerSample = 4  // float32
+        val blockAlign = numChannels * bytesPerSample
+        val byteRate = sampleRate * blockAlign
+        val dataSize = pcm.size
+
+        val header = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
+        header.put("RIFF".toByteArray(Charsets.US_ASCII))        // 0-3
+        header.putInt(36 + dataSize)                              // 4-7  RIFF chunk size
+        header.put("WAVE".toByteArray(Charsets.US_ASCII))         // 8-11
+        header.put("fmt ".toByteArray(Charsets.US_ASCII))         // 12-15
+        header.putInt(16)                                         // 16-19 fmt chunk size (PCM)
+        header.putShort(3.toShort())                              // 20-21 format tag 3 = IEEE float
+        header.putShort(numChannels.toShort())                    // 22-23
+        header.putInt(sampleRate)                                 // 24-27
+        header.putInt(byteRate)                                   // 28-31
+        header.putShort(blockAlign.toShort())                     // 32-33
+        header.putShort((bytesPerSample * 8).toShort())           // 34-35 bits per sample
+        header.put("data".toByteArray(Charsets.US_ASCII))         // 36-39
+        header.putInt(dataSize)                                   // 40-43
+
+        return header.array() + pcm
     }
 
     /**

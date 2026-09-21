@@ -51,8 +51,11 @@ object DiagnosticsLogExporter {
         if (!hasAccess) return null
 
         val raw = try {
-            val pid = android.os.Process.myPid()
-            val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", "$MAX_LINES", "--pid", "$pid"))
+            // NO --pid filter: the whole point is the PREVIOUS session's logs,
+            // which belong to a DEAD pid (the ring buffer survives process
+            // death, but --pid would exclude every line not from THIS pid).
+            // The INTERESTING regex below does the app-relevance filtering.
+            val proc = Runtime.getRuntime().exec(arrayOf("logcat", "-d", "-v", "time", "-t", "$MAX_LINES"))
             proc.inputStream.bufferedReader(Charsets.UTF_8).readText().also {
                 proc.waitFor()
             }
@@ -65,8 +68,8 @@ object DiagnosticsLogExporter {
         val allLines = raw.lines()
         val kept = allLines.asSequence()
             .filter { line ->
-                val body = line.drop(18) // skip "MM-DD HH:MM:SS.mmm PID PID " prefix for matching
-                INTERESTING.containsMatchIn(body) || ANY_ERROR.containsMatchIn(line)
+                val body = line.drop(18) // skip "MM-DD HH:MM:SS.mmm " prefix for matching
+                INTERESTING.containsMatchIn(body)
             }
             .take(MAX_KEPT_LINES)
             .toList()

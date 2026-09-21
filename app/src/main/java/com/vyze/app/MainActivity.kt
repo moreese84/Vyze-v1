@@ -1,5 +1,6 @@
 package com.vyze.app
 import com.vyze.app.util.CrashLogFile
+import com.vyze.app.core.VyzeCoreController
 import com.vyze.app.ui.MainViewModel
 import com.vyze.app.device.HapticManager
 import com.vyze.app.speech.TTSManager
@@ -598,6 +599,71 @@ class MainActivity : AppCompatActivity() {
      *         session); false if the rescue is unavailable and the caller
      *         should fall through to normal error handling.
      */
+    /**
+     * OFFLINE-PRIMARY voice capture: [AudioCapture] records the utterance
+     * with its own end-of-speech VAD (1.2s silence after ≥1.5s speech, 8s
+     * cap) and the LOCAL Gemma engine transcribes it. No cloud recognizer, no
+     * cue — the original tap → speak → answer flow. The transcript flows
+     * through the EXACT original pipeline: detectLocaleFromText →
+     * onSpeechResult → student router → answer, mirroring included.
+     *
+     * Failure surfaces once and hands control back to the user — no retry
+     * loops, no unprompted listening (ORIGINAL FLOW contract).
+     *
+     * MUST be called with NO active SpeechRecognizer (mic contention).
+     */
+    private fun startGemmaPrimaryCapture(core: VyzeCoreController) {
+        isListening = true
+        lastPartialText = ""
+        Log.i(TAG, "OFFLINE voice: Gemma-primary capture (no cloud recognizer)")
+        CrashLogFile.log(TAG, "GEMMA-PRIMARY CAPTURE: recording")
+        asrScope.launch {
+            val audio = try {
+                AudioCapture.recordSpeech()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Gemma-primary: capture crashed: ${t.javaClass.simpleName}: ${t.message}")
+                null
+            }
+            // Re-check before transcribing: a tap analysis may have started
+            // while the mic was open (the engine runs one generation at a
+            // time) — identical discipline to the original rescue path.
+            val inferring = core.isCurrentlyInferring()
+            val transcription = if (audio == null || inferring) null else try {
+                core.transcribeAudio(audio)?.trim()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Gemma-primary: transcribe failed: ${t.message}")
+                null
+            }
+            mainHandler.post {
+                isListening = false
+                if (!voiceSessionWanted) {
+                    Log.d(TAG, "Gemma-primary: session aborted during recording — dropping")
+                    return@post
+                }
+                when {
+                    audio == null ->
+                        onSpeechError?.invoke("Could not record audio — tap the mic to try again")
+                    inferring ->
+                        onSpeechError?.invoke("Model busy — tap the mic to try again")
+                    transcription.isNullOrBlank() -> {
+                        Log.w(TAG, "Gemma-primary: nothing understood")
+                        onSpeechError?.invoke("I didn't catch that — tap the mic to try again")
+                    }
+                    else -> {
+                        Log.i(TAG, "Gemma-primary transcript: $transcription")
+                        CrashLogFile.log(TAG, "GEMMA-PRIMARY TRANSCRIPT: $transcription")
+                        // The EXACT original post-transcript pipeline — same
+                        // entry point a recognized query uses. Student router
+                        // untouched.
+                        val locale = detectLocaleFromText(transcription!!)
+                        lastDetectedLocale = locale
+                        onSpeechResult?.invoke(transcription, locale, 0f)
+                    }
+                }
+            }
+        }
+    }
+
     private fun attemptModelAsrRescue(originalError: String): Boolean {
         if (!modelAsrRescueAllowed) {
             Log.d(TAG, "Model-ASR rescue suppressed (e.g. voice audition active)")
@@ -1078,6 +1144,49 @@ class MainActivity : AppCompatActivity() {
     fun startListeningSafely() {
         mainHandler.post {
             try {
+                // ── GEMMA-PRIMARY OFFLINE VOICE ────────────────────
+                // The platform recognizer service accepts offline sessions
+                // and returns NOTHING (verified in the device log: three
+                // sessions, zero callbacks, zero errors). The app's own
+                // Gemma audio encoder is the offline recognizer — the same
+                // Tier 2 mechanism as the rescue, promoted to primary.
+                // CRITICAL ORDERING: this branch runs BEFORE any
+                // SpeechRecognizer is created — a bound recognizer service
+                // claims the recognition audio source and silences our own
+                // AudioRecord on the same source.
+                if (isDeviceOffline()) {
+                    val core = (application as? VyzeApplication)?.coreController
+                    if (core != null && core.isEngineReady() && !core.isCurrentlyInferring()) {
+                        if (noisePaused) {
+                            Log.d(TAG, "startListeningSafely: noise pause active — staying quiet until tap")
+                            return@post
+                        }
+                        if (ttsReady && ttsManager.hasPendingSpeech()) {
+                            Log.d(TAG, "startListeningSafely: answer still queued/speaking — deferring mic start")
+                            return@post
+                        }
+                        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                            != android.content.pm.PackageManager.PERMISSION_GRANTED
+                        ) {
+                            Log.d(TAG, "startListeningSafely: Requesting RECORD_AUDIO permission")
+                            audioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                            return@post
+                        }
+                        // Release any recognizer claim on the audio source.
+                        destroySpeechRecognizer()
+                        startGemmaPrimaryCapture(core)
+                        return@post
+                    }
+                    // Skip-reason IN THE CRASH LOG (the pullable file) — the
+                    // offline branch MUST be able to explain itself.
+                    CrashLogFile.log(
+                        TAG,
+                        "GEMMA-PRIMARY SKIP: core=${core != null}, " +
+                            "ready=${core?.isEngineReady()}, inferring=${core?.isCurrentlyInferring()}"
+                    )
+                } else {
+                    CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: isDeviceOffline()=false at tap time")
+                }
                 if (speechRecognizer == null) {
                     Log.w(TAG, "startListeningSafely: SpeechRecognizer is null")
                     return@post
@@ -1379,6 +1488,7 @@ class MainActivity : AppCompatActivity() {
                     RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                     RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
                 )
+                val offline = isDeviceOffline()
                 if (recognitionLocale != null) {
                     val tag = recognitionLocale.toLanguageTag()
                     // Strong hint: listen for the user's actual language
@@ -1416,11 +1526,9 @@ class MainActivity : AppCompatActivity() {
                     // pre-Jev-era offline behavior: English recognition via
                     // the device's downloaded offline pack, with the Gemma
                     // model-ASR rescue covering what the pack cannot.
-                    val offline = isDeviceOffline()
                     if (offline) {
-                        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                        Log.i(TAG, "OFFLINE MODE: recognizer extras stripped to on-device path")
-                        CrashLogFile.log(TAG, "OFFLINE RECOGNIZER: prefer-offline, auto-detect extras skipped")
+                        Log.i(TAG, "OFFLINE MODE: cloud-only recognizer extras stripped (pre-Jev intent)")
+                        CrashLogFile.log(TAG, "OFFLINE RECOGNIZER: auto-detect extras stripped")
                     }
                     // API 34+: ask the engine to auto-detect the spoken
                     // language from the supported set (en-US, ms-MY, zh-CN)
@@ -1444,13 +1552,16 @@ class MainActivity : AppCompatActivity() {
                 // session ended before the query completed. 600/800ms keeps
                 // the session open long enough for short non-English queries
                 // while the follow-up window watchdog still bounds latency.
+                // PRE-JEV VAD TIMINGS offline (400/300ms — the exact values
+                // that worked); JEV-era 800/600ms kept online for the
+                // non-English clipping fix. Byte-identical offline intent.
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    800L
+                    if (isDeviceOffline()) 400L else 800L
                 )
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                    600L
+                    if (isDeviceOffline()) 300L else 600L
                 )
                 putExtra(
                     RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
