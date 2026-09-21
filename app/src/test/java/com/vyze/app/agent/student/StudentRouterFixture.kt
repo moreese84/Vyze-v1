@@ -1,14 +1,23 @@
-// GENERATED from app/src/test/resources/fixtures/phase0_route_labels.jsonl
-// (Phase 0 Jev labeling of the seed corpus — frozen gate fixture).
+// GENERATED from the frozen labeling artifacts:
+//   SEED_ROWS    <- app/src/test/resources/fixtures/phase0_route_labels.jsonl
+//                   (Phase 0 live Jev labeling of the seed corpus)
+//   DEVICE_ROWS  <- app/src/test/resources/fixtures/phase3_device_labels.jsonl
+//                   (Phase 3 device-corpus labels, hand-assigned per plan B2;
+//                    regex_action from the real baseline, Jev fields null)
 // Regenerate with: python tools/jev_harness/gen_kotlin_fixture.py
 // Do not hand-edit.
 package com.vyze.app.agent.student
 
 /**
- * Frozen Phase 0 route labels: regex baseline, Jev (teacher), and the
- * hand-assigned expected action per seed query. Consumed by
- * StudentRouterFixtureTest to prove the student router meets the
- * Phase 2→3 gate (student ≥ regex baseline on this corpus).
+ * Frozen route labels consumed by StudentRouterFixtureTest.
+ *
+ * SEED_ROWS backs the Phase 2→3 gate (student ≥ regex baseline on the
+ * Jev-labeled seed corpus) and the Jev-teacher reference test.
+ *
+ * DEVICE_ROWS is the B2 regression gate for the v2 distilled branches
+ * (app-cue echo, greeting garble, ms deictic opener): `expected` was
+ * hand-assigned from the device-corpus distillation evidence; `note`
+ * records the source row. DEVICE_ROWS carries no Jev fields by design.
  */
 object StudentRouterFixture {
 
@@ -19,12 +28,13 @@ object StudentRouterFixture {
         val previous: String?,
         val expected: String,
         val regexAction: String,
-        val jevAction: String,
-        val jevConfidence: Double,
-        val jevFastPathNoul: Double,
+        val jevAction: String?,
+        val jevConfidence: Double?,
+        val jevFastPathNoul: Double?,
+        val note: String?,
     )
 
-    val ROWS: List<Row> = listOf(
+    val SEED_ROWS: List<Row> = listOf(
         Row(
             id = "p1",
             lang = "en",
@@ -35,6 +45,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.48,
+            note = null,
         ),
         Row(
             id = "p2",
@@ -46,6 +57,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.05,
+            note = null,
         ),
         Row(
             id = "p3",
@@ -57,6 +69,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.95,
             jevFastPathNoul = 0.1,
+            note = null,
         ),
         Row(
             id = "p4",
@@ -68,6 +81,7 @@ object StudentRouterFixture {
             jevAction = "none_of_these",
             jevConfidence = 0.45,
             jevFastPathNoul = 0.92,
+            note = null,
         ),
         Row(
             id = "p5",
@@ -79,6 +93,7 @@ object StudentRouterFixture {
             jevAction = "SOS",
             jevConfidence = 0.94,
             jevFastPathNoul = 0.39,
+            note = null,
         ),
         Row(
             id = "e1",
@@ -90,6 +105,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.68,
+            note = null,
         ),
         Row(
             id = "e2",
@@ -101,6 +117,7 @@ object StudentRouterFixture {
             jevAction = "FAST_COLOR_ANALYSIS",
             jevConfidence = 0.97,
             jevFastPathNoul = 0.38,
+            note = null,
         ),
         Row(
             id = "e3",
@@ -112,6 +129,7 @@ object StudentRouterFixture {
             jevAction = "LIGHT_CHECK",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.77,
+            note = null,
         ),
         Row(
             id = "e4",
@@ -123,6 +141,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.1,
+            note = null,
         ),
         Row(
             id = "e5",
@@ -134,6 +153,7 @@ object StudentRouterFixture {
             jevAction = "IGNORE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.85,
+            note = null,
         ),
         Row(
             id = "e6",
@@ -145,6 +165,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.98,
             jevFastPathNoul = 0.59,
+            note = null,
         ),
         Row(
             id = "a1",
@@ -156,6 +177,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.08,
+            note = null,
         ),
         Row(
             id = "a2",
@@ -167,6 +189,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.87,
             jevFastPathNoul = 0.06,
+            note = null,
         ),
         Row(
             id = "a3",
@@ -178,6 +201,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 0.46,
             jevFastPathNoul = 0.41,
+            note = null,
         ),
         Row(
             id = "a4",
@@ -189,6 +213,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 0.85,
             jevFastPathNoul = 0.39,
+            note = null,
         ),
         Row(
             id = "a5",
@@ -200,6 +225,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.93,
             jevFastPathNoul = 0.13,
+            note = null,
         ),
         Row(
             id = "a6",
@@ -211,6 +237,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.91,
             jevFastPathNoul = 0.07,
+            note = null,
         ),
         Row(
             id = "a7",
@@ -222,6 +249,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.86,
             jevFastPathNoul = 0.66,
+            note = null,
         ),
         Row(
             id = "m1",
@@ -233,6 +261,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.61,
+            note = null,
         ),
         Row(
             id = "m2",
@@ -244,6 +273,7 @@ object StudentRouterFixture {
             jevAction = "FAST_COLOR_ANALYSIS",
             jevConfidence = 0.98,
             jevFastPathNoul = 0.41,
+            note = null,
         ),
         Row(
             id = "m3",
@@ -255,6 +285,7 @@ object StudentRouterFixture {
             jevAction = "LIGHT_CHECK",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.75,
+            note = null,
         ),
         Row(
             id = "m4",
@@ -266,6 +297,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.12,
+            note = null,
         ),
         Row(
             id = "m5",
@@ -277,6 +309,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.11,
+            note = null,
         ),
         Row(
             id = "m6",
@@ -288,6 +321,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.98,
             jevFastPathNoul = 0.39,
+            note = null,
         ),
         Row(
             id = "m7",
@@ -299,6 +333,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.96,
             jevFastPathNoul = 0.19,
+            note = null,
         ),
         Row(
             id = "m8",
@@ -310,6 +345,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.82,
             jevFastPathNoul = 0.13,
+            note = null,
         ),
         Row(
             id = "m9",
@@ -321,6 +357,7 @@ object StudentRouterFixture {
             jevAction = "IGNORE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.81,
+            note = null,
         ),
         Row(
             id = "m10",
@@ -332,6 +369,7 @@ object StudentRouterFixture {
             jevAction = "SOS",
             jevConfidence = 0.92,
             jevFastPathNoul = 0.48,
+            note = null,
         ),
         Row(
             id = "ma1",
@@ -343,6 +381,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.52,
+            note = null,
         ),
         Row(
             id = "ma2",
@@ -354,6 +393,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.97,
             jevFastPathNoul = 0.06,
+            note = null,
         ),
         Row(
             id = "z1",
@@ -365,6 +405,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.52,
+            note = null,
         ),
         Row(
             id = "z2",
@@ -376,6 +417,7 @@ object StudentRouterFixture {
             jevAction = "FAST_COLOR_ANALYSIS",
             jevConfidence = 0.95,
             jevFastPathNoul = 0.3,
+            note = null,
         ),
         Row(
             id = "z3",
@@ -387,6 +429,7 @@ object StudentRouterFixture {
             jevAction = "LIGHT_CHECK",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.76,
+            note = null,
         ),
         Row(
             id = "z4",
@@ -398,6 +441,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.1,
+            note = null,
         ),
         Row(
             id = "z5",
@@ -409,6 +453,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.09,
+            note = null,
         ),
         Row(
             id = "z6",
@@ -420,6 +465,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.98,
             jevFastPathNoul = 0.5,
+            note = null,
         ),
         Row(
             id = "z7",
@@ -431,6 +477,7 @@ object StudentRouterFixture {
             jevAction = "VLM_VOICE_QUERY",
             jevConfidence = 0.96,
             jevFastPathNoul = 0.16,
+            note = null,
         ),
         Row(
             id = "z8",
@@ -442,6 +489,7 @@ object StudentRouterFixture {
             jevAction = "IGNORE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.82,
+            note = null,
         ),
         Row(
             id = "z9",
@@ -453,6 +501,7 @@ object StudentRouterFixture {
             jevAction = "SOS",
             jevConfidence = 0.97,
             jevFastPathNoul = 0.52,
+            note = null,
         ),
         Row(
             id = "f1",
@@ -464,6 +513,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.1,
+            note = null,
         ),
         Row(
             id = "f2",
@@ -475,6 +525,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 0.9,
             jevFastPathNoul = 0.12,
+            note = null,
         ),
         Row(
             id = "f3",
@@ -486,6 +537,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.11,
+            note = null,
         ),
         Row(
             id = "f4",
@@ -497,6 +549,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 0.82,
             jevFastPathNoul = 0.18,
+            note = null,
         ),
         Row(
             id = "f5",
@@ -508,6 +561,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.11,
+            note = null,
         ),
         Row(
             id = "f6",
@@ -519,6 +573,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 0.75,
             jevFastPathNoul = 0.15,
+            note = null,
         ),
         Row(
             id = "f7",
@@ -530,6 +585,7 @@ object StudentRouterFixture {
             jevAction = "FAST_COLOR_ANALYSIS",
             jevConfidence = 0.83,
             jevFastPathNoul = 0.38,
+            note = null,
         ),
         Row(
             id = "f8",
@@ -541,6 +597,7 @@ object StudentRouterFixture {
             jevAction = "VLM_SCENE_DESCRIBE",
             jevConfidence = 0.55,
             jevFastPathNoul = 0.22,
+            note = null,
         ),
         Row(
             id = "f9",
@@ -552,6 +609,7 @@ object StudentRouterFixture {
             jevAction = "FAST_COLOR_ANALYSIS",
             jevConfidence = 0.72,
             jevFastPathNoul = 0.28,
+            note = null,
         ),
         Row(
             id = "f10",
@@ -563,6 +621,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 0.99,
             jevFastPathNoul = 0.5,
+            note = null,
         ),
         Row(
             id = "f11",
@@ -574,6 +633,7 @@ object StudentRouterFixture {
             jevAction = "VLM_TEXT_READ",
             jevConfidence = 0.98,
             jevFastPathNoul = 0.39,
+            note = null,
         ),
         Row(
             id = "n1",
@@ -585,6 +645,7 @@ object StudentRouterFixture {
             jevAction = "IGNORE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.37,
+            note = null,
         ),
         Row(
             id = "n2",
@@ -596,6 +657,178 @@ object StudentRouterFixture {
             jevAction = "IGNORE",
             jevConfidence = 1.0,
             jevFastPathNoul = 0.59,
+            note = null,
+        ),
+    )
+
+    val DEVICE_ROWS: List<Row> = listOf(
+        Row(
+            id = "dev1",
+            lang = "en",
+            query = "what is in front of me",
+            previous = null,
+            expected = "VLM_SCENE_DESCRIBE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_1: canonical scene opener; regex fallthrough",
+        ),
+        Row(
+            id = "dev2",
+            lang = "ms",
+            query = "Ini pula apa ini pula apa",
+            previous = "Hey, I'm about this.",
+            expected = "VLM_SCENE_DESCRIBE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 vm_16: v2 ms deictic opener branch (Jev 0.65)",
+        ),
+        Row(
+            id = "dev3",
+            lang = "en",
+            query = "please say that again",
+            previous = "what is in front of me",
+            expected = "IGNORE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_2: v2 app-cue echo branch; answered with a stale scene before v2",
+        ),
+        Row(
+            id = "dev4",
+            lang = "en",
+            query = "Hello, I'm a model.",
+            previous = "is in front of me analyzing what is in front of me",
+            expected = "IGNORE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_13: v2 greeting-garble branch (Jev 0.79)",
+        ),
+        Row(
+            id = "dev5",
+            lang = "en",
+            query = "Hey, I'm about this.",
+            previous = "Hello, I'm a model.",
+            expected = "IGNORE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_14: v2 greeting-garble branch (Jev 0.75); no question content",
+        ),
+        Row(
+            id = "dev6",
+            lang = "en",
+            query = "is in front of me analyzing what is in front of me",
+            previous = null,
+            expected = "IGNORE",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_12: app-cue garble hybrid (mic caught 'Analyzing' plus a scene opener); previous was a tap-lane prompt (boilerplate omitted). KNOWN STUDENT MISS: embeds 'what is in front' so the student says SCENE — motivating row for the v3 app-cue-garble branch",
+        ),
+        Row(
+            id = "dev7",
+            lang = "en",
+            query = "you read this for me",
+            previous = null,
+            expected = "VLM_TEXT_READ",
+            regexAction = "VLM_TEXT_READ",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_6: read intent via legacy keyword; previous was a tap-lane prompt (boilerplate omitted)",
+        ),
+        Row(
+            id = "dev8",
+            lang = "en",
+            query = "is this a drinking water",
+            previous = null,
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_4: product verification ask; previous was a tap-lane prompt (boilerplate omitted)",
+        ),
+        Row(
+            id = "dev9",
+            lang = "en",
+            query = "is it recyclable",
+            previous = "you read this for me",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789950997064 ir_7: follow-up on the just-read object; catch-all",
+        ),
+        Row(
+            id = "dev10",
+            lang = "en",
+            query = "are you sure",
+            previous = "and what is behind it",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789815166971 ir_2: challenge follow-up; the app answers these from the live scene, never IGNORE",
+        ),
+        Row(
+            id = "dev11",
+            lang = "en",
+            query = "and what is behind it",
+            previous = "what is in front of me",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789815166971 vm_3: spatial follow-up; catch-all (deliberately not SCENE: it points at a target rather than a broad describe)",
+        ),
+        Row(
+            id = "dev12",
+            lang = "en",
+            query = "what about this",
+            previous = "is that a refrigerator",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789815166971 ir_5: follow-up echo trap; seed f2 analog from real usage",
+        ),
+        Row(
+            id = "dev13",
+            lang = "en",
+            query = "but it looks like refrigerator",
+            previous = "are you sure",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789815166971 ir_3: user correction; catch-all",
+        ),
+        Row(
+            id = "dev14",
+            lang = "en",
+            query = "is that a refrigerator",
+            previous = "but it looks like refrigerator",
+            expected = "VLM_VOICE_QUERY",
+            regexAction = "VLM_VOICE_QUERY",
+            jevAction = null,
+            jevConfidence = null,
+            jevFastPathNoul = null,
+            note = "session 1789815166971 ir_4: verification question; catch-all",
         ),
     )
 
