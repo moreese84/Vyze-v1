@@ -1391,6 +1391,13 @@ class CameraFragment : Fragment() {
                         }
                         // ── NORMAL VLM PIPELINE ──────────────────────
                         else -> {
+                        // PHASE 3 SHADOW ROUTER (speech lane): every query
+                        // reaching the speech-intelligence router is also
+                        // observed by the shadow router — same log-only,
+                        // flag-gated observation the tap lane gets in
+                        // [bargeInAndCapture]. Nothing is executed here.
+                        logShadowRoute(spokenText)
+
                         // ── ACCESSIBILITY SETTINGS COMMAND ───────
                         // "open accessibility settings" takes the user to
                         // the system screen to disable TalkBack.

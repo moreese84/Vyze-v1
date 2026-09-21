@@ -28,6 +28,15 @@
             android:exported="true" />
 
         <!--
+            Shadow-route toggle (debug only): flips the in-process shadow
+            flag so ROUTE decisions can be verified on-device via logcat.
+            Process-local — every app restart restores default-dark.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.ShadowRouteToggleReceiver"
+            android:exported="true" />
+
+        <!--
             Auto-export provider (debug only). initOrder default; no
             authorities — every stub method returns null/0, nothing can
             query it. Multiprocess=false (default) keeps the export in the
