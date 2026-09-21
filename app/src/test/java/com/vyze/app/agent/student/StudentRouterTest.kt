@@ -179,6 +179,84 @@ class StudentRouterTest {
         )
     }
 
+    // ── v2: app-cue echo (device corpus distillation) ─────────────
+
+    @Test
+    fun `app cue echo is ignored`() {
+        val d = StudentRouter.decide("Please say that again")
+        assertEquals(RouterDecision.Action.IGNORE, d.action)
+        assertFalse(d.requiresVlm)
+    }
+
+    @Test
+    fun `app cue echo with punctuation and case is ignored`() {
+        assertEquals(
+            RouterDecision.Action.IGNORE,
+            StudentRouter.decide("Please, say that AGAIN!").action,
+        )
+    }
+
+    @Test
+    fun `app cue phrase inside a real request stays routable`() {
+        // Not an exact cue equality — must NOT hit the app-cue branch.
+        val d = StudentRouter.decide("Can you please say that again louder")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+    }
+
+    // ── v2: greeting garble (device corpus distillation) ──────────
+
+    @Test
+    fun `greeting garble without question content is ignored`() {
+        val d = StudentRouter.decide("Hello, I'm a model.")
+        assertEquals(RouterDecision.Action.IGNORE, d.action)
+    }
+
+    @Test
+    fun `second greeting garble variant is ignored`() {
+        // The ir_14 trap: "this" contains "is" — word-boundary matching
+        // must not read it as the question marker "is".
+        val d = StudentRouter.decide("Hey, I'm about this.")
+        assertEquals(RouterDecision.Action.IGNORE, d.action)
+    }
+
+    @Test
+    fun `greeting with a real question still routes to the VLM`() {
+        val d = StudentRouter.decide("Hello, what is in front of me?")
+        assertEquals(RouterDecision.Action.VLM_SCENE_DESCRIBE, d.action)
+    }
+
+    @Test
+    fun `greeting with a visual question falls through to voice query`() {
+        val d = StudentRouter.decide("Hi, is someone standing near me?")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+    }
+
+    // ── v2: ms deictic opener (device corpus distillation) ────────
+
+    @Test
+    fun `malay deictic opener routes to scene describe`() {
+        val d = StudentRouter.decide("Ini pula apa")
+        assertEquals(RouterDecision.Action.VLM_SCENE_DESCRIBE, d.action)
+        assertTrue(d.requiresVlm)
+    }
+
+    @Test
+    fun `malay repeated deictic opener routes to scene describe`() {
+        assertEquals(
+            RouterDecision.Action.VLM_SCENE_DESCRIBE,
+            StudentRouter.decide("Ini pula apa ini pula apa").action,
+        )
+    }
+
+    @Test
+    fun `malay follow-up yang ini pula stays a voice query`() {
+        // Seed follow-up f8 — must NOT be swallowed by the new opener rule.
+        assertEquals(
+            RouterDecision.Action.VLM_VOICE_QUERY,
+            StudentRouter.decide("Yang ini pula?").action,
+        )
+    }
+
     // ── Catch-all preserves the legacy fallback ───────────────────
 
     @Test

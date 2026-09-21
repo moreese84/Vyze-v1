@@ -4,13 +4,30 @@ import com.vyze.app.agent.RouterDecision
 import java.util.Locale
 
 /**
- * STUDENT ROUTER v1 — distilled offline from the Phase 0 Jev harness.
+ * STUDENT ROUTER v2 — distilled offline from the Jev harness.
  *
- * PROVENANCE: rules below were derived from the regex-wrong/Jev-right rows
+ * PROVENANCE: v1 rules were derived from the regex-wrong/Jev-right rows
  * of the frozen Phase 0 fixture (app/src/test/resources/fixtures/
- * phase0_route_labels.jsonl, also at docs/eval/). Jev (cloud, dev-machine
- * only) labeled the corpus; this class is the offline student that ships.
- * No network, no Jev code, no Android dependencies — JVM-pure.
+ * phase0_route_labels.jsonl, also at docs/eval/). v2 adds three narrow
+ * branches distilled from the live-labeled DEVICE corpus
+ * (tools/jev_harness/corpus/jev_export, git-ignored — real usage
+ * transcripts are never committed):
+ *  - APP-CUE ECHO → IGNORE. Vyze's own spoken prompts ("Please say that
+ *    again.", "Analyzing.", …) get re-captured by the mic as user queries
+ *    and were answered with stale scene text (device rows ir_2; audit
+ *    relevance 1.26 with a stale answer). Exact-phrase match only.
+ *  - GREETING GARBLE → IGNORE. ASR fragments that open with a greeting
+ *    and carry no question content ("Hello, I'm a model." / "Hey, I'm
+ *    about this." — Jev IGNORE at 0.79/0.75) were falling through to
+ *    full scene descriptions (device rows ir_13/ir_14). Greetings with a
+ *    question word still route normally.
+ *  - MS DEICTIC OPENER → SCENE. "ini pula apa" (≈ "what is this now")
+ *    is a scene-describe opener, not a follow-up voice query (device row
+ *    vm_16, Jev 0.65). Exact phrase; seed follow-up "Yang ini pula?" is
+ *    untouched.
+ * Jev (cloud, dev-machine only) labeled the corpora; this class is the
+ * offline student that ships. No network, no Jev code, no Android
+ * dependencies — JVM-pure.
  *
  * CONTRACT (mirrors VyzeShadowRouter.decideSpeech):
  *  - pure text in → [RouterDecision] out; no I/O, no Android, no state.
@@ -34,6 +51,8 @@ import java.util.Locale
  * ACCURACY (frozen Phase 0 fixture, 52 rows with expected labels):
  * student 45/52 (86.5%) vs regex baseline 29/52 (55.8%). Per-language:
  * en 78.3% / ms 88.2% / zh 83.3% — measured by StudentRouterFixtureTest.
+ * v2 branches add 4/4 agreement with Jev on the device-corpus speech rows
+ * they target (ir_2, ir_13, ir_14, vm_16) without touching seed behavior.
  */
 object StudentRouter {
 
@@ -53,6 +72,39 @@ object StudentRouter {
         "what is in front", "what do you see", "describe this", "describe the",
         "apa kat depan", "apa di depan",
         "我面前是什么", "面前是什么", "描述一下", "描述这个",
+        "ini pula apa",  // v2: ms deictic opener (device row vm_16, Jev 0.65)
+    )
+
+    /**
+     * v2: Vyze's OWN spoken prompts, captured by the mic as user queries
+     * (device row ir_2 — answered with a stale scene description before).
+     * Matched by EXACT normalized equality, never substring: a real user
+     * asking for a repeat says "can you say that again", which differs and
+     * stays routable. Extend only with strings Vyze itself speaks.
+     */
+    private val APP_CUE_PHRASES = setOf(
+        "please say that again",
+        "i did not catch that double tap and try again",
+        "i didn't catch that double tap and try again",
+        "analyzing",
+        "almost ready",
+    )
+
+    /** v2: opening greeting tokens for the greeting-garble branch. */
+    private val GREETING_TOKENS = setOf("hello", "hi", "hey", "hai")
+
+    /**
+     * v2: question-content markers. A greeting-containing transcript with
+     * none of these is treated as garble, not a request. ASCII markers
+     * match on WORD BOUNDARIES (a substring "is" match inside "this" must
+     * not count — device row ir_14 is exactly that case); CJK markers match
+     * as substrings, mirroring containsKeyword.
+     */
+    private val QUESTION_MARKERS = listOf(
+        "what", "where", "when", "who", "why", "how", "which",
+        "is", "are", "was", "can", "could", "do", "does", "did",
+        "apa", "mana", "bila", "siapa", "kenapa", "macam mana", "adakah",
+        "吗", "呢", "什么", "哪", "怎么",
     )
 
     private val COLOR_KEYWORDS = listOf(
@@ -90,7 +142,7 @@ object StudentRouter {
     private val WORD_BOUNDARY_MATCHERS: Map<String, Regex> =
         (LEGACY_READ_KEYWORDS + READ_EXTRA_KEYWORDS + SCENE_KEYWORDS +
             COLOR_KEYWORDS + LIGHT_KEYWORDS + DANGER_KEYWORDS +
-            OUT_OF_DOMAIN_KEYWORDS + DEVICE_CONTROL_KEYWORDS)
+            OUT_OF_DOMAIN_KEYWORDS + DEVICE_CONTROL_KEYWORDS + QUESTION_MARKERS)
             .filter { kw -> kw.all { it.code < 128 } }
             .associateWith { kw -> Regex("\\b${Regex.escape(kw)}\\b") }
 
@@ -118,6 +170,13 @@ object StudentRouter {
             )
         }
         val lower = text.lowercase(Locale.ROOT)
+        // Punctuation-stripped form for exact-phrase matching (v2 branches):
+        // curly apostrophes and trailing marks must not break equality.
+        val normalizedText = lower
+            .replace('\u2019', '\'')
+            .filter { it.isLetterOrDigit() || it == ' ' }
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
         // 1. Read intent — legacy keywords win first, then distilled extras.
         if (LEGACY_READ_KEYWORDS.anyIn(lower) || READ_EXTRA_KEYWORDS.anyIn(lower)) {
@@ -174,8 +233,35 @@ object StudentRouter {
                 includeCameraFrame = false,
             )
         }
-        // 7. Filler-only transcripts are noise.
-        val contentTokens = lower
+        // 7. v2: app-cue echo — Vyze's own spoken prompt re-captured as a
+        //    query. Exact normalized equality; runs AFTER the positive
+        //    intents so a cue phrase inside a real request stays routable.
+        if (normalizedText in APP_CUE_PHRASES) {
+            return RouterDecision(
+                action = RouterDecision.Action.IGNORE,
+                reason = "student: app-cue echo (distilled: device corpus jev labels)",
+                requiresVlm = false,
+                includeCameraFrame = false,
+            )
+        }
+        // 8. v2: greeting-only garble — starts with a greeting token, no
+        //    question content (device rows ir_13/ir_14, Jev IGNORE 0.79/0.75).
+        //    Markers use the word-boundary matcher: "this" must not read as
+        //    the marker "is".
+        val firstToken = normalizedText.substringBefore(' ')
+        if (firstToken in GREETING_TOKENS &&
+            !QUESTION_MARKERS.anyIn(normalizedText)
+        ) {
+            return RouterDecision(
+                action = RouterDecision.Action.IGNORE,
+                reason = "student: greeting garble without question content " +
+                    "(distilled: device corpus jev labels)",
+                requiresVlm = false,
+                includeCameraFrame = false,
+            )
+        }
+        // 9. Filler-only transcripts are noise.
+        val contentTokens = normalizedText
             .split(Regex("[^\\p{L}\\p{N}]+"))
             .filter { it.isNotEmpty() && it !in FILLER_TOKENS }
         if (contentTokens.isEmpty()) {
@@ -186,7 +272,7 @@ object StudentRouter {
                 includeCameraFrame = false,
             )
         }
-        // 8. Catch-all — the exact legacy fallback.
+        // 10. Catch-all — the exact legacy fallback.
         return RouterDecision(
             action = RouterDecision.Action.VLM_VOICE_QUERY,
             reason = "student: general voice query (legacy catch-all)",
