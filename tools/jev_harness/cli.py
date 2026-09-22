@@ -3,10 +3,12 @@
 
   python -m tools.jev_harness route [--corpus FILE] [--out FILE] [--live]
   python -m tools.jev_harness audit --corpus FILE [--out FILE] [--live]
+  python -m tools.jev_harness append EXPORT_JSONL [...] -o ROLLING.jsonl
 
 Dry-run (default) needs no API key and exercises the full pipeline
 offline. --live requires TYPESAFE_API_KEY in the environment and the
-typesafe-sdk package installed.
+typesafe-sdk package installed. `append` is always offline (A1: rolling
+corpus growth — dedupes on id+ts, never drops rows silently).
 """
 
 import argparse
@@ -50,7 +52,25 @@ def main(argv: list[str] | None = None) -> int:
     p_audit = sub.add_parser("audit", help="audit transcripts: echo/language/relevance")
     add_common(p_audit)
 
+    p_append = sub.add_parser(
+        "append",
+        help="A1: merge device exports into a rolling corpus file",
+    )
+    p_append.add_argument("inputs", nargs="+",
+                          help="export JSONL files (corpus/jev_export/interactions_*.jsonl)")
+    p_append.add_argument("-o", "--out", required=True,
+                          help="rolling corpus JSONL path (created if missing, .bak kept)")
+    p_append.add_argument("--namespace", action="store_true",
+                          help="rewrite ids as <session-stem>_<id> so cross-session "
+                               "id collisions (ir_1 in every export) cannot merge rows")
+
     args = parser.parse_args(argv)
+
+    # A1 append never needs a corpus/model — dispatch before that machinery.
+    if args.cmd == "append":
+        from .append import append_sources
+        append_sources(args.inputs, args.out, namespace=args.namespace)
+        return 0
 
     corpus_path = args.corpus or "builtin"
     items = CORPUS if args.corpus is None else load_corpus(args.corpus)

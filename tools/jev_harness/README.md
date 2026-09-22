@@ -41,6 +41,13 @@ python -m tools.jev_harness route --corpus corpus/device_queries.jsonl --live \
 # 4. Audit recorded (query, answer) transcripts — the echo / mirror reports
 #    (rows need at least: query, answer; optional: id, lang, previous)
 python -m tools.jev_harness audit --corpus corpus/transcripts.jsonl --live
+
+# 5. A1: merge new device exports into the rolling corpus (offline,
+#    idempotent — safe to re-run; dedupes on id+ts)
+python -m tools.jev_harness append corpus/jev_export/interactions_*.jsonl \
+    -o corpus/rolling.jsonl
+#    add --namespace to rewrite ids as <session>_<id> so the per-export
+#    id counter restart (ir_1 in every session) can never collide
 ```
 
 ## What it measures
@@ -82,7 +89,10 @@ Two corpus kinds:
    ```sh
    adb shell am broadcast -n com.vyze.app/.debug.InteractionLogExportReceiver
    adb pull /sdcard/Android/data/com.vyze.app/files/jev_export/ corpus/
-   python -m tools.jev_harness audit --corpus corpus/jev_export/<file>.jsonl --live
+   # merge every export into the rolling corpus (idempotent), then audit it:
+   python -m tools.jev_harness append corpus/jev_export/interactions_*.jsonl \
+       -o corpus/rolling.jsonl
+   python -m tools.jev_harness audit --corpus corpus/rolling.jsonl --live
    ```
 
    The exporter merges both transcript stores (camera-lane
