@@ -37,12 +37,14 @@ object VyzeAgentRuntime {
     /**
      * VLM pre-gate flag ([PreGatePolicy]). Ships FALSE — when dark, every
      * transcript takes the exact legacy dispatch (zero behavior change).
-     * Like [shadowEnabled], the runtime never enables itself; the debug
-     * toggle receiver flips it process-locally and every app restart
-     * restores default-dark. When enabled, only the three high-confidence
-     * IGNORE families (app-cue echo / greeting garble / filler-only)
-     * bypass the VLM; all positive intents and the catch-all pass through
-     * untouched.
+     * Like [shadowEnabled], the runtime never enables itself. Default-dark
+     * on every app start holds for RELEASE by construction (no toggle
+     * component exists); DEBUG builds additionally persist the last
+     * toggled state (PreGateStickyProvider) so the OEM memory manager
+     * killing the app between test cycles doesn't re-darken it mid-test.
+     * When enabled, only the three high-confidence IGNORE families
+     * (app-cue echo / greeting garble / filler-only) bypass the VLM; all
+     * positive intents and the catch-all pass through untouched.
      */
     @Volatile
     var preGateEnabled: Boolean = false

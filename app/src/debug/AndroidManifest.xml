@@ -47,6 +47,18 @@
             android:exported="true" />
 
         <!--
+            Sticky pre-gate restore (debug only): runs at process start,
+            before Application.onCreate, and restores the last toggled
+            pre-gate state so the OEM memory manager killing the app between
+            test cycles doesn't re-darken the flag. Stub provider — no
+            tables, no queries. Does not exist in release builds.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.PreGateStickyProvider"
+            android:authorities="${applicationId}.debug.pregatesticky"
+            android:exported="false" />
+
+        <!--
             Auto-export provider (debug only). initOrder default; no
             authorities — every stub method returns null/0, nothing can
             query it. Multiprocess=false (default) keeps the export in the

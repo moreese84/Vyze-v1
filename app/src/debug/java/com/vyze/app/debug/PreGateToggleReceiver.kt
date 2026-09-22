@@ -24,8 +24,11 @@ import com.vyze.app.agent.VyzeAgentRuntime
  *     adb shell am broadcast -n com.vyze.app/.debug.PreGateToggleReceiver
  *     adb shell am broadcast -n com.vyze.app/.debug.PreGateToggleReceiver --ez enabled false
  *
- * (Omitting --ez toggles: on → off → on. The flag is process state — an
- * app restart resets it to false.)
+ * (Omitting --ez toggles: on → off → on. The state is STICKY within
+ * debug builds — [PreGateStickyProvider] persists it and restores it at
+ * process start, so the OEM memory manager killing the app between test
+ * cycles no longer re-darkens the flag mid-testing. Release builds have
+ * no such components and always start dark.)
  *
  * Exported=true is intentional and safe: the component exists ONLY in
  * debug builds and its sole effect is flipping an in-memory boolean that
@@ -40,7 +43,11 @@ class PreGateToggleReceiver : BroadcastReceiver() {
             !VyzeAgentRuntime.preGateEnabled
         }
         VyzeAgentRuntime.preGateEnabled = requested
-        Log.i(TAG, "VLM pre-gate ${if (requested) "ENABLED" else "DISABLED"} (process-local)")
+        // STICKY (debug only): persist so PreGateStickyProvider restores
+        // the state when the OEM memory manager kills and restarts the
+        // process — otherwise every kill silently re-darkens the flag.
+        PreGateStickyProvider.setSticky(context.applicationContext, requested)
+        Log.i(TAG, "VLM pre-gate ${if (requested) "ENABLED" else "DISABLED"} (sticky: survives restarts; debug only)")
     }
 
     private companion object {

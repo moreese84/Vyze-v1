@@ -1432,8 +1432,21 @@ class CameraFragment : Fragment() {
                     // detected as device-English would otherwise REVERT the
                     // mirrored Malay/Chinese TTS voice mid-answer, and the
                     // rest of the answer would play with the wrong voice.
+                    // PRE-GATE LANGUAGE GUARD: greeting-garble / filler /
+                    // app-cue transcripts must not steer the TTS voice. The
+                    // recognizer freely mislabels short garble — "hello" was
+                    // tagged ms_MY (loanword) and the mirrored locale made the
+                    // NEXT spoken response come out Malay (live-tested
+                    // 2026-09-22). Same contract as the ANALYZING/SPEAKING
+                    // drop below: only real queries interrupt speech or set
+                    // the active language.
+                    val preGateHandles = VyzeAgentRuntime.preGateEnabled &&
+                        PreGatePolicy.evaluate(spokenText) !=
+                            PreGatePolicy.ResponseMode.PASS_THROUGH
                     if (appState == AppState.ANALYZING || appState == AppState.SPEAKING) {
                         Log.d(TAG, "Speech result during $appState — skipping barge-in + locale change (noise gate will drop)")
+                    } else if (preGateHandles) {
+                        Log.d(TAG, "Pre-gate family — skipping barge-in + locale change (garble must not steer language)")
                     } else {
                         activity.interruptTts()
                         coreController.setUserLocale(detectedLocale)

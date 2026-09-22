@@ -60,6 +60,18 @@ class PreGatePolicyTest {
         )
     }
 
+    @Test
+    fun `asr doubled greeting garble gets gentle ignore`() {
+        // Live regression (2026-09-22): the recognizer committed "hello
+        // hello" tagged ms_MY — the pre-gate must still admit it, so the
+        // dispatch guard can skip the barge-in + locale mirror (garble must
+        // never steer the TTS voice into Malay).
+        assertEquals(
+            ResponseMode.GENTLE_IGNORE,
+            PreGatePolicy.evaluate("hello hello"),
+        )
+    }
+
     // ── Admitted family 3: filler-only → GENTLE_IGNORE ───────────────
 
     @Test
