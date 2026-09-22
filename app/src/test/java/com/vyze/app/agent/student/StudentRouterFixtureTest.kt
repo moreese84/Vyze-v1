@@ -152,6 +152,9 @@ class StudentRouterFixtureTest {
             "dev3" to "IGNORE",             // app-cue echo ("please say that again")
             "dev4" to "IGNORE",             // greeting garble ("Hello, I'm a model.")
             "dev5" to "IGNORE",             // greeting garble ("Hey, I'm about this.")
+            // 2026-09-22 sessions (live pre-gate evidence):
+            "dev21" to "VLM_TEXT_READ",     // greeting + real read intent — read keywords win BEFORE the v2 greeting-garble branch
+            "dev22" to "IGNORE",            // doubled greeting garble ("Hello, hello. Hello.") — the live GENTLE_IGNORE form
         )
         for (r in deviceRows) {
             val pinned = v2Pins[r.id] ?: continue
