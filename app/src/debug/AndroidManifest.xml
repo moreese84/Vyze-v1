@@ -37,6 +37,16 @@
             android:exported="true" />
 
         <!--
+            VLM pre-gate toggle (debug only): flips the in-process pre-gate
+            flag so IGNORE-family traffic can be verified as VLM-skipping on
+            device via logcat ("VLM pre-gate:" lines). Process-local — every
+            app restart restores default-dark.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.PreGateToggleReceiver"
+            android:exported="true" />
+
+        <!--
             Auto-export provider (debug only). initOrder default; no
             authorities — every stub method returns null/0, nothing can
             query it. Multiprocess=false (default) keeps the export in the

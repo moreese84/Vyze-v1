@@ -34,6 +34,19 @@ object VyzeAgentRuntime {
     @Volatile
     var shadowEnabled: Boolean = false
 
+    /**
+     * VLM pre-gate flag ([PreGatePolicy]). Ships FALSE — when dark, every
+     * transcript takes the exact legacy dispatch (zero behavior change).
+     * Like [shadowEnabled], the runtime never enables itself; the debug
+     * toggle receiver flips it process-locally and every app restart
+     * restores default-dark. When enabled, only the three high-confidence
+     * IGNORE families (app-cue echo / greeting garble / filler-only)
+     * bypass the VLM; all positive intents and the catch-all pass through
+     * untouched.
+     */
+    @Volatile
+    var preGateEnabled: Boolean = false
+
     /** Session episode store (shared with the maintenance tick). */
     val episodes = SessionEpisodeManager()
 
@@ -314,5 +327,6 @@ object VyzeAgentRuntime {
         AdkAgentManager.resetForTests()
         evalRecorder.clear()
         shadowEnabled = false
+        preGateEnabled = false
     }
 }

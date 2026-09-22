@@ -20,7 +20,10 @@ import java.util.Locale
  *    and carry no question content ("Hello, I'm a model." / "Hey, I'm
  *    about this." — Jev IGNORE at 0.79/0.75) were falling through to
  *    full scene descriptions (device rows ir_13/ir_14). Greetings with a
- *    question word still route normally.
+ *    question word still route normally. Exact matching uses an
+ *    apostrophe-stripped normalization: "didn't" → "didnt", so both the
+ *    straight- and curly-quote cue phrases actually match (previously
+ *    dead entries — the normalizer turned "didn't" into "didn t").
  *  - MS DEICTIC OPENER → SCENE. "ini pula apa" (≈ "what is this now")
  *    is a scene-describe opener, not a follow-up voice query (device row
  *    vm_16, Jev 0.65). Exact phrase; seed follow-up "Yang ini pula?" is
@@ -84,8 +87,11 @@ object StudentRouter {
      */
     private val APP_CUE_PHRASES = setOf(
         "please say that again",
-        "i did not catch that double tap and try again",
-        "i didn't catch that double tap and try again",
+        // Stored APOSTROPHE-STRIPPED to match the normalizer ("didn't" →
+        // "didnt"): the straight and curly variants collapse into one form.
+        // Before the fix this entry kept its apostrophe and could NEVER match
+        // — recaptures of Vyze's own spoken cue woke the VLM every time.
+        "i didnt catch that double tap and try again",
         "analyzing",
         "almost ready",
     )
@@ -172,6 +178,12 @@ object StudentRouter {
         val lower = text.lowercase(Locale.ROOT)
         // Punctuation-stripped form for exact-phrase matching (v2 branches):
         // curly apostrophes and trailing marks must not break equality.
+        // Apostrophes (straight AND curly) are DELETED by the filter below,
+        // not replaced with spaces: "didn't" normalizes to "didnt", so ASR
+        // punctuation variance can never split a cue phrase into two tokens.
+        // APP_CUE_PHRASES therefore stores the apostrophe-stripped form —
+        // before that fix the apostrophe entry could never match and
+        // recaptures of Vyze's own spoken cue woke the VLM every time.
         val normalizedText = lower
             .replace('\u2019', '\'')
             .filter { it.isLetterOrDigit() || it == ' ' }
@@ -234,8 +246,9 @@ object StudentRouter {
             )
         }
         // 7. v2: app-cue echo — Vyze's own spoken prompt re-captured as a
-        //    query. Exact normalized equality; runs AFTER the positive
-        //    intents so a cue phrase inside a real request stays routable.
+        //    query. Exact normalized equality (apostrophe-stripped — see the
+        //    normalizer note above); runs AFTER the positive intents so a cue
+        //    phrase inside a real request stays routable.
         if (normalizedText in APP_CUE_PHRASES) {
             return RouterDecision(
                 action = RouterDecision.Action.IGNORE,

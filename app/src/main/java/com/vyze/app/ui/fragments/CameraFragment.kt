@@ -4,6 +4,7 @@ import com.vyze.app.agent.RouterSignal
 import com.vyze.app.agent.RouterSnapshot
 import com.vyze.app.agent.VyzeAgentRuntime
 import com.vyze.app.agent.VyzeShadowRouter
+import com.vyze.app.agent.student.PreGatePolicy
 import com.vyze.app.core.ThermalPolicy
 import com.vyze.app.core.ThermalPowerController
 import androidx.lifecycle.lifecycleScope
@@ -196,6 +197,64 @@ class CameraFragment : Fragment() {
         } catch (t: Throwable) {
             CrashLogFile.log(TAG, "shadow route log failed: ${t.message}")
         }
+    }
+
+    /**
+     * VLM PRE-GATE (latency lever #1) — flag-gated by
+     * [VyzeAgentRuntime.preGateEnabled], ships dark.
+     *
+     * Returns true ONLY when the transcript is in a high-confidence IGNORE
+     * family the student classifies (app-cue echo / greeting garble /
+     * filler-only — see [PreGatePolicy]) AND the flag is on; the caller's
+     * ladder is then bypassed entirely: no capture, no Gemma inference,
+     * ~0ms instead of ~2s of GPU work for a question nobody asked.
+     *
+     * Response modes (PreGatePolicy.ResponseMode):
+     *  - SILENT (app-cue echo): nothing is spoken — Vyze is already talking
+     *    (the cue IS its own speech); interrupting itself to say "didn't
+     *    catch that" would worsen the echo.
+     *  - GENTLE_IGNORE (greeting garble / filler-only): speak the SAME
+     *    localized "did not catch that" cue the empty-result path uses, and
+     *    confirm with the standard tap haptic. No state flips: the mic
+     *    session died with the speakQueued flush (same mechanism as the
+     *    instant-answer lane), APP stays IDLE, and the next double tap
+     *    starts fresh — identical to a rejected utterance, minus the wasted
+     *    VLM inference.
+     *
+     * False is returned for everything else (positive intents, catch-all)
+     * and whenever the flag is dark — the ladder proceeds unchanged.
+     */
+    private fun maybeHandlePreGate(spokenText: String): Boolean {
+        if (!VyzeAgentRuntime.preGateEnabled) return false
+        val mode = PreGatePolicy.evaluate(spokenText)
+        if (mode == PreGatePolicy.ResponseMode.PASS_THROUGH) return false
+        Log.i(TAG, "VLM pre-gate: $mode for \"$spokenText\" (VLM skipped)")
+        when (mode) {
+            PreGatePolicy.ResponseMode.SILENT -> {
+                // App-cue echo: Vyze is already speaking this exact prompt;
+                // stay silent rather than interrupt itself.
+            }
+            PreGatePolicy.ResponseMode.GENTLE_IGNORE -> {
+                try {
+                    ttsManager.speakQueued(
+                        ttsManager.localized(
+                            "I did not catch that. Double tap and try again.",
+                            "Saya tidak dengar itu. Sentuh dua kali dan cuba lagi.",
+                            "我没有听清，请双击屏幕再试一次。"
+                        )
+                    )
+                } catch (_: Throwable) {}
+                try {
+                    systemVibrator?.vibrate(
+                        VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE)
+                    )
+                } catch (_: Throwable) {}
+            }
+            PreGatePolicy.ResponseMode.PASS_THROUGH -> {
+                // Unreachable: PASS_THROUGH returned false above.
+            }
+        }
+        return true
     }
 
     /**
@@ -1434,8 +1493,21 @@ class CameraFragment : Fragment() {
                                 //    the reset wipes the prior-answer anchor.
                                 // 2. Instant answers (time/date/battery) —
                                 //    local, no capture, no inference.
-                                // 3. Normal pipelines (existing behavior).
-                                if (coreController.detectConversationVerb(spokenText)) {
+                                // 3. VLM PRE-GATE (latency lever #1, ships
+                                //    dark): when enabled, high-confidence
+                                //    IGNORE families (app-cue echo / greeting
+                                //    garble / filler-only) skip the VLM — see
+                                //    PreGatePolicy. Deliberately INSIDE this
+                                //    branch: the settings/noise-gate/
+                                //    confirmation handling above must never be
+                                //    bypassed (a garble picked up mid-answer
+                                //    must be dropped by the noise gate, not
+                                //    flush the in-flight response).
+                                // 4. Normal pipelines (existing behavior).
+                                if (maybeHandlePreGate(spokenText)) {
+                                    // Handled: no capture, no VLM, no state
+                                    // change (see maybeHandlePreGate).
+                                } else if (coreController.detectConversationVerb(spokenText)) {
                                     Log.d(TAG, "Conversation verb: \"$spokenText\" — expanding on retained frame")
                                     appState = AppState.ANALYZING
                                     updateStatus("Answering...")

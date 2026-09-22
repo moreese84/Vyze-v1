@@ -197,6 +197,26 @@ class StudentRouterTest {
     }
 
     @Test
+    fun `app cue echo with straight apostrophe is ignored`() {
+        // Regression: the normalizer strips apostrophes ("didn't" →
+        // "didnt"), so the cue set must store the stripped form. Before the
+        // fix the apostrophe entry could never match and this recapture of
+        // Vyze's own spoken cue woke the VLM every time.
+        assertEquals(
+            RouterDecision.Action.IGNORE,
+            StudentRouter.decide("I didn't catch that. Double tap and try again.").action,
+        )
+    }
+
+    @Test
+    fun `app cue echo with curly apostrophe is ignored`() {
+        assertEquals(
+            RouterDecision.Action.IGNORE,
+            StudentRouter.decide("I didn\u2019t catch that. Double tap and try again.").action,
+        )
+    }
+
+    @Test
     fun `app cue phrase inside a real request stays routable`() {
         // Not an exact cue equality — must NOT hit the app-cue branch.
         val d = StudentRouter.decide("Can you please say that again louder")
