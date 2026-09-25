@@ -39,6 +39,11 @@ object SelfTalkPolicy {
         Regex("\\bi\\s?m an ai( assistant)?\\b"),
         Regex("\\bas an ai( language model)?\\b"),
         Regex("\\bi cannot (and )?will not\\b"),
+        // Polite-refusal forms (Jev teacher, 2026-09-25 corpus run: the one
+        // genuine gap — "I'm sorry, I cannot fulfill this request."). The
+        // normalizer renders both "I'm" and "I am" as "i m" / "i am".
+        Regex("\\bi (am|m) sorry\\b.{0,30}\\bi cannot\\b"),
+        Regex("\\bi cannot fulfill\\b"),
         // Refusal-speak (ms) — the ms refusal hallucination.
         Regex("\\bsaya (tidak boleh|tidak dapat|tidak mampu)\\b"),
         Regex("\\bsebagai model (bahasa )?besar\\b"),

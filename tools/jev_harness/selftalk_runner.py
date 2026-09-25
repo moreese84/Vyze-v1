@@ -35,33 +35,47 @@ def load_rows(path: str) -> list[dict]:
 def selftalk_labels(items: list[dict], *, live: bool, model: str = MODEL_DEFAULT,
                     sleep_s: float = 0.2) -> list[dict]:
     """Classify every row; on-device policy verdict rides along for comparison."""
-    from .selftalk_device_mirror import device_policy_verdict
+    from .selftalk_device_mirror import device_policy_verdict, is_tap_lane
 
     rows: list[dict] = []
-    client = _client(model) if live else None
-    questions = selftalk_questions() if live else None
+    if not live:
+        for item in items:
+            row = dict(item)
+            row.update({"jev_selftalk_class": None, "jev_selftalk_confidence": None})
+            row["device_selftalk"] = device_policy_verdict(str(item.get("query", "")))
+            row["lane"] = "tap" if is_tap_lane(item) else "voice"
+            rows.append(row)
+        return rows
 
-    for item in items:
-        query = str(item.get("query", ""))
-        row = dict(item)
-        row.update({"jev_selftalk_class": None, "jev_selftalk_confidence": None})
-        row["device_selftalk"] = device_policy_verdict(query)
-
-        if live and query.strip():
-            try:
-                state = build_state(item)
-                judgment = client.decide(questions["selftalk_class"], state)
-                row.update(extract(item, judgment))
-                time.sleep(sleep_s)
-            except Exception as e:  # one bad row never kills the pass
-                row["selftalk_error"] = f"{type(e).__name__}: {e}"
-        rows.append(row)
+    client = _client(model)
+    with client:
+        for item in items:
+            query = str(item.get("query", ""))
+            row = dict(item)
+            row.update({"jev_selftalk_class": None, "jev_selftalk_confidence": None})
+            row["device_selftalk"] = device_policy_verdict(query)
+            row["lane"] = "tap" if is_tap_lane(item) else "voice"
+            # Tap-lane rows carry no spoken language — the speech filter
+            # never sees them; grading them only generates noise.
+            if query.strip() and row["lane"] == "voice":
+                try:
+                    result = client.system_one(
+                        state=build_state(item),
+                        questions=selftalk_questions(),
+                    )
+                    row.update(extract(result))
+                    row["selftalk_error"] = None
+                    time.sleep(sleep_s)
+                except Exception as e:  # one bad row never kills the pass
+                    row["selftalk_error"] = f"{type(e).__name__}: {e}"
+            rows.append(row)
     return rows
 
 
 def write_report(rows: list[dict], out_path: str | None) -> None:
     """Console + file report: agreement rate and the misses that matter."""
     ok = [r for r in rows if r.get("jev_selftalk_class")]
+    skipped_tap = sum(1 for r in rows if r.get("lane") == "tap")
     lines = ["SELF-TALK TEACHER REPORT", ""]
 
     if not ok:
@@ -83,7 +97,7 @@ def write_report(rows: list[dict], out_path: str | None) -> None:
         if r["jev_selftalk_class"] == "user_speech" and r["device_selftalk"]
     ]
 
-    lines.append(f"rows compared:            {len(ok)}")
+    lines.append(f"voice rows compared:      {len(ok)} (tap-lane skipped: {skipped_tap})")
     lines.append(f"Jev-flagged suspect:      {sum(1 for r in ok if r['jev_selftalk_class'] in SUSPECT_CLASSES)}")
     lines.append(f"MISSED BY DEVICE POLICY:  {len(misses)}  <- next pattern revision")
     lines.append(f"device false drops:       {len(false_drops)}  <- patterns too aggressive")

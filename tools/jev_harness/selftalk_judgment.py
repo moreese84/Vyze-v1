@@ -76,10 +76,12 @@ def build_state(item: dict) -> dict:
     }
 
 
-def extract(item: dict, judgment) -> dict:
-    """Flatten the judgment onto the corpus row (harness row convention)."""
+def extract(result) -> dict:
+    """Pull the self-talk class from a system_one response (harness row
+    convention: result.choices[<question id>] carries the Choice)."""
+    st = result.choices["selftalk_class"]
     return {
-        "jev_selftalk_class": judgment.choice,
-        "jev_selftalk_confidence": judgment.confidence,
-        "jev_selftalk_probabilities": dict(judgment.probabilities),
+        "jev_selftalk_class": st.choice,
+        "jev_selftalk_confidence": st.confidence,
+        "jev_selftalk_probabilities": dict(st.probabilities),
     }

@@ -12,12 +12,25 @@ exact device verdict to expose misses and over-drops.
 
 import re
 
+# Mirror of audit_judgment.lane_of: tap-lane rows carry no spoken language
+# and never touch the speech filter — the teacher must not grade them.
+TAP_QUERY_PREFIX = "User tapped at position"
+
+
+def is_tap_lane(item: dict) -> bool:
+    lane = item.get("lane")
+    if lane:
+        return lane == "tap"
+    return str(item.get("query", "")).startswith(TAP_QUERY_PREFIX)
+
 # Mirrors SelfTalkPolicy.SELF_TALK_PATTERNS (Kotlin), same order.
 SELF_TALK_PATTERNS = [
     re.compile(r"\bi am a (large )?language model\b"),
     re.compile(r"\bi\s?m an ai( assistant)?\b"),
     re.compile(r"\bas an ai( language model)?\b"),
     re.compile(r"\bi cannot (and )?will not\b"),
+    re.compile(r"\bi (am|m) sorry\b.{0,30}\bi cannot\b"),
+    re.compile(r"\bi cannot fulfill\b"),
     re.compile(r"\bsaya (tidak boleh|tidak dapat|tidak mampu)\b"),
     re.compile(r"\bsebagai model (bahasa )?besar\b"),
     re.compile(r"作为一个(?:大型)?语言模型"),

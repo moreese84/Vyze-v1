@@ -27,6 +27,13 @@ class SelfTalkPolicyTest {
     }
 
     @Test
+    fun `polite refusal form is dropped - Jev teacher gap fix`() {
+        // The one genuine miss from the 2026-09-25 corpus run.
+        assertTrue(SelfTalkPolicy.isSelfTalk("I'm sorry, I cannot fulfill this request."))
+        assertTrue(SelfTalkPolicy.isSelfTalk("I am sorry but I cannot help with that."))
+    }
+
+    @Test
     fun `malay refusal-speak is dropped`() {
         assertTrue(SelfTalkPolicy.isSelfTalk("Saya tidak dapat memproses permintaan anda."))
         assertTrue(SelfTalkPolicy.isSelfTalk("Saya tidak boleh membantu dengan itu."))
