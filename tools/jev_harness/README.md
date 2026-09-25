@@ -66,6 +66,60 @@ shows the confidence distribution so thresholds are chosen from *our* data.
 - `language_matches_query` — `Noul` (en/ms/zh mirroring compliance)
 - `relevance` — `Score` (0–2, averaged)
 
+**Self-talk teacher pass (`selftalk`)** — per voice-lane row, one `Choice`:
+- `selftalk_class` — who spoke: `user_speech` / `model_self_talk` /
+  `not_user_content`. Compares Jev's verdict against the Python mirror
+  of the on-device `SelfTalkPolicy` (`selftalk_device_mirror.py`) and
+  reports **MISSED BY DEVICE POLICY** (new hallucination shapes → next
+  pattern revision) and **device false drops** (patterns too aggressive).
+  Tap-lane rows are skipped (no spoken language — the speech filter never
+  sees them). See "The self-talk ritual" below.
+
+## The self-talk ritual (anti-hallucination maintenance loop)
+
+Run this after every batch of new device sessions (roadshow, dogfooding,
+new languages/accents). It keeps the on-device L4 guarantee true as the
+corpus grows: **Vyze never speaks what it has no evidence for.**
+
+```sh
+# 0. Prereq (once): put the key in tools/jev_harness/.env (git-ignored):
+#    TYPESAFE_API_KEY=...
+
+# 1. New sessions on the device → export + pull (see the workflow above)
+#    adb shell am broadcast -n com.vyze.app/.debug.InteractionLogExportReceiver
+#    adb pull /sdcard/Android/data/com.vyze.app/files/jev_export/ corpus/
+
+# 2. Merge into the rolling corpus (idempotent):
+python -m tools.jev_harness append corpus/jev_export/interactions_*.jsonl \
+    -o corpus/rolling.jsonl
+
+# 3. Run the teacher (one cheap Choice call per voice row):
+python -m tools.jev_harness selftalk --corpus corpus/rolling.jsonl --live
+
+# 4. Read the report:
+#    MISSED BY DEVICE POLICY: N  → new hallucination shapes. For each:
+#      a. Is it ACTUALLY model self-talk/refusal (not app-cue echo — the
+#         router owns those, and tap-lane rows don't count)?
+#      b. Add the pattern to SelfTalkPolicy.SELF_TALK_PATTERNS (Kotlin)
+#         AND selftalk_device_mirror.py (Python) — keep them in sync,
+#         same order.
+#      c. Add the verbatim transcript as a named test case
+#         (SelfTalkPolicyTest) — it can never silently regress.
+#      d. Re-run this pass: the shape must move out of MISSED.
+#    device false drops: N  → a pattern is too wide. Narrow it the same
+#      way; a false drop means REAL user speech was silently discarded —
+#      fix before any release promotion.
+
+# 5. Watch-list discipline: a flagged shape with <3 corpus occurrences
+#    is NOT a pattern (over-fitting risk). Note it, wait for repeats.
+
+# 6. Commit: policy + mirror + tests together, one commit.
+```
+
+First run (2026-09-25, 75 rows → 65 voice): 1 genuine gap caught and
+fixed (polite-refusal "I'm sorry, I cannot fulfill this request."),
+0 false drops — the loop works. Cost: ~65 one-cent API calls per run.
+
 ## Corpus conventions
 
 Rows are dicts: `id`, `lang` (`en|ms|zh`), `query`, `expected`
