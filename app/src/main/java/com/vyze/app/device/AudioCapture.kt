@@ -229,6 +229,18 @@ object AudioCapture {
                 Log.w(TAG, "Capture too short (${bytes.size} bytes) — discarding")
                 return null
             }
+            // ── LAYER 0: SPEECH GATE (L4 anti-hallucination stack) ──
+            // A clip with essentially NO classified speech is hallucination
+            // bait: every observed Gemma fabrication ("Selamat pagi", "Saya
+            // tidak dapat memproses…", "I am a large language model…") sat
+            // on sub-300ms speech. Return null — the honest "I didn't catch
+            // that" — instead of spending ~1.5s of inference to fabricate.
+            // Pure policy, evidence-bounded floor: see [SpeechGatePolicy].
+            if (!SpeechGatePolicy.shouldTranscribe(speechMs)) {
+                Log.w(TAG, "Speech gate: speechMs=$speechMs < ${SpeechGatePolicy.MIN_SPEECH_MS} — silent clip, not transcribing")
+                CrashLogFile.log(TAG, "SPEECH GATE: dropped (speechMs=$speechMs < ${SpeechGatePolicy.MIN_SPEECH_MS})")
+                return null
+            }
             lastCapture = bytes  // retained for the suspect-transcript replay
             return bytes
 

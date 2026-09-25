@@ -59,6 +59,26 @@
             android:exported="false" />
 
         <!--
+            Gemma-always toggle (debug only): flips the voice-engine flag
+            so Design A (voice transcribes LOCALLY on every tap, online
+            included) can be verified on-device. Process-local + sticky
+            within debug builds; release always starts dark.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.GemmaAlwaysToggleReceiver"
+            android:exported="true" />
+
+        <!--
+            Sticky gemma-always restore (debug only): same discipline as
+            the pre-gate sticky provider — survives OEM kills during test
+            cycles. Stub provider; does not exist in release builds.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.GemmaAlwaysStickyProvider"
+            android:authorities="${applicationId}.debug.gemmaalwayssticky"
+            android:exported="false" />
+
+        <!--
             Auto-export provider (debug only). initOrder default; no
             authorities — every stub method returns null/0, nothing can
             query it. Multiprocess=false (default) keeps the export in the

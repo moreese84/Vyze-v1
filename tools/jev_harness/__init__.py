@@ -6,6 +6,9 @@ Modules:
   regex_baseline    — pure-Python mirror of VyzeShadowRouter.decideSpeech
   router_judgment   — Jev Choice+Noul routing questions
   audit_judgment    — Jev echo/language/relevance audit questions
+  selftalk_judgment — L4 teacher: who spoke (user/model/not-content)
+  selftalk_runner   — self-talk labeling pass + device-policy comparison
+  selftalk_device_mirror — Python mirror of the Kotlin SelfTalkPolicy
   runners           — corpus loading + live/dry-run labeling passes
   reports           — routing agreement + compliance summaries (gate evidence)
   cli               — `python -m tools.jev_harness route|audit`

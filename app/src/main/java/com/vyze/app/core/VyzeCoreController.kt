@@ -1,6 +1,7 @@
 package com.vyze.app.core
 import com.vyze.app.VyzeApplication
 import com.vyze.app.util.CrashLogFile
+import com.vyze.app.speech.SelfTalkPolicy
 import com.vyze.app.speech.TTSManager
 import com.vyze.app.device.AudioCapture
 import com.vyze.app.vision.EmbeddingEngine
@@ -829,6 +830,20 @@ class VyzeCoreController(
             // final flush in flushRemainingSentenceBuffer bypasses this
             // cap, so nothing held here is ever lost.
             if (ttsManager.pendingUtteranceCount() > TTSManager.MAX_PENDING_UTTERANCES) {
+                return
+            }
+
+            // ── LAYER 2: SELF-TALK ANSWER GUARD (L4 stack) ───────
+            // Last resort: if the model's ANSWER text contains self-talk
+            // (self-ID/refusal-speak), stop speaking the rest of that
+            // answer. Layers 0–1 gate the transcript; this gate makes the
+            // failure mode impossible to HEAR even if something slipped
+            // through. The buffer is cleared — the turn ends silently and
+            // the session completes (no nagging on top).
+            if (SelfTalkPolicy.isSelfTalk(text.toString())) {
+                Log.w(TAG, "Answer guard: SELF-TALK in answer buffer — suppressing remaining output")
+                CrashLogFile.log(TAG, "SELF-TALK GUARD: answer suppressed (${text.take(60)})")
+                sentenceBuffer.setLength(0)
                 return
             }
 
@@ -2399,15 +2414,25 @@ class VyzeCoreController(
             return null
         }
         // Gemma's ASR instruction — transcribe in the language ACTUALLY
-        // SPOKEN. The old prompt hard-pinned the active UI locale's
-        // language ("...in $langName into $langName text"), which
-        // straitjacketed the output: Chinese speech after a ms-MY ladder
-        // retry came back as Malay text (device log 2026-09-25, "ini apa").
-        // The active locale is now only a HINT; the model may fall back to
-        // any supported language the audio actually carries.
-        val langHint = activeUserLocale.getDisplayLanguage(java.util.Locale.US)
-            .ifBlank { null }
-        val asrPrompt = AsrPromptPolicy.buildTranscribePrompt(langHint)
+        // SPOKEN, with NO language hint at all.
+        //
+        // History (device logs, 2026-09-25):
+        //  1. The original prompt HARD-PINNED the active UI locale
+        //     ("in $langName into $langName text") — Mandarin came back
+        //     as Malay text.
+        //  2. The softened hint ("most likely in Malay, but may also be…")
+        //     STILL biased the model: with the UI locale at ms-MY, Chinese
+        //     speech in a marginal clip came back as "Ini apa" (15:20
+        //     session, Design A active). The hint carries the caller's
+        //     STALE UI state, which is exactly the evidence that poisoned
+        //     the pin — at capture time we have NO reliable knowledge of
+        //     the spoken language. The audio is the only evidence.
+        //
+        // The fully neutral prompt names the three supported languages and
+        // defers entirely to what was actually said. (The hinted form
+        // remains available in [AsrPromptPolicy] for future callers with
+        // REAL spoken-language evidence, and stays JVM-tested.)
+        val asrPrompt = AsrPromptPolicy.buildTranscribePrompt(langHint = null)
         return vlmEngine.transcribeAudio(
             audioBytes = audioBytes,
             prompt = asrPrompt,

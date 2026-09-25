@@ -3,9 +3,12 @@ import com.vyze.app.util.CrashLogFile
 import com.vyze.app.core.VyzeCoreController
 import com.vyze.app.ui.MainViewModel
 import com.vyze.app.device.HapticManager
+import com.vyze.app.agent.VyzeAgentRuntime
 import com.vyze.app.speech.LadderPolicy
+import com.vyze.app.speech.SelfTalkPolicy
 import com.vyze.app.speech.SuspectSignals
 import com.vyze.app.speech.TTSManager
+import com.vyze.app.speech.VoiceEnginePolicy
 import com.vyze.app.ui.TtsViewModel
 import com.vyze.app.device.AudioCapture
 import com.vyze.app.ui.SplashViewModel
@@ -665,6 +668,14 @@ class MainActivity : AppCompatActivity() {
                         Log.w(TAG, "Gemma-primary: nothing understood")
                         onSpeechError?.invoke("I didn't catch that — tap the mic to try again")
                     }
+                    // ── LAYER 1: SELF-TALK FILTER (L4 stack) ─────
+                    // The model spoke as ITSELF instead of transcribing
+                    // the user — never deliver that as a query.
+                    SelfTalkPolicy.isSelfTalk(transcription) -> {
+                        Log.w(TAG, "Gemma-primary: SELF-TALK dropped: \"$transcription\"")
+                        CrashLogFile.log(TAG, "SELF-TALK GUARD: gemma-primary dropped \"$transcription\"")
+                        onSpeechError?.invoke("I didn't catch that — tap the mic to try again")
+                    }
                     else -> {
                         Log.i(TAG, "Gemma-primary transcript: $transcription")
                         CrashLogFile.log(TAG, "GEMMA-PRIMARY TRANSCRIPT: $transcription")
@@ -737,6 +748,17 @@ class MainActivity : AppCompatActivity() {
                     val transcription = core.transcribeAudio(audio)?.trim()
                     if (transcription.isNullOrBlank()) {
                         Log.w(TAG, "Model-ASR rescue: nothing understood")
+                        finishRescueWithError(originalError)
+                        return@launch
+                    }
+                    // ── LAYER 1: SELF-TALK FILTER (L4 stack) ─────────
+                    // The rescue cue ("Please say that again.") is spoken
+                    // aloud RIGHT BEFORE recording — the highest-risk
+                    // capture for recapture. The model speaking as itself
+                    // (self-ID/refusal) is never the user's query.
+                    if (SelfTalkPolicy.isSelfTalk(transcription)) {
+                        Log.w(TAG, "Model-ASR rescue: SELF-TALK dropped: \"$transcription\"")
+                        CrashLogFile.log(TAG, "SELF-TALK GUARD: rescue dropped \"$transcription\"")
                         finishRescueWithError(originalError)
                         return@launch
                     }
@@ -828,6 +850,13 @@ class MainActivity : AppCompatActivity() {
                 val transcription = core.transcribeAudio(audio)?.trim()
                 if (transcription.isNullOrBlank()) {
                     Log.w(TAG, "Suspect audio replay: nothing understood")
+                    finishRescueWithError("No speech detected.")
+                    return@launch
+                }
+                // ── LAYER 1: SELF-TALK FILTER (L4 stack) ─────────────
+                if (SelfTalkPolicy.isSelfTalk(transcription)) {
+                    Log.w(TAG, "Suspect audio replay: SELF-TALK dropped: \"$transcription\"")
+                    CrashLogFile.log(TAG, "SELF-TALK GUARD: replay dropped \"$transcription\"")
                     finishRescueWithError("No speech detected.")
                     return@launch
                 }
@@ -1185,38 +1214,62 @@ class MainActivity : AppCompatActivity() {
                 // SpeechRecognizer is created — a bound recognizer service
                 // claims the recognition audio source and silences our own
                 // AudioRecord on the same source.
-                if (isDeviceOffline()) {
-                    val core = (application as? VyzeApplication)?.coreController
-                    if (core != null && core.isEngineReady() && !core.isCurrentlyInferring()) {
-                        if (noisePaused) {
-                            Log.d(TAG, "startListeningSafely: noise pause active — staying quiet until tap")
-                            return@post
-                        }
-                        if (ttsReady && ttsManager.hasPendingSpeech()) {
-                            Log.d(TAG, "startListeningSafely: answer still queued/speaking — deferring mic start")
-                            return@post
-                        }
-                        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
-                            != android.content.pm.PackageManager.PERMISSION_GRANTED
-                        ) {
-                            Log.d(TAG, "startListeningSafely: Requesting RECORD_AUDIO permission")
-                            audioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
-                            return@post
-                        }
-                        // Release any recognizer claim on the audio source.
-                        destroySpeechRecognizer()
-                        startGemmaPrimaryCapture(core)
+                // ── VOICE-ENGINE SELECTION (VoiceEnginePolicy) ──────
+                // Pure decision, capability booleans in → engine out:
+                //  - OFFLINE: Gemma primary (the original contract — the
+                //    platform recognizer accepts offline sessions and
+                //    returns NOTHING).
+                //  - ONLINE + gemmaAlwaysEnabled (Design A, debug toggle):
+                //    Gemma primary TOO — the system recognizer is not
+                //    consulted; the Mandarin ghost-text bug class is
+                //    bypassed rather than fought. Voice never leaves the
+                //    phone, unconditionally.
+                //  - Flag off + online: legacy platform-recognizer path
+                //    (ladder/rescue/suspects all intact as the fallback).
+                //  - Engine unusable (not ready/busy): system recognizer —
+                //    a slow local engine must never become a dead mic.
+                // CRITICAL ORDERING (unchanged): this branch runs BEFORE
+                // any SpeechRecognizer is created — a bound recognizer
+                // service claims the recognition audio source and silences
+                // our own AudioRecord on the same source.
+                val offline = isDeviceOffline()
+                val core = (application as? VyzeApplication)?.coreController
+                val engine = VoiceEnginePolicy.chooseEngine(
+                    gemmaAlwaysEnabled = VyzeAgentRuntime.gemmaAlwaysEnabled,
+                    deviceOffline = offline,
+                    engineReady = core != null && core.isEngineReady(),
+                    engineIdle = core == null || !core.isCurrentlyInferring(),
+                )
+                if (engine == VoiceEnginePolicy.Engine.GEMMA_PRIMARY && core != null) {
+                    if (noisePaused) {
+                        Log.d(TAG, "startListeningSafely: noise pause active — staying quiet until tap")
                         return@post
                     }
-                    // Skip-reason IN THE CRASH LOG (the pullable file) — the
-                    // offline branch MUST be able to explain itself.
-                    CrashLogFile.log(
-                        TAG,
-                        "GEMMA-PRIMARY SKIP: core=${core != null}, " +
-                            "ready=${core?.isEngineReady()}, inferring=${core?.isCurrentlyInferring()}"
-                    )
-                } else {
-                    CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: isDeviceOffline()=false at tap time")
+                    if (ttsReady && ttsManager.hasPendingSpeech()) {
+                        Log.d(TAG, "startListeningSafely: answer still queued/speaking — deferring mic start")
+                        return@post
+                    }
+                    if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED
+                    ) {
+                        Log.d(TAG, "startListeningSafely: Requesting RECORD_AUDIO permission")
+                        audioPermissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+                        return@post
+                    }
+                    // Release any recognizer claim on the audio source.
+                    destroySpeechRecognizer()
+                    startGemmaPrimaryCapture(core)
+                    return@post
+                }
+                // Explain every skip IN THE CRASH LOG (the pullable file).
+                if (engine == VoiceEnginePolicy.Engine.GEMMA_PRIMARY) {
+                    // Policy chose Gemma but core is somehow null —
+                    // unreachable in practice; log defensively.
+                    CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: core=null (defensive)")
+                } else if (core != null && core.isEngineReady() && VyzeAgentRuntime.gemmaAlwaysEnabled) {
+                    CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: engine busy at tap time (gemmaAlways on)")
+                } else if (!offline && !VyzeAgentRuntime.gemmaAlwaysEnabled) {
+                    CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: online + flag off → system recognizer (legacy)")
                 }
                 if (speechRecognizer == null) {
                     Log.w(TAG, "startListeningSafely: SpeechRecognizer is null")

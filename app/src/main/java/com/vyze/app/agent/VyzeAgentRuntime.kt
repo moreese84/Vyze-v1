@@ -49,6 +49,19 @@ object VyzeAgentRuntime {
     @Volatile
     var preGateEnabled: Boolean = false
 
+    /**
+     * DESIGN A "Gemma always" flag ([com.vyze.app.speech.VoiceEnginePolicy]).
+     * Ships FALSE — when dark, voice routing is the exact legacy behavior
+     * (system recognizer online, Gemma-primary offline). When enabled,
+     * voice transcribes LOCALLY on every tap, online included: the system
+     * recognizer is not consulted, and the Google-recognizer bug class
+     * (Mandarin ghost text, ladder churn) is bypassed. Debug toggle +
+     * sticky restore mirror [preGateEnabled]; promotion is a deliberate
+     * manual code change.
+     */
+    @Volatile
+    var gemmaAlwaysEnabled: Boolean = false
+
     /** Session episode store (shared with the maintenance tick). */
     val episodes = SessionEpisodeManager()
 

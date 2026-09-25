@@ -52,6 +52,13 @@ def main(argv: list[str] | None = None) -> int:
     p_audit = sub.add_parser("audit", help="audit transcripts: echo/language/relevance")
     add_common(p_audit)
 
+    p_selftalk = sub.add_parser(
+        "selftalk",
+        help="L4 teacher: class who spoke (user/model/not-content) and "
+             "compare against the on-device SelfTalkPolicy",
+    )
+    add_common(p_selftalk)
+
     p_append = sub.add_parser(
         "append",
         help="A1: merge device exports into a rolling corpus file",
@@ -86,6 +93,13 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(routing_report(rows))
         out = args.out or "out/route_labels.jsonl"
+    elif args.cmd == "selftalk":
+        from .selftalk_runner import selftalk_labels, write_report
+        rows = selftalk_labels(items, live=args.live, model=args.model,
+                               sleep_s=args.sleep)
+        print()
+        write_report(rows, None)
+        out = args.out or "out/selftalk_labels.jsonl"
     else:
         rows = audit_transcripts(items, live=args.live, model=args.model,
                                  sleep_s=args.sleep)
