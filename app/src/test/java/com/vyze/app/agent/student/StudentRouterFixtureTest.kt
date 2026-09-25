@@ -144,9 +144,9 @@ class StudentRouterFixtureTest {
     @Test
     fun `v2 regression - distilled device branches hold their labels`() {
         // Named pin for the v2 branches: any edit that flips one of these
-        // rows fails here BY NAME, not just as a rate drop. dev6 (app-cue
-        // garble hybrid) is deliberately absent — it is the documented
-        // known miss that motivates the v3 branch.
+        // rows fails here BY NAME, not just as a rate drop. dev6 was the
+        // documented known miss motivating the v3 branch — it now enters
+        // the corpus as dev24 with the same text and pins IGNORE.
         val v2Pins = mapOf(
             "dev2" to "VLM_SCENE_DESCRIBE", // ms deictic opener ("Ini pula apa…")
             "dev3" to "IGNORE",             // app-cue echo ("please say that again")
@@ -155,6 +155,11 @@ class StudentRouterFixtureTest {
             // 2026-09-22 sessions (live pre-gate evidence):
             "dev21" to "VLM_TEXT_READ",     // greeting + real read intent — read keywords win BEFORE the v2 greeting-garble branch
             "dev22" to "IGNORE",            // doubled greeting garble ("Hello, hello. Hello.") — the live GENTLE_IGNORE form
+            // 2026-09-24 session + dev6 promotion (v3 app-cue-garble branch):
+            "dev24" to "IGNORE",            // app-cue garble hybrid — the documented known miss, now fixed
+            "dev25" to "IGNORE",            // rescue self-talk hybrid ("Analyzing what is here in Xian")
+            "dev26" to "IGNORE",            // pure status-cue echo ("analyzing scene")
+            "dev27" to "VLM_TEXT_READ",     // real read request behind a cue opener stays routable
         )
         for (r in deviceRows) {
             val pinned = v2Pins[r.id] ?: continue

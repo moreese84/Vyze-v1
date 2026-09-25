@@ -223,6 +223,50 @@ class StudentRouterTest {
         assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
     }
 
+    // ── v3: app-cue garble hybrid (dev6 + 2026-09-24 session) ────
+
+    @Test
+    fun `app cue garble hybrid dev6 is ignored`() {
+        // The documented known miss, promoted to the corpus as dev24.
+        val d = StudentRouter.decide("is in front of me analyzing what is in front of me")
+        assertEquals(RouterDecision.Action.IGNORE, d.action)
+        assertFalse(d.requiresVlm)
+    }
+
+    @Test
+    fun `rescue self-talk hybrid is ignored`() {
+        // 2026-09-24 live: the model-ASR rescue transcribed Vyze's own
+        // "Analyzing" cue plus the user's half-remembered scene opener.
+        val d = StudentRouter.decide("Analyzing what is here in Xian")
+        assertEquals(RouterDecision.Action.IGNORE, d.action)
+        assertFalse(d.requiresVlm)
+    }
+
+    @Test
+    fun `pure status cue echo is ignored`() {
+        // The recognizer handed back Vyze's own TTS line as the result.
+        assertEquals(
+            RouterDecision.Action.IGNORE,
+            StudentRouter.decide("analyzing scene").action,
+        )
+    }
+
+    @Test
+    fun `real request behind a cue opener stays routable`() {
+        // Branch guard: read keywords run BEFORE the v3 hybrid check, so a
+        // real request that happens to open with the app's cue is served.
+        val d = StudentRouter.decide("Analyzing scene. Read the label for me")
+        assertEquals(RouterDecision.Action.VLM_TEXT_READ, d.action)
+    }
+
+    @Test
+    fun `knowledge question survives the hybrid check`() {
+        // A real ask keeps its question marker after cue+deictic stripping —
+        // must NOT be swallowed by the hybrid family.
+        val d = StudentRouter.decide("Analyzing what is paracetamol used for")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+    }
+
     // ── v2: greeting garble (device corpus distillation) ──────────
 
     @Test

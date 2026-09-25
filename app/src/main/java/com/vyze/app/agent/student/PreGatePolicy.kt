@@ -75,6 +75,10 @@ object PreGatePolicy {
         if (d.action != RouterDecision.Action.IGNORE) return ResponseMode.PASS_THROUGH
         return when {
             d.reason.contains("app-cue echo") -> ResponseMode.SILENT
+            // v3: the app's own status cue captured inside a garble hybrid —
+            // same family as the echo (Vyze is already talking; answering a
+            // scene nobody asked for is the dev6 regression). Silent skip.
+            d.reason.contains("app-cue garble hybrid") -> ResponseMode.SILENT
             d.reason.contains("greeting garble") -> ResponseMode.GENTLE_IGNORE
             d.reason.contains("filler-only") -> ResponseMode.GENTLE_IGNORE
             else -> ResponseMode.PASS_THROUGH

@@ -3,6 +3,8 @@ import com.vyze.app.util.CrashLogFile
 import com.vyze.app.core.VyzeCoreController
 import com.vyze.app.ui.MainViewModel
 import com.vyze.app.device.HapticManager
+import com.vyze.app.speech.LadderPolicy
+import com.vyze.app.speech.SuspectSignals
 import com.vyze.app.speech.TTSManager
 import com.vyze.app.ui.TtsViewModel
 import com.vyze.app.device.AudioCapture
@@ -461,9 +463,23 @@ class MainActivity : AppCompatActivity() {
     /**
      * Speak a short announcement without waiting for completion.
      * Used for status updates like "Analyzing scene..."
+     *
+     * SELF-TALK FIX (2026-09-24): never speak a status cue over an OPEN
+     * recognizer session. That session's cue was re-captured as the user's
+     * query ("analyzing scene", lang=ms_MY in the device log) and drove a
+     * full wrong-language answer pipeline. The mic hearing Vyze is always
+     * a bug: drop the cue while listening — the status line still shows
+     * visually, and the real answer follows moments later. The source fix
+     * for the capture path itself is the session-close at every rescue/
+     * replay delivery site (see SELF-TALK FIX notes).
      */
     fun announceStatus(text: String) {
         if (!ttsReady || text.isBlank()) return
+        if (isListening) {
+            Log.d(TAG, "announceStatus: mic open — dropping status cue (self-talk guard): \"$text\"")
+            CrashLogFile.log(TAG, "SELF-TALK GUARD: status cue suppressed while listening")
+            return
+        }
         ttsManager.speakImmediate(text)
     }
 
@@ -748,6 +764,16 @@ class MainActivity : AppCompatActivity() {
                         // heard instead of falling back to en-US again.
                         val rescueLocale = detectLocaleFromText(transcription)
                         lastDetectedLocale = rescueLocale
+                        // SELF-TALK FIX (2026-09-24): the recognizer session
+                        // that failed is still technically open when the
+                        // rescue delivers — CameraFragment's LISTENING state
+                        // then feeds the ANSWER TTS back into a fresh
+                        // recognition cycle, and the mic hears Vyze talking
+                        // ("analyzing scene" became a 'query'). Close the
+                        // session before delivery; the fragment's state
+                        // machine owns any further mic windows.
+                        isListening = false
+                        speechRecognizer?.cancel()
                         // Confidence 0: the rescue already asked the user to
                         // repeat once — never chain another confirmation ask.
                         onSpeechResult?.invoke(transcription, rescueLocale, 0f)
@@ -816,6 +842,11 @@ class MainActivity : AppCompatActivity() {
                     localeFallbackIndex = 0
                     val replayLocale = detectLocaleFromText(transcription)
                     lastDetectedLocale = replayLocale
+                    // SELF-TALK FIX: same discipline as the model-ASR rescue
+                    // delivery — close the stale recognizer session before
+                    // the answer pipeline runs, or the mic hears the reply.
+                    isListening = false
+                    speechRecognizer?.cancel()
                     // Confidence 0: never chain a confirmation ask on top of
                     // the retries the transcript already went through.
                     onSpeechResult?.invoke(transcription, replayLocale, 0f)
@@ -1649,6 +1680,11 @@ class MainActivity : AppCompatActivity() {
                     localeFallbackIndex = 0
                     Log.i(TAG, "Suspect retry failed (error=$error) — accepting original transcript")
                     CrashLogFile.log(TAG, "SUSPECT RETRY FAILED: accepting original transcript")
+                    // SELF-TALK FIX: deliver with the recognizer session
+                    // closed — an open mic behind the answer invites the
+                    // app to hear itself (see the model-ASR rescue note).
+                    isListening = false
+                    speechRecognizer?.cancel()
                     onSpeechResult?.invoke(originalTranscript, lastDetectedLocale, 0f)
                     return
                 }
@@ -1679,17 +1715,19 @@ class MainActivity : AppCompatActivity() {
                     //     every new session starts fresh and unpinned.
                     // (b) Skip the locale the failed session was pinned to —
                     //     re-running it would reproduce the same NO_MATCH.
-                    if (lastPinnedLocaleTag == null && localeFallbackIndex == 0) {
-                        val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
-                            it.language == lastDetectedLocale?.language
-                        }
-                        if (idx > 0) localeFallbackIndex = idx
-                    }
-                    if (FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
-                        .toLanguageTag() == lastPinnedLocaleTag
-                    ) {
-                        localeFallbackIndex++
-                    }
+                    // Retry-index selection is [LadderPolicy]'s contract:
+                    // an unpinned failure NEVER re-tries the device-default
+                    // English model (the duplicate-retry bug that surfaced
+                    // "No speech detected" for Chinese first-contact speech
+                    // on 2026-09-24), and the pinned/claimed language is
+                    // always skipped.
+                    localeFallbackIndex = LadderPolicy.nextRetryIndex(
+                        locales = FALLBACK_RECOGNITION_LOCALES,
+                        currentIndex = localeFallbackIndex,
+                        failedPinnedTag = lastPinnedLocaleTag,
+                        lastSpokenMsZh = lastSpokenMsZhLocale(),
+                        detectedBundleTag = null
+                    )
                     if (localeFallbackIndex >= FALLBACK_RECOGNITION_LOCALES.size) {
                         Log.i(TAG, "Ladder exhausted — falling through to normal error handling")
                     } else {
@@ -1857,10 +1895,27 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // (R1)/(R2) trigger: no ms/zh evidence AND (low confidence OR
-                // an implausible English transcript).
+                // an implausible English transcript OR a v3 ghost signal).
+                // v3 GHOST SIGNALS (2026-09-25): the platform recognizer can
+                // return CONFIDENT English text for Mandarin speech ("speak
+                // in Chinese", "Chinese", "what are you talking") — success
+                // with wrong language that neither NO_MATCH nor low
+                // confidence ever sees. Two pure signals arm the suspect
+                // ladder for that class: the language-NAME echo (the
+                // transcript is just a language word) and the language-FLIP
+                // (fluent English claimed while the conversation recently
+                // showed ms/zh speech or the ladder is mid-climb). Both only
+                // ARM the ladder — the transcript is still delivered if the
+                // re-listen and the offline audio replay confirm it.
                 val implausible = isImplausibleEnglishTranscript(bestMatch)
+                val languageEcho = SuspectSignals.isLanguageNameEcho(bestMatch)
+                val flipSuspect = SuspectSignals.isFlipSuspect(
+                    resultIsEnglish = finalLocale.language == "en",
+                    spokenMsZhHistory = lastSpokenMsZhLocale() != null,
+                    ladderActive = localeFallbackIndex > 0,
+                )
                 if (!textSaysMsZh && !bundleClaimsMsZh(detectedLang) &&
-                    (lowConfidence || implausible) &&
+                    (lowConfidence || implausible || languageEcho || flipSuspect) &&
                     suspectLadderRetries < SUSPECT_LADDER_MAX_RETRIES
                 ) {
                     // Attempt 1: re-listen pinned to the ladder's next
@@ -1871,26 +1926,22 @@ class MainActivity : AppCompatActivity() {
                         // Order the retry at the last successfully SPOKEN
                         // language when known, then skip the language the
                         // recognizer claimed in its bundle (the failed model).
-                        if (lastPinnedLocaleTag == null && localeFallbackIndex == 0) {
-                            val spokenMsZh = lastSpokenMsZhLocale()
-                            if (spokenMsZh != null) {
-                                val idx = FALLBACK_RECOGNITION_LOCALES.indexOfFirst {
-                                    it.language == spokenMsZh.language
-                                }
-                                if (idx > 0) localeFallbackIndex = idx
-                            }
-                        }
-                        if (!detectedLang.isNullOrBlank() &&
-                            FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
-                                .toLanguageTag() == detectedLang
-                        ) {
-                            localeFallbackIndex++
-                        }
+                        // Same contract as the NO_MATCH ladder (LadderPolicy):
+                        // skip the failed pinned/claimed language, and never
+                        // re-try the device-default English model after an
+                        // unpinned failure.
+                        localeFallbackIndex = LadderPolicy.nextRetryIndex(
+                            locales = FALLBACK_RECOGNITION_LOCALES,
+                            currentIndex = localeFallbackIndex,
+                            failedPinnedTag = lastPinnedLocaleTag,
+                            lastSpokenMsZh = lastSpokenMsZhLocale(),
+                            detectedBundleTag = detectedLang?.takeIf { it.isNotBlank() }
+                        )
                         if (localeFallbackIndex < FALLBACK_RECOGNITION_LOCALES.size) {
                             val nextLocale = FALLBACK_RECOGNITION_LOCALES[localeFallbackIndex]
                             suspectLadderRetries++
                             pendingSuspectTranscript = bestMatch
-                            Log.i(TAG, "Suspect transcript (conf=$conf${if (implausible) ", implausible" else ""}) - ladder retry as ${nextLocale.toLanguageTag()} (attempt $suspectLadderRetries)")
+                            Log.i(TAG, "Suspect transcript (conf=$conf${if (implausible) ", implausible" else ""}${if (languageEcho) ", language-echo" else ""}${if (flipSuspect) ", language-flip" else ""}) - ladder retry as ${nextLocale.toLanguageTag()} (attempt $suspectLadderRetries)")
                             CrashLogFile.log(TAG, "SUSPECT LADDER RETRY: recognition -> ${nextLocale.toLanguageTag()}")
                             isListening = false
                             speechRecognizer?.cancel()
@@ -2035,6 +2086,9 @@ class MainActivity : AppCompatActivity() {
          * used by the failing session is skipped. Reset when any
          * transcription is accepted, on a user-aborted session, and on each
          * new user-initiated session.
+         *
+         * Retry-index selection lives in [com.vyze.app.speech.LadderPolicy]
+         * (pure, JVM-tested): the language that just failed is never retried.
          */
         private val FALLBACK_RECOGNITION_LOCALES = listOf(
             java.util.Locale.US,

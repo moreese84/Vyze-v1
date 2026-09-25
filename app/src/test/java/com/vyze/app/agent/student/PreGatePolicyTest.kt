@@ -82,6 +82,34 @@ class PreGatePolicyTest {
         )
     }
 
+    // ── Admitted family 4 (v3): app-cue garble hybrid → SILENT ───────
+
+    @Test
+    fun `app cue garble hybrid is silent`() {
+        // dev6 / dev24 + the 2026-09-24 live session: answering this family
+        // was a full ~2s wrong-language scene inference nobody asked for.
+        assertEquals(
+            ResponseMode.SILENT,
+            PreGatePolicy.evaluate("is in front of me analyzing what is in front of me"),
+        )
+        assertEquals(
+            ResponseMode.SILENT,
+            PreGatePolicy.evaluate("Analyzing what is here in Xian"),
+        )
+        assertEquals(
+            ResponseMode.SILENT,
+            PreGatePolicy.evaluate("analyzing scene"),
+        )
+    }
+
+    @Test
+    fun `real request behind cue opener passes through`() {
+        assertEquals(
+            ResponseMode.PASS_THROUGH,
+            PreGatePolicy.evaluate("Analyzing scene. Read the label for me"),
+        )
+    }
+
     // ── Pass-through: everything the pre-gate must NEVER touch ───────
 
     @Test

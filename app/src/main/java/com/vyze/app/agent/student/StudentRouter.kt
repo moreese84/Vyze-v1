@@ -162,6 +162,42 @@ object StudentRouter {
         any { containsKeyword(normalized, it) }
 
     /**
+     * v3 helper: the cue fingerprint token — Vyze's status cue opener.
+     * Presence in the transcript (anywhere) is the family's signature.
+     */
+    private const val APP_CUE_HYBRID_TOKEN = "analyzing"
+
+    /**
+     * v3 helper: deictic scene openers stripped before the marker check.
+     * Longest-first so "what is in front of me" is consumed whole instead
+     * of leaving "in front of me" behind.
+     */
+    private val DEICTIC_OPENER_PHRASES = listOf(
+        "what is in front of me", "what is here", "what is this",
+        "what is that", "what is in front", "is in front of me",
+        "in front of me",
+    )
+
+    /**
+     * v3: app-cue garble hybrid test (pure). True when the cue token is
+     * present and, after stripping the cue + deictic openers, NO question
+     * marker survives — i.e. the utterance references nothing and asks
+     * nothing. See branch 7b for the device evidence.
+     */
+    private fun isAppCueGarbleHybrid(normalized: String): Boolean {
+        if (!normalized.contains(APP_CUE_HYBRID_TOKEN)) return false
+        var remainder = normalized
+        remainder = remainder.replace(APP_CUE_HYBRID_TOKEN, " ")
+        for (phrase in DEICTIC_OPENER_PHRASES) {
+            remainder = remainder.replace(phrase, " ")
+        }
+        remainder = remainder.replace(Regex("\\s+"), " ").trim()
+        if (remainder.isEmpty()) return true
+        // Anything left must carry no question content to count as echo.
+        return !QUESTION_MARKERS.anyIn(remainder)
+    }
+
+    /**
      * The distilled routing decision for a spoken query. Pure — no I/O,
      * no Android, no state; fully unit-testable.
      */
@@ -197,6 +233,29 @@ object StudentRouter {
                 reason = "student: read intent (legacy keywords + phase0 extras)",
                 requiresVlm = true,
                 includeCameraFrame = true,
+            )
+        }
+        // 1b. v3: app-cue GARBLE HYBRID — the app's own status cue
+        //     ("Analyzing scene…") re-captured TOGETHER WITH the user's
+        //     half-remembered scene opener ("what is here") and ASR garble
+        //     of the cue's tail. Device rows: dev6 ("is in front of me
+        //     analyzing what is in front of me"), and the 2026-09-24 live
+        //     session ("Analyzing what is here in Xian", "analyzing scene").
+        //     Sits BETWEEN read-intent and the scene openers: read keywords
+        //     win first (a real request hidden behind a cue opener is
+        //     served — "Analyzing scene. Read the label"), and the hybrid
+        //     check must run BEFORE rule 2, whose deictic openers the
+        //     hybrid embeds (the old ordering is exactly why dev6 was a
+        //     known miss — the student said SCENE). A real ask keeps its
+        //     topic ("what is paracetamol used for" retains "what"/"is")
+        //     and stays routable.
+        if (isAppCueGarbleHybrid(normalizedText)) {
+            return RouterDecision(
+                action = RouterDecision.Action.IGNORE,
+                reason = "student: app-cue garble hybrid (v3: distilled from " +
+                    "dev6 + 2026-09-24 session)",
+                requiresVlm = false,
+                includeCameraFrame = false,
             )
         }
         // 2. Scene-describe openers.

@@ -2398,17 +2398,16 @@ class VyzeCoreController(
             Log.w(TAG, "transcribeAudio called but engine not ready")
             return null
         }
-        // Gemma's ASR instruction — transcribe in the user's language. The
-        // language name is derived from the active locale so Malay/Chinese
-        // speech is transcribed natively, not through an English detour.
-        val langName = activeUserLocale.getDisplayLanguage(java.util.Locale.US)
-            .ifBlank { activeUserLocale.language }
-        val asrPrompt = "Transcribe the following speech segment in $langName into $langName text. " +
-            "Follow these specific instructions for formatting the answer: " +
-            "Only output the transcription, with no newlines. " +
-            "Output plain text only: no markdown symbols, no bullets, no asterisks, no emoji. " +
-            "When transcribing numbers, write the digits, i.e. write 1.7 and not one point seven, " +
-            "and write 3 instead of three."
+        // Gemma's ASR instruction — transcribe in the language ACTUALLY
+        // SPOKEN. The old prompt hard-pinned the active UI locale's
+        // language ("...in $langName into $langName text"), which
+        // straitjacketed the output: Chinese speech after a ms-MY ladder
+        // retry came back as Malay text (device log 2026-09-25, "ini apa").
+        // The active locale is now only a HINT; the model may fall back to
+        // any supported language the audio actually carries.
+        val langHint = activeUserLocale.getDisplayLanguage(java.util.Locale.US)
+            .ifBlank { null }
+        val asrPrompt = AsrPromptPolicy.buildTranscribePrompt(langHint)
         return vlmEngine.transcribeAudio(
             audioBytes = audioBytes,
             prompt = asrPrompt,
