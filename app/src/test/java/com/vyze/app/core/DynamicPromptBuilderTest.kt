@@ -157,6 +157,110 @@ class DynamicPromptBuilderTest {
         // The examples must also carry the no-echo demonstration rule.
         assertTrue(en.contains("NEVER repeat or echo the user's question"))
         assertTrue(ms.contains("JANGAN sesekali ulang atau gema soalan pengguna"))
+
+        // ZH parity (2026-09-26 audit finding #1): the follow-up header is
+        // fully localized in Chinese — never the old English-only header.
+        assertTrue(zh.contains("后续对话示例"))
+        assertTrue(zh.contains("绝不重复或复述用户的问题"))
+        assertFalse(zh.contains("Follow-up conversation examples"))
+    }
+
+    // ── 5. Canned failure-phrase override (mirroring parity) ─────
+
+    @Test
+    fun `ms and zh prompts pin localized canned failure phrases`() = runBlocking {
+        val ms = builder().buildPrompt(
+            queryOverride = "berapa duit ni?",
+            userLocale = Locale("ms"),
+            currencyMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "这是什么钱？",
+            userLocale = Locale("zh"),
+            currencyMode = true,
+        )
+
+        // Both carry the override clause...
+        for ((loc, p) in listOf("ms" to ms, "zh" to zh)) {
+            assertTrue("$loc missing override clause", p.contains("FAILURE-PHRASE OVERRIDE"))
+            assertTrue("$loc missing speak-instead rule", p.contains("instead — never the English one"))
+        }
+        // ...with the currency safety phrase pinned in the user's language
+        // (the never-guess path is the one a wrong-language answer costs most).
+        assertTrue(ms.contains("Saya tidak dapat membaca nilai ini dengan jelas"))
+        assertTrue(zh.contains("我读不清楚"))
+        // The bank-card and read-failure phrases are covered too.
+        assertTrue(ms.contains("Saya tidak dapat mengenal pasti kad ini dengan jelas"))
+        assertTrue(zh.contains("文字不清楚"))
+    }
+
+    @Test
+    fun `english prompts get no failure-phrase override`() = runBlocking {
+        val en = builder().buildPrompt(
+            queryOverride = "how much is this note?",
+            userLocale = Locale.US,
+            currencyMode = true,
+        )
+        assertFalse(en.contains("FAILURE-PHRASE OVERRIDE"))
+        // Other unsupported languages fall through to null as well — no clause,
+        // English-drift handling stays with the mirroring layers.
+        val ja = builder().buildPrompt(queryOverride = "これは何？", userLocale = Locale("ja"))
+        assertFalse(ja.contains("FAILURE-PHRASE OVERRIDE"))
+    }
+
+    // ── 6. Sensitive-ID privacy contract ────────────────────────
+
+    @Test
+    fun `sensitive id mode injects pinned per-language refusal late in prompt`() = runBlocking {
+        val ms = builder().buildPrompt(
+            queryOverride = "nombor kad pengenalan saya apa?",
+            userLocale = Locale("ms"),
+            ocrText = "KAD PENGENALAN MALAYSIA 900101-01-5231",
+            sensitiveIdMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "这个卡号是什么？",
+            userLocale = Locale("zh"),
+            sensitiveIdMode = true,
+        )
+
+        // The refusal phrase is pinned in the user's language.
+        assertTrue(ms.contains("Membaca nombor kad pengenalan atau nombor kad bank"))
+        assertTrue(zh.contains("朗读您的身份证号码或银行卡号码是被禁止的"))
+
+        // Late placement: the privacy rule must land AFTER the OCR verbatim
+        // directive (3f vs 2b — last-seen rule wins on a 2B model).
+        val ocrIdx = ms.indexOf("The OCR text above is the ground truth")
+        val privacyIdx = ms.indexOf("PRIVACY — HIGHEST PRIORITY RULE")
+        assertTrue(ocrIdx in 0 until privacyIdx)
+
+        // The override contract instructs skipping the number in OCR text.
+        assertTrue(ms.contains("overrides any instruction to read text verbatim"))
+    }
+
+    @Test
+    fun `sensitive id off by default leaves no privacy clause`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "berapa duit ini?",
+            userLocale = Locale("ms"),
+            currencyMode = true,
+        )
+        assertFalse(p.contains("PRIVACY — HIGHEST PRIORITY RULE"))
+    }
+
+    @Test
+    fun `currency rules anchor identity and gate serial reading to asks`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "ini duit apa?",
+            userLocale = Locale("ms"),
+            currencyMode = true,
+        )
+        // Identity anchor (the 'kad pengenalan' mislabel fix).
+        assertTrue(p.contains("even if it resembles a card"))
+        // Value-first ordering.
+        assertTrue(p.contains("dominant color") && p.contains("FIRST"))
+        // Serial reading is allowed but gated on being asked.
+        assertTrue(p.contains("Serial numbers on banknotes are allowed to read"))
     }
 
     // ── Engine turn delimiters (VlmEngineManager) ────────────────

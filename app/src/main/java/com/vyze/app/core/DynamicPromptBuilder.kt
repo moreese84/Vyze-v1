@@ -29,6 +29,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         ocrText: String? = null,
         currencyMode: Boolean = false,
         bankCardMode: Boolean = false,
+        sensitiveIdMode: Boolean = false,
         memoryContext: String? = null,
         textOnlyMode: Boolean = false,
         brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL,
@@ -164,13 +165,55 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(BANK_CARD_RULES)
             }
 
+            // 3d. SENSITIVE-ID PRIVACY CONTRACT (fires on identity-card /
+            //     account-number asks). Injected AFTER every rule block so it is
+            //     the last instruction before the mirror line — on a 2B model the
+            //     last-seen rule wins, and this one must out-rank the OCR
+            //     "read it verbatim" directive above when a card number is in
+            //     the OCR text. The refusal phrase is PINNED in the user's
+            //     language (SensitiveIdPolicy) so TTS never speaks digits.
+            //     English keeps no override (already the base language).
+            if (sensitiveIdMode) {
+                val refusal = SensitiveIdPolicy.refusalPhrase(userLocale.language)
+                sb.appendLine("PRIVACY — HIGHEST PRIORITY RULE: $refusal This rule " +
+                    "overrides any instruction to read text verbatim: if the OCR text " +
+                    "or the scene contains such a number, SKIP it and answer with the " +
+                    "refusal phrase above instead.")
+            }
+
+            // 3e. CANNED-PHRASE OVERRIDE (ms/zh): the shared rule constants quote
+            //     their failure fallbacks in English ("I cannot read this clearly",
+            //     "Text is unclear", ...) while the [OUTPUT LANGUAGE] tag demands
+            //     every word in the user's language — a direct instruction conflict
+            //     on the SAFETY paths (currency / bank card never-guess). For
+            //     ms/zh the exact spoken form of each canned phrase is pinned
+            //     here, after every rule block that names an English phrase.
+            //     English needs no override (the constants already speak it).
+            failurePhraseClauseFor(userLocale.language)?.let { sb.appendLine(it) }
+
             // 4. Language mirror — reinforce at bottom (ALL languages now:
             //    symmetric anchor, English included — see the top mirror note)
             sb.appendLine("REMEMBER: Respond only in $langName. Begin immediately with the answer itself — never repeat or echo the user's question.")
 
             val prompt = sb.toString()
-            Log.d(TAG, "Built prompt: ${prompt.length} chars, " +
-                "mode=${if (isDirectQuery) "DIRECT_QUERY" else "NAVIGATION"}")
+            // DIAGNOSTIC (INFO, content-free) — the single-funnel line proving
+            // which mode + language EVERY built prompt carried. DynamicPromptBuilder
+            // is the one place both the native lane and the agent lane pass
+            // through (buildPromptForAgent calls buildPrompt), so one line here
+            // settles "which lane dispatched, did currency/bankCard fire" from a
+            // plain logcat dump — on devices that suppress DEBUG, where the old
+            // Log.d line was invisible. PRIVACY: never log query/OCR content —
+            // logcat is not a private channel; only flags and counts below.
+            val promptMode = when {
+                textOnlyMode -> "TEXT_ONLY"
+                continuousMode -> "CONTINUOUS"
+                isDirectQuery -> "DIRECT_QUERY"
+                else -> "NAVIGATION"
+            }
+            Log.i(TAG, "Built prompt: ${prompt.length} chars, mode=$promptMode, " +
+                "lang=${userLocale.language}, currency=$currencyMode, bankCard=$bankCardMode, " +
+                "sensitiveId=$sensitiveIdMode, ocr=${!ocrText.isNullOrBlank()}, " +
+                "dialogue=${!dialogueContext.isNullOrBlank()}, brevity=$brevityLevel")
             prompt
 
         } catch (e: Exception) {
@@ -418,11 +461,14 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
          * worse than "I cannot read it clearly" for a blind user.
          */
         private const val CURRENCY_RULES =
-            "This is money — a banknote or a coin. Identify its VALUE from the " +
-            "large numerals and printed text. State the value and the currency " +
-            "(for example: 50 Ringgit, or 10 cents) and the dominant color. " +
+            "This object IS money — a banknote or a coin — even if it resembles a card. " +
+            "Identify its VALUE from the large numerals and printed text. State the value " +
+            "and the currency (for example: 50 Ringgit, or 10 cents) and the dominant color " +
+            "FIRST; describe other printed details only after the value. Serial numbers on " +
+            "banknotes are allowed to read, but read them digit by digit only if asked. " +
             "If the value cannot be read clearly, say exactly: I cannot read this " +
-            "clearly. NEVER guess or invent a value. Do not mention serial numbers. " +
+            "clearly. NEVER guess or invent a value. Do not mention anything else about " +
+            "the printing beyond value, color and what was asked. " +
             "Reply as pure plain text for text to speech: never output markdown " +
             "symbols, bullets, dashes, asterisks, or emoji."
 
@@ -492,9 +538,8 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
 
         /** FEW-SHOT FOLLOW-UP EXAMPLES (ZH) — same exchange, Chinese mirroring. */
         private const val FOLLOWUP_EXAMPLES_ZH =
-            "Follow-up conversation examples (continue the exchange; answer ONLY the " +
-            "newest question, in the SAME language it was asked, and NEVER repeat or echo " +
-            "the user's question):\n" +
+            "后续对话示例（继续这组对话；只回答最新的问题，用与提问相同的语言回答，" +
+            "绝不重复或复述用户的问题）：\n" +
             "User: 我前面有什么？\n" +
             "Vyze: 桌上有一个咖啡杯。\n" +
             "User: 那这个呢？\n" +
@@ -551,5 +596,39 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
             "Respond with the answer only: never repeat, echo, or quote the question, " +
             "never restate the task, and write every word in the language named in " +
             "the [OUTPUT LANGUAGE] tag."
+
+        /**
+         * CANNED-PHRASE OVERRIDE (mirroring parity, 2026-09-26 audit finding #2):
+         * CURRENCY_RULES, BANK_CARD_RULES, DIRECT_RULES_PROSE, NAV_RULES_PROSE and
+         * TEXT_ONLY_RULES quote their failure fallbacks in English ("say exactly:
+         * I cannot read this clearly" / "Text is unclear" / "No text visible" /
+         * "not clearly visible" / "I do not know that"). Under the tag-authority
+         * model every other layer mirrors the [OUTPUT LANGUAGE] tag — these quoted
+         * phrases were the one instruction telling the model to speak English, on
+         * the never-guess safety paths where a wrong-language answer costs the most.
+         * For ms/zh, pin the exact spoken form of each canned phrase in the user's
+         * language (the few-shots already demonstrate the localized forms — this
+         * makes the rule explicit). Returns null for English: the constants already
+         * speak English there. Pure function — JVM-tested.
+         */
+        private fun failurePhraseClauseFor(language: String): String? = when (language) {
+            "ms" ->
+                "FAILURE-PHRASE OVERRIDE: wherever the rules above name an English " +
+                "failure phrase, speak the Malay phrase instead — never the English one. " +
+                "'I cannot read this clearly' -> 'Saya tidak dapat membaca nilai ini dengan jelas'. " +
+                "'I cannot identify this card clearly' -> 'Saya tidak dapat mengenal pasti kad ini dengan jelas'. " +
+                "'Text is unclear' -> 'Teks tidak jelas'. 'No text visible' -> 'Tiada teks kelihatan'. " +
+                "'not clearly visible' -> 'tidak kelihatan dengan jelas'. " +
+                "'I do not know that' -> 'Saya tidak tahu tentang itu'."
+            "zh" ->
+                "FAILURE-PHRASE OVERRIDE: wherever the rules above name an English " +
+                "failure phrase, speak the Chinese phrase instead — never the English one. " +
+                "'I cannot read this clearly' -> '我读不清楚'. " +
+                "'I cannot identify this card clearly' -> '我无法清楚辨认这张卡'. " +
+                "'Text is unclear' -> '文字不清楚'. 'No text visible' -> '看不到文字'. " +
+                "'not clearly visible' -> '看不清楚'. " +
+                "'I do not know that' -> '我不知道'."
+            else -> null
+        }
     }
 }

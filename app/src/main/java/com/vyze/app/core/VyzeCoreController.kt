@@ -86,6 +86,10 @@ class VyzeCoreController(
     @Volatile
     private var currencyModeActive = false
 
+    /** 2026-09-26: true while the current turn is an identity/account-number ask —
+     *  the prompt then carries the pinned refusal contract (SensitiveIdPolicy). */
+    private var sensitiveIdModeActive = false
+
     /** True while the current snapshot is a bank card identification query. */
     @Volatile
     private var bankCardModeActive = false
@@ -488,6 +492,7 @@ class VyzeCoreController(
                             }
                         }
                         bankCardModeActive = false
+                        sensitiveIdModeActive = false
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
@@ -508,6 +513,14 @@ class VyzeCoreController(
         }
 
         // Announce loading status so blind users know the app is working.
+        // BOOT LANGUAGE CONTRACT (2026-09-26): the app-scoped TTSManager
+        // outlives this controller — without re-anchoring, its currentLocale
+        // carries the LAST SESSION's mirrored STT language and boot cues
+        // play in that language (observed: zh queries → Chinese boot cues,
+        // preference untouched). Re-anchor to the PERSISTED choice (English
+        // default) before the first localized() cue. Idempotent; no-op on a
+        // cold start where the pref is already the active language.
+        ttsManager.reanchorToPersistedLanguage(context)
         val modelExists = vlmEngine.isModelOnDisk()
         if (!modelExists) {
             ttsManager.speakQueued(
@@ -671,6 +684,9 @@ class VyzeCoreController(
             ocrText = null,
             currencyMode = false,
             bankCardMode = false,
+            // PRIVACY BRANCH on the agent lane too: re-checked per dispatch —
+            // the agent lane must never become the path around the refusal.
+            sensitiveIdMode = SensitiveIdPolicy.isSensitiveIdQuery(rawQuery),
             memoryContext = null,
             textOnlyMode = false,
             brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
@@ -1108,6 +1124,7 @@ class VyzeCoreController(
         lastDescribedTime = 0L
         currencyModeActive = false
         bankCardModeActive = false
+        sensitiveIdModeActive = false
         // A deliberate user action invalidates the continuous-mode scene
         // baseline — the next auto-capture should describe fresh.
         lastContinuousEmbedding = null
@@ -1199,6 +1216,10 @@ class VyzeCoreController(
         val isVoiceFollowUpCandidate = !isTapQuery && !query.isNullOrBlank()
         val currencyQuery = isCurrencyQuery(query)
         val bankCardQuery = isBankCardQuery(query)
+        // PRIVACY BRANCH (deterministic, owner: the router — the model never
+        // self-decides): identity-card / account-number asks get the pinned
+        // refusal contract regardless of which lane dispatches.
+        val sensitiveIdQuery = SensitiveIdPolicy.isSensitiveIdQuery(query)
         // Deterministic at trigger time — the volatile mode flags are reset in
         // onComplete before the record step runs.
         val isPreciseRead = currencyQuery || bankCardQuery
@@ -1212,6 +1233,7 @@ class VyzeCoreController(
         }
         currencyModeActive = currencyQuery
         bankCardModeActive = bankCardQuery
+        sensitiveIdModeActive = sensitiveIdQuery
 
         // ── TAP GRID TAG (structured spatial prompting) ───────────
         // Raw pixel coords mean nothing to a small VLM — it ignores them.
@@ -1638,7 +1660,8 @@ class VyzeCoreController(
                 // Conversational context ONLY for genuine voice follow-ups —
                 // never for taps, continuous mode, currency or bank-card reads.
                 val dialogueContext = if (isVoiceFollowUpCandidate &&
-                    !continuousMode && !currencyModeActive && !bankCardModeActive
+                    !continuousMode && !currencyModeActive && !bankCardModeActive &&
+                    !sensitiveIdModeActive
                 ) {
                     dialogueContextForPrompt()
                 } else null
@@ -1651,6 +1674,7 @@ class VyzeCoreController(
                     ocrText = ocrText,
                     currencyMode = currencyModeActive,
                     bankCardMode = bankCardModeActive,
+                    sensitiveIdMode = sensitiveIdModeActive,
                     memoryContext = memoryContext,
                     brevityLevel = brevityLevel,
                     dialogueContext = dialogueContext

@@ -1392,6 +1392,31 @@ class TTSManager private constructor(context: Context) {
         setLanguage(savedLang, context)
     }
 
+    /**
+     * Re-anchor the ACTIVE voice to the user's PERSISTED language choice.
+     *
+     * WHY THIS EXISTS (2026-09-26 device session): TTSManager is app-scoped,
+     * so [currentLocale] survives Activity re-entry — including STT mirroring
+     * from the previous session ([mirrorDetectedLocale] is ephemeral in the
+     * PERSISTENCE sense only; the in-memory locale it set lives as long as
+     * the process). Boot/loading cues then played in the LAST SPOKEN
+     * language instead of the stored choice: zh queries at 13:38 → boot cues
+     * played Chinese at 13:39 with the preference untouched. Cold starts were
+     * never affected (fresh singleton starts at the English default), which
+     * is why the bug only appeared after re-entering the app mid-session.
+     *
+     * Call BEFORE any boot cue on activity/controller re-initialization:
+     * startup announcements then follow the persisted preference — English
+     * by default, or the language the user explicitly chose in Voice
+     * Settings — never the residual session voice. Session mirroring resumes
+     * normally with the next spoken query.
+     */
+    fun reanchorToPersistedLanguage(context: Context) {
+        applySettings(context)
+        Log.i(TAG, "reanchorToPersistedLanguage: active voice = ${getCurrentLanguageKey()} " +
+            "(persisted pref, session mirroring cleared)")
+    }
+
     // ── Lifecycle ─────────────────────────────────────────────────
 
     fun onDestroy() {
