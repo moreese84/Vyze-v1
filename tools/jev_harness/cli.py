@@ -88,6 +88,25 @@ def main(argv: list[str] | None = None) -> int:
     p_fit.add_argument("--out", default=None,
                        help="weights JSONL path (provenance + rules)")
 
+    p_fit1 = sub.add_parser(
+        "fit_rung1",
+        help="B4 rung 1: fit the hashed char-n-gram Naive Bayes on the "
+             "labeled feature table, gate on frozen fixtures (zero false "
+             "drops, beats all-WAKE + regex baseline per language), "
+             "optionally emit the Kotlin scorer",
+    )
+    p_fit1.add_argument("--features", required=True,
+                        help="feature table JSONL (from 'features --out')")
+    p_fit1.add_argument("--fixture", required=True,
+                        help="seed fixture JSONL (phase0_route_labels.jsonl)")
+    p_fit1.add_argument("--device-fixture", default=None,
+                        help="device fixture JSONL (phase3_device_labels.jsonl)")
+    p_fit1.add_argument("--emit-kotlin", default=None,
+                        help="emit the generated Kotlin scorer to this path "
+                             "(refused when the gate fails)")
+    p_fit1.add_argument("--out", default=None,
+                        help="model JSON path (provenance + counts)")
+
     p_append = sub.add_parser(
         "append",
         help="A1: merge device exports into a rolling corpus file",
@@ -114,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
         from .fit_rung0 import run as fit_run
         return fit_run(args.features, args.fixture, args.device_fixture,
                        args.out, args.emit_kotlin)
+
+    # B4 rung 1 fitting: same contract as rung 0, NB over hashed n-grams.
+    if args.cmd == "fit_rung1":
+        from .fit_rung1 import run as fit1_run
+        return fit1_run(args.features, args.fixture, args.device_fixture,
+                        args.out, args.emit_kotlin)
 
     corpus_path = args.corpus or "builtin"
     items = CORPUS if args.corpus is None else load_corpus(args.corpus)
