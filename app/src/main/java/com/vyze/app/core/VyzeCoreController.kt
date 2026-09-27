@@ -102,6 +102,12 @@ class VyzeCoreController(
      *  the prompt then carries the pinned refusal contract (SensitiveIdPolicy). */
     private var sensitiveIdModeActive = false
 
+    /** True when a medicine query ran and the DB lookup missed (P1b). */
+    private var medicineMissModeActive = false
+
+    /** True when the current query is a date/time arithmetic ask (P1a). */
+    private var dateModeActive = false
+
     /** True while the current snapshot is a bank card identification query. */
     @Volatile
     private var bankCardModeActive = false
@@ -505,6 +511,8 @@ class VyzeCoreController(
                         }
                         bankCardModeActive = false
                         sensitiveIdModeActive = false
+                        medicineMissModeActive = false
+                        dateModeActive = false
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
@@ -699,6 +707,7 @@ class VyzeCoreController(
             // PRIVACY BRANCH on the agent lane too: re-checked per dispatch —
             // the agent lane must never become the path around the refusal.
             sensitiveIdMode = SensitiveIdPolicy.isSensitiveIdQuery(rawQuery),
+            dateRulesMode = hitsDateQuery(rawQuery),
             memoryContext = null,
             textOnlyMode = false,
             brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
@@ -1140,6 +1149,8 @@ class VyzeCoreController(
         currencyModeActive = false
         bankCardModeActive = false
         sensitiveIdModeActive = false
+        medicineMissModeActive = false
+        dateModeActive = false
         // A deliberate user action invalidates the continuous-mode scene
         // baseline — the next auto-capture should describe fresh.
         lastContinuousEmbedding = null
@@ -1235,6 +1246,10 @@ class VyzeCoreController(
         // self-decides): identity-card / account-number asks get the pinned
         // refusal contract regardless of which lane dispatches.
         val sensitiveIdQuery = SensitiveIdPolicy.isSensitiveIdQuery(query)
+        // P1a DATE CONTRACT: relative-date asks get the shown-work arithmetic
+        // clause — a 2B model one-shotting "next Friday" is a silent wrong
+        // answer the user cannot detect.
+        val dateQuery = hitsDateQuery(query)
         // Deterministic at trigger time — the volatile mode flags are reset in
         // onComplete before the record step runs.
         val isPreciseRead = currencyQuery || bankCardQuery
@@ -1249,6 +1264,11 @@ class VyzeCoreController(
         currencyModeActive = currencyQuery
         bankCardModeActive = bankCardQuery
         sensitiveIdModeActive = sensitiveIdQuery
+        // P1b: a fresh capture always restarts with no miss recorded; the
+        // OCR stage sets it only when a medicine ask actually misses.
+        medicineMissModeActive = false
+        // P1a: date-arithmetic contract armed per query.
+        dateModeActive = dateQuery
 
         // ── RECOVERY-CUE ARMING (implicit failure detection) ──────
         // A spoken recovery cue ("please say that again") means the
@@ -1522,6 +1542,17 @@ class VyzeCoreController(
                             if (medicineInfo != null) {
                                 CrashLogFile.log(TAG, "Medicine match: ${medicineInfo.name}")
                                 ocrText = "$ocrText\n[MEDICINE INFO: ${medicineInfo.name}, ${medicineInfo.genericName}, ${medicineInfo.dosage}. ${medicineInfo.frequency}. WARNING: ${medicineInfo.warnings}]"
+                            } else {
+                                // P1b EXPLICIT MISS (AI Edge Gallery mood-tracker
+                                // steal): the DB has no record for this label.
+                                // Inject a HARD PROVENANCE marker so the model can
+                                // never blend general knowledge into a dosing
+                                // answer — the builder pins the localized
+                                // miss-refusal instead. AUDIT 2026-09-28: on a
+                                // miss the model previously received the medicine
+                                // few-shot with NO provenance signal at all.
+                                medicineMissModeActive = true
+                                CrashLogFile.log(TAG, "Medicine DB miss: no record for OCR label")
                             }
                         } catch (e: Throwable) {
                             CrashLogFile.logError(TAG, "Medicine lookup failed: ${e.message}", e)
@@ -1704,6 +1735,8 @@ class VyzeCoreController(
                     currencyMode = currencyModeActive,
                     bankCardMode = bankCardModeActive,
                     sensitiveIdMode = sensitiveIdModeActive,
+                    medicineMissMode = medicineMissModeActive,
+                    dateRulesMode = dateModeActive,
                     memoryContext = memoryContext,
                     brevityLevel = brevityLevel,
                     dialogueContext = dialogueContext
@@ -2754,6 +2787,18 @@ class VyzeCoreController(
     }
 
     /**
+     * P1a: true when the query asks about dates, days, or relative time
+     * ("what date is next Friday", "berapa hari lagi sampai raya",
+     * "下個星期五是什麼日期"). Pure keyword gate — same style as
+     * [isCurrencyQuery]. Null/blank never triggers.
+     */
+    private fun hitsDateQuery(query: String?): Boolean {
+        if (query.isNullOrBlank()) return false
+        val lower = query.lowercase()
+        return DATE_KEYWORDS.any { keyword -> lower.contains(keyword) }
+    }
+
+    /**
      * Look up a medicine from the local knowledge base by matching
      * OCR text against the database. Tries exact match first, then
      * fuzzy substring search.
@@ -3127,7 +3172,10 @@ class VyzeCoreController(
             "wang", "duit", "wang kertas", "wang syiling", "duit syiling",
             "syiling", "koin",
             // Chinese
-            "钱", "钞票", "纸币", "硬币", "钱币", "多少钱"
+            "钱", "钞票", "纸币", "硬币", "钱币", "多少钱",
+            // Traditional (Gemma ASR emits Traditional; zh-fold parity with
+            // tools/jev_harness/features.py TRAD_TO_SIMP)
+            "錢", "鈔票", "紙幣", "硬幣", "錢幣", "多少錢"
         )
 
         /** Keywords that trigger bank card identification. */
@@ -3139,14 +3187,49 @@ class VyzeCoreController(
             "kad bank", "kad debit", "kad kredit", "kad atm",
             "kad", "kad apa", "bank apa",
             // Chinese
-            "银行卡", "借记卡", "信用卡", "什么卡", "哪家银行"
+            "银行卡", "借记卡", "信用卡", "什么卡", "哪家银行",
+            // Traditional (Gemma ASR emits Traditional)
+            "銀行卡", "借記卡", "信用卡", "什麼卡", "哪家銀行"
         )
 
-        /** Keywords that trigger medicine database lookup. */
+        /**
+     * Keywords that mark a query as DATE/TIME arithmetic (P1a shown-work
+     * contract). "time" alone is deliberately absent — the instant-answer
+     * lane owns clock reads; this bank feeds the prompt clause only.
+     */
+    private val DATE_KEYWORDS = listOf(
+        // English — deliberately NOT bare "date" (⊂ "update") or bare
+        // "hari" (too broad); phrase-level keys only.
+        "what date", "the date", "today's date", "date today",
+        "what day", "day of the week", "days until", "days left",
+        "how many days", "weeks until", "how many weeks",
+        "next monday", "next tuesday", "next wednesday", "next thursday",
+        "next friday", "next saturday", "next sunday",
+        // Malay / Bahasa Melayu
+        "tarikh", "berapa hari", "berapa minggu", "berapa tahun",
+        "hari apa", "esok", "lusa", "minggu depan", "bulan depan",
+        "tahun depan", "raya", "aidilfitri", "hari raya",
+        // Chinese — shared-script keys once, script-specific pairs listed
+        // (Gemma ASR emits Traditional; zh-fold parity with
+        // tools/jev_harness/features.py TRAD_TO_SIMP)
+        "日期", "下星期", "新年",
+        // Simplified
+        "几号", "几月", "多少天", "还有几天", "星期几", "下个星期",
+        "礼拜", "农历年",
+        // Traditional
+        "幾號", "幾月", "還有幾天", "星期幾", "下個星期",
+        "禮拜", "農曆年"
+    )
+
+    /** Keywords that trigger medicine database lookup. */
         private val MEDICINE_KEYWORDS = listOf(
             "medicine", "medication", "drug", "pill", "tablet",
             "capsule", "dosage", "prescription", "pharmacy",
-            "ubat", "dos", "ubat apa", "jenis ubat"
+            "ubat", "dos", "ubat apa", "jenis ubat",
+            // Chinese — Simplified + Traditional (Gemma ASR emits Traditional;
+            // zh-fold parity with tools/jev_harness/features.py TRAD_TO_SIMP)
+            "药", "药物", "药瓶", "处方", "剂量", "药盒", "吃什么药",
+            "藥", "藥物", "藥瓶", "處方", "劑量", "藥盒", "什麼藥"
         )
 
         // ── Confidence Check Constants ───────────────────────────

@@ -298,4 +298,124 @@ class DynamicPromptBuilderTest {
         // History is never adjacent to the generation boundary.
         assertTrue(out.indexOf("User: What is in front of me?") < out.indexOf("What about this?"))
     }
+
+    // ── 7. Medicine DB-miss contract (P1b) ──────────────────
+
+    @Test
+    fun `medicine miss mode pins the localized no-record refusal`() = runBlocking {
+        val en = builder().buildPrompt(
+            queryOverride = "how often do I take this?",
+            userLocale = Locale.US,
+            medicineMissMode = true,
+        )
+        val ms = builder().buildPrompt(
+            queryOverride = "ubat ini macam mana nak makan?",
+            userLocale = Locale("ms"),
+            medicineMissMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "這個藥要怎麼吃？",
+            userLocale = Locale("zh"),
+            medicineMissMode = true,
+        )
+
+        // Pinned spoken form per language — absence is spoken honestly,
+        // never paraphrased into general knowledge.
+        assertTrue(en.contains("I don't have a record of this medicine"))
+        assertTrue(ms.contains("Saya tiada rekod ubat ini dalam senarai"))
+        assertTrue(zh.contains("我的藥品列表裡沒有這個藥的資訊"))
+        // The guess-ban is present in every language.
+        for ((loc, p) in listOf("en" to en, "ms" to ms, "zh" to zh)) {
+            assertTrue("$loc missing guess ban", p.contains("Never state or guess any dosage"))
+        }
+    }
+
+    @Test
+    fun `medicine miss off leaves no record rule and late placement wins`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "ubat apa ini?",
+            userLocale = Locale("ms"),
+            medicineMissMode = false,
+        )
+        assertFalse(p.contains("MEDICINE RECORD RULE"))
+
+        // With OCR + a miss, the record rule lands AFTER the OCR verbatim
+        // directive — last-seen rule wins on the 2B model.
+        val withMiss = builder().buildPrompt(
+            queryOverride = "how often do I take this?",
+            userLocale = Locale.US,
+            ocrText = "DICLAC RETARD 100mg",
+            medicineMissMode = true,
+        )
+        val ocrIdx = withMiss.indexOf("The OCR text above is the ground truth")
+        val missIdx = withMiss.indexOf("MEDICINE RECORD RULE")
+        assertTrue(ocrIdx in 0 until missIdx)
+    }
+
+    // ── 8. Date-arithmetic contract (P1a) ────────────────────────
+
+    @Test
+    fun `date rules mode injects the contract in every language`() = runBlocking {
+        // Detection is the controller's job (keyword gate); the builder only
+        // injects when the flag is set — mirror that contract here.
+        val asks = listOf(
+            "what date is next Friday?" to Locale.US,
+            "berapa hari lagi sampai raya?" to Locale("ms"),
+            "下個星期五是什麼日期？" to Locale("zh"),
+        )
+        for ((q, loc) in asks) {
+            val p = builder().buildPrompt(
+                queryOverride = q,
+                userLocale = loc,
+                dateRulesMode = true,
+            )
+            assertTrue("no DATE ARITHMETIC RULE for: $q", p.contains("DATE ARITHMETIC RULE"))
+            assertTrue("no device date anchor for: $q", p.contains("Today's date (from the device):"))
+        }
+    }
+
+    @Test
+    fun `date rules inject the device date and force shown work`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "what date is next Friday?",
+            userLocale = Locale.US,
+            dateRulesMode = true,
+        )
+        // Gallery pattern: the model never guesses the anchor — Kotlin injects
+        // the device date deterministically above the shown-work rule.
+        assertTrue(p.contains("Today's date (from the device):"))
+        assertTrue(p.indexOf("Today's date (from the device):") <
+            p.indexOf("DATE ARITHMETIC RULE"))
+        // Shown work: write out the chain, never one-shot silent arithmetic.
+        assertTrue(p.contains("write out each step"))
+        assertTrue(p.contains("Do not do date arithmetic in one silent step"))
+        // Truthful anchor: never a remembered date.
+        assertTrue(p.contains("never to a date you remember"))
+        // TTS is the only channel — the working is capped, not silent.
+        assertTrue(p.contains("at most one short sentence of working"))
+    }
+
+    @Test
+    fun `device date line is localized per language`() = runBlocking {
+        val ms = builder().buildPrompt(
+            queryOverride = "berapa hari lagi sampai raya?",
+            userLocale = Locale("ms"),
+            dateRulesMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "下個星期五是什麼日期？",
+            userLocale = Locale("zh"),
+            dateRulesMode = true,
+        )
+        assertTrue(ms.contains("Today's date (from the device):"))
+        assertTrue(zh.contains("Today's date (from the device):"))
+    }
+
+    @Test
+    fun `non-date queries never carry the date rules`() = runBlocking {
+        val p = builder().buildPrompt(queryOverride = "describe this room", userLocale = Locale.US)
+        assertFalse(p.contains("DATE ARITHMETIC RULE"))
+        val scene = builder().buildPrompt(userLocale = Locale.US, continuousMode = true)
+        assertFalse(scene.contains("DATE ARITHMETIC RULE"))
+    }
 }

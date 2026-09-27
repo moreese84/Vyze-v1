@@ -98,4 +98,20 @@ class SensitiveIdPolicyTest {
         // Unknown languages fall back to English, never null.
         assertEquals(en, unknown)
     }
+
+    // ── Traditional-Chinese ASR parity (2026-09-28) ──────────────
+
+    @Test
+    fun `traditional chinese identity and account asks are detected`() {
+        // Gemma ASR emits Traditional script; the simplified-only bank
+        // missed these on device (currency=false class of bug).
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("讀一下這個證件號碼"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("這個賬號是多少"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("我的銀行賬號是什麼"))
+        // 證-form identity card (the old bank only carried the 証 variant).
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("身份證號碼是多少"))
+        // Existing Traditional pairs stay detected (regression pin).
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("這個卡號是什麼"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("這個戶口號碼是多少"))
+    }
 }

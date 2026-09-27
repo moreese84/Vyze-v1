@@ -43,7 +43,8 @@ object SensitiveIdPolicy {
         "nombor dalam kad", "nombor atas kad", "nombor kat kad",
         // Chinese
         "身份证", "身份証", "證件號", "证件号", "卡号", "卡號",
-        "银行卡号", "銀行卡號", "账号", "帳號", "账户号码", "戶口號碼"
+        "银行卡号", "銀行卡號", "账号", "帳號", "账户号码", "戶口號碼",
+        "證件號碼", "賬號", "賬戶號碼", "銀行帳號", "身份證"  // Traditional (Gemma ASR)
     )
 
     /**

@@ -30,6 +30,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         currencyMode: Boolean = false,
         bankCardMode: Boolean = false,
         sensitiveIdMode: Boolean = false,
+        medicineMissMode: Boolean = false,
+        dateRulesMode: Boolean = false,
         memoryContext: String? = null,
         textOnlyMode: Boolean = false,
         brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL,
@@ -191,6 +193,33 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     English needs no override (the constants already speak it).
             failurePhraseClauseFor(userLocale.language)?.let { sb.appendLine(it) }
 
+            // 3f. MEDICINE DB-MISS CONTRACT (P1b, 2026-09-28): a medicine ask
+            //     whose DB lookup found NO record must produce the pinned
+            //     localized miss-refusal — never general knowledge, never an
+            //     invented schedule (pattern proven in AI Edge Gallery's
+            //     mood-tracker skill: "if no entry exists, explicitly inform
+            //     the user no entry was found"). Injected after every rule
+            //     block — last-seen-wins on the 2B model.
+            if (medicineMissMode) {
+                sb.appendLine(medicineMissClauseFor(userLocale.language))
+            }
+
+            // 3g. DATE ARITHMETIC CONTRACT (P1a, 2026-09-28): relative-date
+            //     asks get the DEVICE date injected deterministically (the
+            //     model otherwise anchors to training-data dates — garbage
+            //     in, confident garbage out) plus the shown-work rule.
+            //     Adaptation of AI Edge Gallery's create-calendar-event skill
+            //     (its `get_current_date_and_time` tool call = our Kotlin
+            //     injection). The spoken chain is short by design: Vyze's
+            //     only output channel is TTS, so "write steps silently" is
+            //     impossible — instead the model speaks one compact,
+            //     user-verifiable chain ("Today is Tue 29 Sep, so this
+            //     Friday is 3 October"), which a blind listener can audit.
+            if (dateRulesMode) {
+                sb.appendLine(todayLineFor(userLocale))
+                sb.appendLine(DATE_ARITHMETIC_RULES)
+            }
+
             // 4. Language mirror — reinforce at bottom (ALL languages now:
             //    symmetric anchor, English included — see the top mirror note)
             sb.appendLine("REMEMBER: Respond only in $langName. Begin immediately with the answer itself — never repeat or echo the user's question.")
@@ -212,7 +241,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             }
             Log.i(TAG, "Built prompt: ${prompt.length} chars, mode=$promptMode, " +
                 "lang=${userLocale.language}, currency=$currencyMode, bankCard=$bankCardMode, " +
-                "sensitiveId=$sensitiveIdMode, ocr=${!ocrText.isNullOrBlank()}, " +
+                "sensitiveId=$sensitiveIdMode, medicineMiss=$medicineMissMode, " +
+                "dateRules=$dateRulesMode, " +
+                "ocr=${!ocrText.isNullOrBlank()}, " +
                 "dialogue=${!dialogueContext.isNullOrBlank()}, brevity=$brevityLevel")
             prompt
 
@@ -630,5 +661,66 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
                 "'I do not know that' -> '我不知道'."
             else -> null
         }
+
+        /**
+         * P1b MEDICINE MISS-REFUSAL (2026-09-28): pinned spoken form of the
+         * "no record" refusal per language. Fires ONLY on a medicine query
+         * whose knowledge-base lookup missed — the DB is the only allowed
+         * source for the user's own medication facts, and absence is spoken
+         * honestly instead of paraphrased into a guess. Pattern credit: AI
+         * Edge Gallery mood-tracker skill (Apache-2.0). Pure — JVM-tested.
+         */
+        private fun medicineMissClauseFor(language: String): String = when (language) {
+            "ms" ->
+                "MEDICINE RECORD RULE: The local medicine database has NO record for " +
+                "this medicine. Say exactly: 'Saya tiada rekod ubat ini dalam senarai. " +
+                "Sila semak label atau bertanya kepada farmasi.' Never state or guess " +
+                "any dosage, frequency, or warning for it."
+            "zh" ->
+                "MEDICINE RECORD RULE: The local medicine database has NO record for " +
+                "this medicine. Say exactly: '我的藥品列表裡沒有這個藥的資訊。請查看藥品標籤或詢問藥劑師。' " +
+                "Never state or guess any dosage, frequency, or warning for it."
+            else ->
+                "MEDICINE RECORD RULE: The local medicine database has NO record for " +
+                "this medicine. Say exactly: \"I don't have a record of this medicine in " +
+                "your list. Please check the label or ask your pharmacist.\" Never state " +
+                "or guess any dosage, frequency, or warning for it."
+        }
+
+        /**
+         * P1a: the deterministic device-date line injected above the
+         * shown-work rule. Kotlin owns the anchor (Gallery's calendar skill
+         * uses a tool call for the same reason: the model must never guess
+         * today's date). Locale-patterned so ms/zh read naturally via TTS.
+         */
+        private fun todayLineFor(locale: java.util.Locale): String {
+            val today = java.time.LocalDate.now()
+            val pattern = when (locale.language) {
+                "zh" -> "yyyy年M月d日，EEEE"
+                "ms" -> "EEEE，d MMMM yyyy"
+                else -> "EEEE, d MMMM yyyy"
+            }
+            val formatted = today.format(
+                java.time.format.DateTimeFormatter.ofPattern(pattern, locale)
+            )
+            return "Today's date (from the device): $formatted."
+        }
+
+        /**
+         * P1a shown-work rule. Small models one-shotting "next Friday"
+         * silently get month lengths and roll-overs wrong; forcing the
+         * visible chain (Gallery pattern) plus a truthful anchor makes the
+         * answer auditable — and the chain is SHORT because TTS is the only
+         * output channel.
+         */
+        private val DATE_ARITHMETIC_RULES =
+            "DATE ARITHMETIC RULE: Today's date is given above from the device — " +
+            "anchor every date answer to it, never to a date you remember. For " +
+            "relative asks (\"next Friday\", \"how many days until\"), work it out " +
+            "explicitly: write out each step — the target day, the days to add, " +
+            "and the final date with the month and year rolled over correctly. " +
+            "Do not do date arithmetic in one silent step. Keep it short: at most " +
+            "one short sentence of working, then the final date — e.g. \"Today is " +
+            "Tuesday 29 September, so this Friday is 3 October.\""
     }
 }
