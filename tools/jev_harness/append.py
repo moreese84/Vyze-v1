@@ -9,11 +9,14 @@ one rolling corpus file without duplicating rows:
 
 Design decisions (each earned the hard way):
 
-  - DEDUPE KEY = (id, ts), never id alone. Device export sessions restart
-    their counters — `ir_1` exists in interactions_1789815166971.jsonl AND
-    interactions_1789950997064.jsonl with DIFFERENT content. Deduping on id
-    would silently drop real rows; id+ts collides only for a true re-export
-    of the same row.
+  - DEDUPE KEY = (ts, stable-content fingerprint), never id alone, never
+    (id, ts) anymore. Two traps were survived by (id, ts) — restarted
+    session counters, and id collisions across sessions — until a third
+    appeared on 2026-09-28: --namespace rewrites id to `<stem>_<id>` and a
+    multi-session re-export under a NEW filename re-keyed every old row,
+    silently adding 183 duplicate groups. Identity is now the device
+    timestamp plus a sha256 over the never-mutating fields (query, answer,
+    lane, lang); id and the post-hoc feedback/note fields are excluded.
 
   - SESSION NAMESPACING (opt-in, --namespace): device ids are only unique
     within one export session. When set, rows are rewritten to
@@ -41,6 +44,7 @@ Design decisions (each earned the hard way):
     summary reports the voice/tap split so a glance shows corpus shape.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -80,19 +84,38 @@ def read_jsonl_rows(path: str | Path) -> tuple[list[dict], list[tuple[int, str]]
 
 # ── Dedupe + namespacing ─────────────────────────────────────────────
 
-def row_key(row: dict) -> tuple:
-    """The dedupe key. Rows with id AND ts → (id, ts): device export
-    sessions restart their counters, so id alone would silently drop real
-    rows — id+ts collides only for a true re-export of the same row.
+def _stable_fingerprint(row: dict) -> str:
+    """Content fingerprint over fields that NEVER mutate after the fact:
+    query/answer/lane/lang. Deliberately excludes id (namespace renames it
+    per export) and feedback/note (suspect tags are added post-hoc, so the
+    same interaction re-exported after a code change differs there)."""
+    stable = {k: row.get(k) for k in ("query", "answer", "lane", "lang")
+              if k in row}
+    payload = json.dumps(stable, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
 
-    Rows missing either field fall back to FULL-CONTENT identity: a
-    re-merged identical row is a duplicate (append stays idempotent for
-    any input), a genuinely different keyless row is still added."""
-    rid, ts = row.get("id"), row.get("ts")
-    if rid is None or ts is None:
+
+def row_key(row: dict) -> tuple:
+    """The dedupe key: (ts, stable-content fingerprint).
+
+    2026-09-28 ERATUM: the original key was (id, ts), which survived two
+    real-world traps (restarted session counters; id-collisions across
+    sessions) but not a third — --namespace rewrites id to
+    `<export-stem>_<id>`, and a multi-session re-export under a NEW
+    filename silently re-keyed every old row: 183 duplicate groups entered
+    the rolling corpus. The id component is therefore GONE from the key
+    (it is mutable per export); identity is the device timestamp plus a
+    fingerprint over the never-mutating fields. A clock-reset collision
+    with identical ts still survives dedupe whenever the content differs.
+
+    Rows missing ts fall back to FULL-CONTENT identity: a re-merged
+    identical row is a duplicate (append stays idempotent for any input),
+    a genuinely different keyless row is still added."""
+    ts = row.get("ts")
+    if ts is None:
         payload = json.dumps(row, sort_keys=True, ensure_ascii=False)
         return ("__content__", payload)
-    return (str(rid), ts)
+    return ("ts", str(ts), _stable_fingerprint(row))
 
 
 def namespace_row(row: dict, stem: str) -> dict:
