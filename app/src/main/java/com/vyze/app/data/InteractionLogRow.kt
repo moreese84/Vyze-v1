@@ -34,6 +34,14 @@ data class InteractionLogRow(
     val ts: Long,
     val source: String,
     val lane: String = LANE_VOICE,
+
+    /**
+     * Suspect marks (implicit failure detection, SuspectMarker) — null when
+     * clean. Exported as the corpus `note` field so a shared row arrives
+     * PRE-LABELED AS FAILURE evidence for distillation gating. Also the
+     * provenance field the device fixture integrity test requires.
+     */
+    val note: String? = null,
 ) {
     /** JSON string with proper escaping; fields ordered for grep-ability. */
     fun toJson(): String {
@@ -47,6 +55,9 @@ data class InteractionLogRow(
         sb.append("\"ts\": ").append(ts).append(", ")
         sb.append("\"source\": ").append(quote(source)).append(", ")
         sb.append("\"lane\": ").append(quote(lane))
+        if (!note.isNullOrBlank()) {
+            sb.append(", \"note\": ").append(quote(note))
+        }
         sb.append('}')
         return sb.toString()
     }

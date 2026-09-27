@@ -15,8 +15,10 @@ import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import com.vyze.app.data.InteractionDao
+import com.vyze.app.data.InteractionLogRow
 import com.vyze.app.data.InteractionRecord
 import com.vyze.app.data.MemoryDao
+import com.vyze.app.data.SuspectMarker
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.PreferenceLearner
 import com.vyze.app.memory.SimilarInteraction
@@ -68,6 +70,16 @@ class VyzeCoreController(
     private val barcodeHelper = BarcodeHelper()
     private val scanRepository by lazy { com.vyze.app.data.ScanRepository(context.applicationContext) }
     private val preferenceLearner = PreferenceLearner(memoryDao)
+
+    // ── IMPLICIT FAILURE MARKERS (plan C, 2026-09-24/27) ────────────
+    // Silent self-diagnosis: suspect marks land in interaction_records
+    // .feedback so shared corpus rows arrive PRE-LABELED AS FAILURES.
+    // Pure logic lives in [SuspectMarker]; this state is the minimal
+    // per-conversation context the pure functions need.
+    private var suspectPriorBargeIn = false
+    private var suspectPriorAsrFailure = false
+    private var lastVoiceQuery: String? = null
+    private var lastVoiceQueryAtMs: Long? = null
 
     private val isInferring = AtomicBoolean(false)
 
@@ -1104,6 +1116,9 @@ class VyzeCoreController(
         //    never be misread as impatience.
         if (ttsManager.hasPendingSpeech()) {
             scope.launch { preferenceLearner.recordInterruptWhileSpeaking() }
+            // The NEXT stored record (this new capture's) inherits the mark:
+            // the row BEFORE it was interrupted mid-answer.
+            suspectPriorBargeIn = true
         }
 
         // 1. Stop any active TTS — cancel lingering audio
@@ -1234,6 +1249,20 @@ class VyzeCoreController(
         currencyModeActive = currencyQuery
         bankCardModeActive = bankCardQuery
         sensitiveIdModeActive = sensitiveIdQuery
+
+        // ── RECOVERY-CUE ARMING (implicit failure detection) ──────
+        // A spoken recovery cue ("please say that again") means the
+        // PREVIOUS listening cycle failed to be heard — the record stored
+        // for THIS capture carries suspect_prior_asr_failure. Taps never
+        // arm (no speech involved).
+        if (query != null && InteractionLogRow.laneOf(query) == InteractionLogRow.LANE_VOICE) {
+            suspectPriorAsrFailure = SuspectMarker.isRecoveryCue(
+                query.lowercase()
+                    .map { if (it.isLetterOrDigit() || it == ' ') it else ' ' }
+                    .joinToString("")
+                    .replace(Regex("\\s+"), " ").trim()
+            )
+        }
 
         // ── TAP GRID TAG (structured spatial prompting) ───────────
         // Raw pixel coords mean nothing to a small VLM — it ignores them.
@@ -1796,10 +1825,36 @@ class VyzeCoreController(
                     }
                 } else {
                     CrashLogFile.log(TAG, "Storing interaction for adaptive intelligence...")
+
+                    // ── SUSPECT MARKS (implicit failure detection) ──
+                    // Computed at store time; pure decisions, tiny state.
+                    val repeatWithinWindow = SuspectMarker.isRepeatWithinWindow(
+                        query = query ?: "",
+                        lastQuery = lastVoiceQuery,
+                        lastQueryMsAgo = lastVoiceQueryAtMs
+                            ?.let { System.currentTimeMillis() - it },
+                    )
+                    val langMismatch = query != null && SuspectMarker
+                        .isLangMismatch(query, response)
+                    val suspectTags = SuspectMarker.tagsForStoredRecord(
+                        priorBargeIn = suspectPriorBargeIn,
+                        priorAsrFailure = suspectPriorAsrFailure,
+                        langMismatch = langMismatch,
+                        repeatWithinWindow = repeatWithinWindow,
+                    )
+                    if (suspectTags.isNotEmpty()) {
+                        CrashLogFile.log(TAG, "Suspect marks: $suspectTags")
+                    }
+                    // Flags consumed (they describe THIS record only).
+                    suspectPriorBargeIn = false
+                    suspectPriorAsrFailure = false
+
                     memoryRepository.storeInteraction(
                         bitmap = bitmap,
                         prompt = basePrompt,
-                        output = response
+                        output = response,
+                        feedback = suspectTags,
+                        tags = ""
                     )
 
                     if (currentSessionId == activeSessionId) {
@@ -1811,6 +1866,14 @@ class VyzeCoreController(
                         // Record the exchange for conversational follow-ups.
                         if (isVoiceFollowUpCandidate && !isPreciseRead) {
                             recordDialogueTurn(query ?: "", response)
+                        }
+                        // Recent-query ring for repeat detection (voice lane
+                        // only — taps carry no query worth repeating).
+                        if (!query.isNullOrBlank() &&
+                            InteractionLogRow.laneOf(query) == InteractionLogRow.LANE_VOICE
+                        ) {
+                            lastVoiceQuery = query
+                            lastVoiceQueryAtMs = System.currentTimeMillis()
                         }
 
                         // Continuous mode: refresh the scene baseline so the

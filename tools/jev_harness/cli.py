@@ -59,6 +59,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_common(p_selftalk)
 
+    p_features = sub.add_parser(
+        "features",
+        help="B4 rung 0: extract the feature table for the distilled "
+             "decision list (offline; pairs corpus rows with route labels)",
+    )
+    add_common(p_features)
+    p_features.add_argument(
+        "--labels", default=None,
+        help="route-labels JSONL (out/route_labels.jsonl from 'route --live'); "
+             "falls back to each row's 'expected' field when absent",
+    )
+
+    p_fit = sub.add_parser(
+        "fit_rung0",
+        help="B4 rung 0: fit the 3-class decision list on the labeled "
+             "feature table, validate on frozen fixtures, optionally emit "
+             "the Kotlin classifier",
+    )
+    p_fit.add_argument("--features", required=True,
+                       help="feature table JSONL (from 'features --out')")
+    p_fit.add_argument("--fixture", required=True,
+                       help="seed fixture JSONL (phase0_route_labels.jsonl)")
+    p_fit.add_argument("--device-fixture", default=None,
+                       help="device fixture JSONL (phase3_device_labels.jsonl)")
+    p_fit.add_argument("--emit-kotlin", default=None,
+                       help="emit the generated Kotlin classifier to this path")
+    p_fit.add_argument("--out", default=None,
+                       help="weights JSONL path (provenance + rules)")
+
     p_append = sub.add_parser(
         "append",
         help="A1: merge device exports into a rolling corpus file",
@@ -79,11 +108,28 @@ def main(argv: list[str] | None = None) -> int:
         append_sources(args.inputs, args.out, namespace=args.namespace)
         return 0
 
+    # B4 rung 0 fitting: consumes the feature TABLE (not raw corpus rows)
+    # and has no --corpus — dispatch before the corpus machinery.
+    if args.cmd == "fit_rung0":
+        from .fit_rung0 import run as fit_run
+        return fit_run(args.features, args.fixture, args.device_fixture,
+                       args.out, args.emit_kotlin)
+
     corpus_path = args.corpus or "builtin"
     items = CORPUS if args.corpus is None else load_corpus(args.corpus)
     if not items:
         print(f"No rows found in {corpus_path}", file=sys.stderr)
         return 2
+
+    # B4 rung 0: offline feature extraction — no model machinery needed,
+    # but it does consume the loaded corpus rows.
+    if args.cmd == "features":
+        from .features import build_feature_table, feature_report, write_feature_table
+        table = build_feature_table(items, args.labels)
+        print(feature_report(table))
+        write_feature_table(table, args.out or "out/features.jsonl")
+        return 0
+
     print(f"Corpus: {corpus_path} ({len(items)} rows), model={args.model}, "
           f"mode={'LIVE' if args.live else 'dry-run'}")
 

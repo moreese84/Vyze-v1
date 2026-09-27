@@ -91,6 +91,9 @@ object InteractionLogExporter {
                     ts = r.timestamp,
                     source = "interaction_records",
                     lane = InteractionLogRow.laneOf(query),
+                    // Implicit failure marks (SuspectMarker) → corpus note:
+                    // shared rows arrive pre-labeled as failure evidence.
+                    note = r.feedback.trim().ifEmpty { null },
                 ),
             )
         }
