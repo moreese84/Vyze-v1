@@ -18,6 +18,7 @@ import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.InteractionLogRow
 import com.vyze.app.data.InteractionRecord
 import com.vyze.app.data.MemoryDao
+import com.vyze.app.data.RepetitionLoopGuard
 import com.vyze.app.data.SuspectMarker
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.PreferenceLearner
@@ -241,6 +242,15 @@ class VyzeCoreController(
     private val chunkCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
     // ── Confidence Check ─────────────────────────────────────────
+    /**
+     * Rolling window of generated text for the repetition-loop guard
+     * (streaming check beside the confidence check).
+     */
+    private val repetitionWindow = StringBuilder()
+
+    /** True once the stream guard has tripped for this inference. */
+    private var repetitionGuardTripped = false
+
     /** Buffer for first N tokens to check for hedging language. */
     private val tokenConfidenceBuffer = StringBuilder()
     /** Once first N tokens pass confidence check, stop checking. */
@@ -425,6 +435,41 @@ class VyzeCoreController(
                     // hedging language ("I think", "maybe", "it looks like"),
                     // it's uncertain. Abort early and return a safe fallback
                     // instead of letting it guess and potentially hallucinate.
+                    // ── REPETITION-LOOP GUARD (streaming) ────────────
+                    // A degenerate repetition loop ("999999999999…" —
+                    // row ir_85) is confident garbage: the hedge check
+                    // guards uncertainty, this guards runaway decoding.
+                    // Checked on a rolling window; trips abort the
+                    // generation exactly like the confidence abort.
+                    if (!repetitionGuardTripped) {
+                        synchronized(bufferLock) {
+                            repetitionWindow.append(token)
+                            // Cap the window (the guard needs only the
+                            // tail to detect an ongoing loop).
+                            if (repetitionWindow.length > 600) {
+                                repetitionWindow.delete(0, repetitionWindow.length - 400)
+                            }
+                            repetitionGuardTripped =
+                                RepetitionLoopGuard.isDegenerate(repetitionWindow.toString())
+                        }
+                    }
+                    if (repetitionGuardTripped) {
+                        Log.w(TAG, "Repetition-loop abort: degenerate repetition in stream")
+                        CrashLogFile.log(TAG, "REPETITION ABORT: degenerate repetition detected")
+                        confidenceCheckPassed = true  // stop hedge checks too
+                        isInferring.set(false)
+                        vlmEngine.interrupt()
+                        mainHandler.post {
+                            onInferenceComplete?.invoke(
+                                ttsManager.localized(
+                                    "Not clearly visible.",
+                                    "Ia tidak jelas kelihatan.",
+                                    "看不清楚。"
+                                )
+                            )
+                            onStatusUpdate?.invoke("Ready [degenerate output]")
+                        }
+                    } else {
                     if (!confidenceCheckPassed) {
                         tokenConfidenceBuffer.append(token)
                         val accumulated = tokenConfidenceBuffer.toString().trim()
@@ -457,10 +502,11 @@ class VyzeCoreController(
                         }
                     }
 
-                    synchronized(bufferLock) {
-                        sentenceBuffer.append(token)
+                        synchronized(bufferLock) {
+                            sentenceBuffer.append(token)
+                        }
+                        flushSentenceBufferIfReady()
                     }
-                    flushSentenceBufferIfReady()
                 } catch (e: Throwable) {
                     Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
                 }
@@ -474,6 +520,31 @@ class VyzeCoreController(
             } else {
                 CrashLogFile.log(TAG, "onComplete fired: session=$sessionId, ${fullResponse.length} chars")
                 try {
+                    // ── REPETITION-LOOP GUARD (net at onComplete) ────
+                    // Tokens may have arrived faster than the streaming
+                    // window could judge, or the loop may close exactly
+                    // at the end of generation. Before ANY TTS of the
+                    // remaining buffer: judge the FULL response and, on
+                    // a loop, clear the sentence buffer so the degenerate
+                    // tail never reaches TTS. The localized fallback is
+                    // the only thing spoken.
+                    val fullDegenerate = RepetitionLoopGuard.isDegenerate(fullResponse)
+                    if (fullDegenerate || repetitionGuardTripped) {
+                        synchronized(bufferLock) {
+                            sentenceBuffer.setLength(0)
+                        }
+                        Log.w(TAG, "Repetition-loop net: degenerate full response (${fullResponse.length} chars)")
+                        CrashLogFile.log(TAG, "REPETITION ABORT (net): degenerate full response")
+                    }
+                    val safeResponse = if (fullDegenerate) {
+                        ttsManager.localized(
+                            "Not clearly visible.",
+                            "Ia tidak jelas kelihatan.",
+                            "看不清楚。"
+                        )
+                    } else {
+                        fullResponse
+                    }
                     flushRemainingSentenceBuffer()
                     scope.launch {
                         try {
@@ -518,7 +589,7 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "isInferring set to false")
                     mainHandler.post {
                         try {
-                            onInferenceComplete?.invoke(fullResponse)
+                            onInferenceComplete?.invoke(safeResponse)
                             onStatusUpdate?.invoke("Ready")
                             CrashLogFile.log(TAG, "onComplete UI callbacks done (session=$sessionId)")
                         } catch (e: Throwable) {
@@ -1068,6 +1139,8 @@ class VyzeCoreController(
         currentChunkStarted = false
         tokenConfidenceBuffer.clear()
         confidenceCheckPassed = false
+        repetitionWindow.setLength(0)
+        repetitionGuardTripped = false
     }
 
     // ── Tap Grid Tagging (structured spatial prompting) ───────────
