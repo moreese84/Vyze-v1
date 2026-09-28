@@ -311,6 +311,7 @@ class TTSManager private constructor(context: Context) {
         // listener per instance, matching the old engine-global contract.
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                lastSpeakStartedAtMs = System.currentTimeMillis()
                 if (utteranceId != null) onUtteranceStart(utteranceId)
             }
 
@@ -1470,6 +1471,28 @@ class TTSManager private constructor(context: Context) {
 
     companion object {
         private const val TAG = "[TTSManager]"
+
+        /**
+         * Process-global TTS recency marker (2026-09-28): the last time any
+         * utterance STARTED playing, wall-clock. Consulted by AudioCapture
+         * before retaining calibration-window audio — a capture that opens
+         * while the speaker is still ringing contains Vyze's OWN voice, and
+         * feeding that to the ASR produces self-talk transcripts that
+         * SelfTalkPolicy must then block (observed: follow-up queries
+         * answered by SelfTalkPolicy rejection after a "Hello, I'm a large
+         * language model" transcript). Pure volatile — no locks on the
+         * audio path.
+         */
+        @Volatile
+        var lastSpeakStartedAtMs: Long = 0L
+            private set
+
+        /** True when TTS audio may still be audible/echoing. */
+        val spokeVeryRecently: Boolean
+            get() = System.currentTimeMillis() - lastSpeakStartedAtMs < TTS_ECHO_GUARD_MS
+
+        /** Speaker ring-down + echo tail allowance. */
+        const val TTS_ECHO_GUARD_MS = 1500L
 
         /**
          * Prefixes that mark a letter+digit token as currency/quantity, not an

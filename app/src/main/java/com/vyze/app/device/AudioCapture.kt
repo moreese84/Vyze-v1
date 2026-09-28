@@ -1,5 +1,6 @@
 package com.vyze.app.device
 import com.vyze.app.core.VlmEngineManager
+import com.vyze.app.speech.TTSManager
 import com.vyze.app.util.CrashLogFile
 
 import android.media.AudioFormat
@@ -61,7 +62,12 @@ object AudioCapture {
     /** Stop early when this much near-silence has elapsed (user finished speaking).
      * (L2: 1200ms → 800ms — the trailing wait was pure added latency on every
      * offline query; 800ms still tolerates natural mid-phrase pauses.) */
-    private const val SILENCE_TIMEOUT_MS = 800L
+    /**
+     * Trailing silence before the recorder decides the user is done.
+     * 800 → 450ms (2026-09-28 latency pass): 450ms still clears natural
+     * inter-word pauses (~150–300ms) while saving ~350ms on every ask.
+     */
+    private const val SILENCE_TIMEOUT_MS = 450L
 
     /** RMS below this (of a [-1,1] float signal) counts as silence. This is the
      * FALLBACK floor — [SilenceGate] replaces it with a per-session ambient
@@ -73,7 +79,15 @@ object AudioCapture {
      * "specify" (~0.6s of speech) could NEVER satisfy the silence stop — the
      * recorder then ran to the full 8s cap. That was the dominant offline
      * latency cost in the 2026-09-22 sessions.) */
-    private const val MIN_SPEECH_MS = 600L
+    /**
+     * Classified speech needed BEFORE the trailing-silence stop may engage.
+     * 600 → 400ms (2026-09-28 latency pass): desk queries classified at
+     * 400–500ms sat under the old bar, so the recorder skipped the early
+     * stop and ran to the 4s no-speech bail — up to ~1.5s of dead wait.
+     * Anti-hallucination is unaffected: SpeechGatePolicy.MIN_SPEECH_MS
+     * (300ms) still gates transcription AFTER capture.
+     */
+    private const val MIN_SPEECH_MS = 400L
 
     /**
      * L1 noise-floor calibration: sample this long of ambient BEFORE treating
@@ -81,7 +95,14 @@ object AudioCapture {
      * silence threshold, so a quiet room stops quickly and a noisy room gets
      * a raised gate instead of recording the full 8s cap of room audio.
      */
-    private const val AMBIENT_CALIBRATION_MS = 300L
+    /**
+     * Calibration window (failure mode 3, 2026-09-28): 800ms instead of
+     * 300ms so a double-tap desk knock — which RINGS through the tabletop
+     * for ~500ms — decays INSIDE the window and the quietest-half median
+     * sees true ambient. Costs 500ms of head-of-capture audio, which was
+     * dead lead-in anyway (the user has not spoken yet).
+     */
+    private const val CAL_WINDOW_MS = 800L
 
     /**
      * NO-SPEECH BAIL (L2c): if this much time has elapsed with less than
@@ -143,11 +164,13 @@ object AudioCapture {
             }
 
             // ── L1: AMBIENT CALIBRATION ─────────────────────────────────
-            // Read AMBIENT_CALIBRATION_MS of room tone WITHOUT storing it,
-            // then hand the measured floor to [SilenceGate]. If calibration
-            // fails for any reason the gate falls back to the fixed floor.
+            // Read CAL_WINDOW_MS of room tone WITHOUT storing it, then hand
+            // the measured floor to [SilenceGate] (which calibrates on the
+            // quietest half of the window — see failure mode 3). If
+            // calibration fails for any reason the gate falls back to the
+            // fixed floor.
             val gate = SilenceGate()
-            val calibFloats = FloatArray(((SAMPLE_RATE_HZ * AMBIENT_CALIBRATION_MS) / 1000).toInt())
+            val calibFloats = FloatArray(((SAMPLE_RATE_HZ * CAL_WINDOW_MS) / 1000).toInt())
             var calibRead = 0
             while (calibRead < calibFloats.size) {
                 val n = recorder.read(calibFloats, calibRead, calibFloats.size - calibRead, AudioRecord.READ_BLOCKING)
@@ -162,14 +185,83 @@ object AudioCapture {
 
             val out = java.io.ByteArrayOutputStream()
             val floatBuf = FloatArray(minBuffer / 4)  // 4 bytes per float sample
+            var silenceMs = 0L
+            var speechMs = 0L
+
+            // ── RETROACTIVE CLASSIFICATION + LEAD-SILENCE TRIM ───────────
+            // (failure mode 4 + latency recovery, 2026-09-28)
+            // The calibration audio used to be DISCARDED — but a desk user
+            // starts speaking immediately after the double-tap, so the
+            // question itself landed inside the window and was thrown away
+            // (device evidence: speechMs=100/60/80 with the question audible
+            // in the HAL power history). The calibration audio is REAL
+            // audio: classify it with the now-known gate so speech inside
+            // the window counts toward [speechMs], and RETAIN it in the
+            // clip — TRIMMING the leading silent chunks first so the common
+            // case (user pauses before speaking) does not feed the ASR
+            // 800ms of dead air.
+            //
+            // FAILURE MODE 5 (device, 09:39): on FOLLOW-UP queries the
+            // retained window contained Vyze's OWN TTS tail (the speaker
+            // ringing down from the previous answer) — the ASR dutifully
+            // transcribed "Hello, I'm a large language model…" and
+            // SelfTalkPolicy blocked the turn. So retention is now
+            // CONDITIONAL: when TTS spoke within [TTS_ECHO_GUARD_MS], the
+            // window is classified but DISCARDED again (the old cold-start
+            // rejection only ever mattered on a cold/desk start, never
+            // right after an answer).
+            if (calibRead > 0) {
+                var i = 0
+                var leadSilentChunks = 0
+                var stillLeading = true
+                var fullChunks = 0
+                while (i + SilenceGate.CAL_CHUNK_SAMPLES <= calibRead) {
+                    var sumSq = 0.0
+                    for (j in i until i + SilenceGate.CAL_CHUNK_SAMPLES) {
+                        val s = calibFloats[j].toDouble()
+                        sumSq += s * s
+                    }
+                    val rms = Math.sqrt(sumSq / SilenceGate.CAL_CHUNK_SAMPLES).toFloat()
+                    val ms = (SilenceGate.CAL_CHUNK_SAMPLES * 1000L) / SAMPLE_RATE_HZ
+                    val silent = gate.isSilence(rms)
+                    if (silent) {
+                        silenceMs += ms
+                        if (stillLeading) leadSilentChunks++
+                    } else {
+                        speechMs += ms
+                        silenceMs = 0L
+                        stillLeading = false
+                    }
+                    fullChunks++
+                    i += SilenceGate.CAL_CHUNK_SAMPLES
+                }
+                val ttsEchoRisk = TTSManager.spokeVeryRecently
+                val trimStart = if (ttsEchoRisk) {
+                    calibRead // discard everything — old cold-rejection behavior
+                } else {
+                    LeadSilenceTrim.startSample(
+                        leadSilentChunks, fullChunks, SilenceGate.CAL_CHUNK_SAMPLES
+                    )
+                }
+                val kept = calibRead - trimStart
+                if (kept > 0) {
+                    val calibBuf = ByteBuffer.allocate(kept * 4).order(ByteOrder.LITTLE_ENDIAN)
+                    for (j in trimStart until calibRead) {
+                        calibBuf.putFloat(calibFloats[j])
+                    }
+                    out.write(calibBuf.array())
+                }
+                Log.i(TAG, "Calibration audio " +
+                    (if (ttsEchoRisk) "DISCARDED (TTS echo risk)" else "retained: ${kept * 1000L / SAMPLE_RATE_HZ}ms") +
+                    ", trimmed lead silence: ${trimStart * 1000L / SAMPLE_RATE_HZ}ms, " +
+                    "retroactive speechMs so far: $speechMs")
+            }
             val stopPolicy = CaptureStopPolicy(
                 minSpeechMs = MIN_SPEECH_MS,
                 trailingSilenceMs = SILENCE_TIMEOUT_MS,
                 noSpeechBailMs = NO_SPEECH_BAIL_MS,
                 maxDurationMs = maxDurationMs
             )
-            var silenceMs = 0L
-            var speechMs = 0L
             val startTime = System.currentTimeMillis()
 
             while (true) {
@@ -275,10 +367,26 @@ object AudioCapture {
  * fixed separately by lowering MIN_SPEECH_MS. Pure math — no Android — so
  * JVM tests pin the contract directly.
  *
+ * FAILURE MODE 3 (2026-09-28, reproduced on device twice): the overall-RMS
+ * floor was POISONED by a capture-start transient — the double-tap
+ * vibration thump when the phone rests on a hard surface. One ~100ms
+ * burst inside the calibration window dragged the floor ~10×
+ * (0.002 → 0.017–0.030 observed), the derived threshold rose above
+ * speech level, and every ask was rejected as "silent" ("I did not
+ * catch that") until the next capture re-calibrated clean. Fix (two
+ * stages, both device-evidenced): (a) median of per-chunk RMS instead of
+ * overall RMS; (b) after the desk test showed the knock RINGS through the
+ * tabletop for ~500ms — covering most of a 300ms window, defeating the
+ * plain median — the window grew to 800ms and the floor became the
+ * median of the QUIETEST HALF of the chunks. Genuine steady ambient
+ * noise still raises the gate exactly as before.
+ *
  * Contract (all clamped by ABS_MAX so a loud room can never lock the gate):
  *  - Uncalibrated → fixed fallback floor (0.015), threshold = floor × MARGIN
- *  - Calibrated   → threshold = max(floor × MARGIN, floor + ABS_MIN_MARGIN)
+ *  - Calibrated   → floor = median per-chunk RMS; threshold =
+ *                   max(floor × MARGIN, floor + ABS_MIN_MARGIN)
  *  - threshold never exceeds ABS_MAX (loud-room safety valve)
+ *  - constant-amplitude input → median == overall RMS (old tests hold)
  */
 class SilenceGate {
 
@@ -295,25 +403,46 @@ class SilenceGate {
         private set
 
     /**
-     * Derive floor + threshold from an ambient sample (recording order is
-     * irrelevant — only the distribution matters). Malformed input
-     * (null/empty/zero RMS) leaves the fallback state untouched.
+     * Derive floor + threshold from an ambient sample. The window is split
+     * into [CAL_CHUNK_SAMPLES]-sample chunks (~20ms at 16kHz — the HAL frame
+     * size) and the floor is the MEDIAN of the QUIETEST HALF of the per-chunk
+     * RMS values, so a capture-start transient (desk thump, TTS tail,
+     * double-tap vibration) cannot poison it — including the desk-resonance
+     * case (2026-09-28) where the knock RINGS for most of a short window:
+     * with an 800ms window the ring decays inside it and the quiet tail
+     * dominates the quietest half. Malformed input (null/empty/zero RMS)
+     * leaves the fallback state untouched.
      */
     fun calibrate(samples: FloatArray?, offset: Int = 0, length: Int = samples?.size ?: 0) {
         if (samples == null || length <= 0 || offset < 0 || offset + length > samples.size) return
-        var sumSq = 0.0
-        var count = 0
+        val chunkRms = mutableListOf<Float>()
         val end = offset + length
-        for (i in offset until end) {
-            val s = samples[i].toDouble()
-            sumSq += s * s
-            count++
+        var i = offset
+        while (i < end) {
+            val chunkEnd = minOf(i + CAL_CHUNK_SAMPLES, end)
+            var sumSq = 0.0
+            var count = 0
+            for (j in i until chunkEnd) {
+                val s = samples[j].toDouble()
+                sumSq += s * s
+                count++
+            }
+            if (count > 0) chunkRms.add(Math.sqrt(sumSq / count).toFloat())
+            i = chunkEnd
         }
-        if (count == 0) return
-        val rms = Math.sqrt(sumSq / count)
-        // A dead mic or all-zero buffer yields RMS 0 — keep the fallback.
-        if (rms <= 0.0) return
-        floorRms = rms.toFloat()
+        if (chunkRms.isEmpty()) return
+        chunkRms.sort()
+        // Median of the QUIETEST half (ceil(n/2) values). Constant amplitude
+        // → every chunk is in the quiet half → identical to the overall
+        // median (backward compat). A transient ringing through ≤ half the
+        // window is excluded entirely.
+        val half = (chunkRms.size + 1) / 2
+        val n = half
+        val median = if (n % 2 == 1) chunkRms[n / 2]
+                     else (chunkRms[n / 2 - 1] + chunkRms[n / 2]) / 2f
+        // A dead mic or all-zero buffer yields median RMS 0 — keep the fallback.
+        if (median <= 0.0) return
+        floorRms = median
         val relative = floorRms * MARGIN
         val absolute = floorRms + ABS_MIN_MARGIN
         thresholdRms = Math.min(Math.max(relative, absolute), ABS_MAX)
@@ -330,11 +459,48 @@ class SilenceGate {
         /** Silence threshold margin over the measured/fallback floor. */
         const val MARGIN = 1.8f
 
-        /** Minimum absolute headroom above a measured floor (quiet rooms). */
-        const val ABS_MIN_MARGIN = 0.012f
+        /**
+         * Minimum absolute headroom above a measured floor (quiet rooms).
+         * 2026-09-28: halved 0.012 → 0.006 — device logs showed desk-
+         * occluded speech peaking at only ~0.02 RMS, which could not clear
+         * the old floor+0.012 bar in a near-silent room (classified speech
+         * halved; asks rejected at 280ms against the 300ms bar). Room-hiss
+         * rejection still holds: ambient sits at the floor level, far below
+         * floor+0.006, and noisy rooms are governed by the ×1.8 relative
+         * margin, which is unchanged.
+         */
+        const val ABS_MIN_MARGIN = 0.006f
 
         /** Loud-room safety valve — threshold can never exceed this. */
         const val ABS_MAX = 0.35f
+
+        /**
+         * Calibration sub-chunk size in samples (~20ms at 16kHz — matches
+         * the observed HAL frame count). The floor is the median of the
+         * quietest half of these chunks' RMS (failure mode 3, 2026-09-28).
+         */
+        const val CAL_CHUNK_SAMPLES = 320
+    }
+}
+
+/**
+ * Pure decision for the LEAD-SILENCE TRIM (latency recovery for failure
+ * mode 4, 2026-09-28): the retained calibration window usually opens with
+ * silence — the user has not spoken yet — and serializing it whole fed the
+ * ASR up to 800ms of dead air (+~800ms perceived latency, observed on
+ * device). [startSample] returns the sample offset where the clip should
+ * begin: the end of the leading silent run, MINUS one chunk of natural
+ * lead-in so the first word is never clipped. No leading silence → 0
+ * (keep everything); all-silent window → keep the final chunk (the speech
+ * onset may sit in it — the streaming part continues after it).
+ */
+object LeadSilenceTrim {
+
+    fun startSample(leadSilentChunks: Int, fullChunks: Int, chunkSamples: Int): Int {
+        if (leadSilentChunks <= 0 || fullChunks <= 0 || chunkSamples <= 0) return 0
+        val silentEndChunk = minOf(leadSilentChunks, fullChunks)
+        val keepFromChunk = maxOf(0, silentEndChunk - 1)
+        return keepFromChunk * chunkSamples
     }
 }
 
