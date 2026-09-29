@@ -2365,34 +2365,7 @@ class VyzeCoreController(
      * camera pipeline — a missed text-only route is safe, a wrongly
      * routed visual query is not.
      */
-    fun isTextOnlyQuery(query: String?): Boolean {
-        if (query.isNullOrBlank()) return false
-        val lower = query.lowercase().trim()
-
-        // Malay knowledge form — "apa itu <noun>?" (what is <noun>?) is a
-        // question ABOUT the noun, not a pointer at a scene object. The bare
-        // forms ("apa itu?", "itu apa?") point at something and must stay on
-        // the camera path. Scene extras (holding / in front / see) keep it on
-        // the camera path too ("apa itu yang saya pegang" = what am I holding).
-        val wordCount = lower.split(Regex("\\s+")).size
-        val malayKnowledgeWithSubject =
-            (lower.contains("apa itu") || lower.contains("apa ini")) &&
-                wordCount >= 3 &&
-                !lower.contains("pegang") &&
-                !lower.contains("tangan") &&
-                !lower.contains("hadapan") &&
-                !lower.contains("depan") &&
-                !lower.contains("nampak") &&
-                !lower.contains("lihat")
-        if (malayKnowledgeWithSubject) return true
-
-        // Must contain a knowledge-question marker...
-        val hasKnowledgeMarker = TEXT_ONLY_QUERY_KEYWORDS.any { lower.contains(it) }
-        if (!hasKnowledgeMarker) return false
-        // ...and must NOT reference the visual scene.
-        val referencesScene = TEXT_ONLY_EXCLUDE_KEYWORDS.any { lower.contains(it) }
-        return !referencesScene
-    }
+    fun isTextOnlyQuery(query: String?): Boolean = companionIsTextOnlyQuery(query)
 
     /**
      * Run a text-only inference — no bitmap, no OCR, no memory fingerprint.
@@ -2454,7 +2427,18 @@ class VyzeCoreController(
                 // stored interaction history mentions what the user is asking
                 // about, inject it as context so "where are my keys?" can
                 // surface the last scene that showed keys.
-                val recallRecords = try {
+                //
+                // DATE-ASK RECALL SKIP (device-evidenced 2026-09-29): stored
+                // dialogue never carries device-computed dates, and this
+                // session's own WRONG pre-fix answer ("Jumaat depan ialah 25
+                // Oktober 2026") was re-injected as recall into a later
+                // correct ask — stale-wrong recall is a poison channel for
+                // date asks. The date contract below is self-sufficient
+                // (device anchor + computed example); recall adds nothing
+                // but risk there, so date asks never consult it.
+                val recallRecords = if (companionHitsDateQuery(query)) {
+                    emptyList()
+                } else try {
                     memoryRepository.recallByText(query)
                 } catch (e: Throwable) {
                     CrashLogFile.logError(TAG, "Text recall lookup failed: ${e.message}", e)
@@ -2878,11 +2862,7 @@ class VyzeCoreController(
      * "下個星期五是什麼日期"). Pure keyword gate — same style as
      * [isCurrencyQuery]. Null/blank never triggers.
      */
-    private fun hitsDateQuery(query: String?): Boolean {
-        if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
-        return DATE_KEYWORDS.any { keyword -> lower.contains(keyword) }
-    }
+    private fun hitsDateQuery(query: String?): Boolean = companionHitsDateQuery(query)
 
     /**
      * Look up a medicine from the local knowledge base by matching
@@ -3381,6 +3361,93 @@ class VyzeCoreController(
             // Chinese
             "这个", "那个", "这里", "那里", "前面", "这个东西"
         )
+
+        /**
+         * Visual anchors that mean the user is asking about a date IN THE
+         * SCENE (on a document, a phone screen, a calendar on the wall).
+         * Subset of the scene-exclusion idea, kept separate because these
+         * gate ONLY the new date branch: "tarikh atas surat ini" is a camera
+         * query wearing a date costume, while "Jumaat depan tarikh apa" is
+         * pure knowledge. Words like "see/look/nampak" stay in the general
+         * exclude list only — they do not by themselves anchor a date ask.
+         */
+        private val DATE_ANCHOR_KEYWORDS = listOf(
+            // English
+            "document", "letter", "paper", "receipt", "ticket",
+            "label", "package", "screen", "calendar", "newspaper",
+            // Malay / Bahasa Melayu
+            "surat", "resit", "tiket", "label", "pakej", "pembungkusan",
+            "skrin", "kalendar", "surat khabar",
+            // Chinese
+            "文件", "信", "收据", "票", "标签", "包裹", "屏幕", "屏幕上", "日历", "报纸"
+        )
+
+        /**
+         * P1a date detection (mirrors the instance [hitsDateQuery]):
+         * pure keyword gate over [DATE_KEYWORDS]. Null/blank never triggers.
+         * JVM-visible so the route decision is testable without Android.
+         */
+        fun companionHitsDateQuery(query: String?): Boolean {
+            if (query.isNullOrBlank()) return false
+            val lower = query.lowercase()
+            return DATE_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        }
+
+        /**
+         * Text-only route decision (mirrors the instance [isTextOnlyQuery])
+         * — pure, JVM-tested. Conservative by design: a missed text-only
+         * route is SAFE (the camera lane answers anyway); a wrongly routed
+         * visual query is not (text-only would hallucinate a scene).
+         *
+         * DATE BRANCH (2026-09-29, device-evidenced): date/day asks with no
+         * visual anchor route text-only. Before this branch they fell
+         * through to the camera lane: triggerVlmSnapshot captured a frame,
+         * played "Analyzing scene...", and ran vision inference (~5s) on a
+         * question that needs no camera — and grounded the DATE in whatever
+         * the lens saw (the garbled "Jubarat depan tarikh apa" row answered
+         * with the date READ OFF A LAPTOP SCREEN). For a blind user the cue
+         * says the camera is doing work for a calendar question — a
+         * trust mismatch, plus a slower answer. The anchor guard keeps
+         * "what date is on this receipt" on the camera/OCR path.
+         * The date branch runs BEFORE the knowledge-marker gate because
+         * date asks rarely carry those markers ("next friday" has none).
+         */
+        fun companionIsTextOnlyQuery(query: String?): Boolean {
+            if (query.isNullOrBlank()) return false
+            val lower = query.lowercase().trim()
+
+            // ── DATE BRANCH: relative/calendar asks without a visual anchor.
+            if (companionHitsDateQuery(query) &&
+                DATE_ANCHOR_KEYWORDS.none { lower.contains(it) }
+            ) {
+                return true
+            }
+
+            // ── Malay knowledge form — "apa itu <noun>?" (what is <noun>?)
+            // is a question ABOUT the noun, not a pointer at a scene object.
+            // The bare forms ("apa itu?", "itu apa?") point at something and
+            // must stay on the camera path. Scene extras (holding / in front
+            // / see) keep it on the camera path too ("apa itu yang saya
+            // pegang" = what am I holding).
+            val wordCount = lower.split(Regex("\\s+")).size
+            val malayKnowledgeWithSubject =
+                (lower.contains("apa itu") || lower.contains("apa ini")) &&
+                    wordCount >= 3 &&
+                    !lower.contains("pegang") &&
+                    !lower.contains("tangan") &&
+                    !lower.contains("hadapan") &&
+                    !lower.contains("depan") &&
+                    !lower.contains("nampak") &&
+                    !lower.contains("lihat")
+            if (malayKnowledgeWithSubject) return true
+
+            // Must contain a knowledge-question marker...
+            val hasKnowledgeMarker = TEXT_ONLY_QUERY_KEYWORDS.any { lower.contains(it) }
+            if (!hasKnowledgeMarker) return false
+            // ...and must NOT reference the visual scene.
+            val referencesScene = TEXT_ONLY_EXCLUDE_KEYWORDS.any { lower.contains(it) }
+            return !referencesScene
+        }
 
         /**
          * Session tag for model-native ASR transcriptions. A DISTINCT,

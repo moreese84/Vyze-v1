@@ -392,7 +392,9 @@ class DynamicPromptBuilderTest {
         // Truthful anchor: never a remembered date.
         assertTrue(p.contains("never to a date you remember"))
         // TTS is the only channel — the working is capped, not silent.
-        assertTrue(p.contains("at most one short sentence of working"))
+        // ALL-WEEKDAYS update: the common pairings are pre-computed, so the
+        // short-answer cap replaces the old working-sentence cap.
+        assertTrue(p.contains("Keep it short: answer with just the date sentence"))
     }
 
     @Test
@@ -433,37 +435,131 @@ class DynamicPromptBuilderTest {
             dateRulesMode = true,
         )
 
-        // DEVICE-COMPUTED EXAMPLE (device-evidenced fix): the example dates
-        // are computed from the device clock, never static text — the 2B
-        // model copies demonstrated dates, so a stale example becomes a
-        // spoken lie ("October 3" copied from the wrong static demo).
-        // Recompute the expected strings exactly as the builder does.
-        val today = java.time.LocalDate.now()
-        val delta = ((5 - today.dayOfWeek.value + 7) % 7).toLong()
-        val thisFriday = today.plusDays(delta)
-        val nextFriday = thisFriday.plusDays(7)
-        val enDay = java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale.US)
-        val msDay = java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale("ms"))
-        val zhDay = java.time.format.DateTimeFormatter.ofPattern("M月d日", Locale.SIMPLIFIED_CHINESE)
-        val fEn1 = thisFriday.format(enDay); val fEn2 = nextFriday.format(enDay)
-        val fMs1 = thisFriday.format(msDay); val fMs2 = nextFriday.format(msDay)
-        val fZh1 = thisFriday.format(zhDay); val fZh2 = nextFriday.format(zhDay)
+        // ALL-WEEKDAYS TABLE (device-evidenced extension): Kotlin computes
+        // EVERY upcoming weekday, not just Friday — "How about next
+        // Saturday/Wednesday" follow-ups previously fell back to model
+        // arithmetic and mislabeled weekdays ("Saturday is October 1", a
+        // Thursday). Tests recompute the exact same table from the clock.
+        val (restEn, nextEn) = expectedTable("en")
+        val (restMs, nextMs) = expectedTable("ms")
+        val (restZh, nextZh) = expectedTable("zh")
 
-        // MS: computed example in Malay — never a wrong static date.
-        assertTrue(ms.contains("Jumaat minggu ini ialah $fMs1"))
-        assertTrue(ms.contains("Jumaat depan ialah $fMs2"))
-        assertFalse("ms must not demo in English", ms.contains("so this Friday is"))
+        // MS: computed table in Malay — never a wrong static date.
+        assertTrue(ms.contains("Baki minggu ini: $restMs"))
+        assertTrue(ms.contains("Minggu depan: $nextMs"))
+        assertFalse("ms must not demo in English", ms.contains("Rest of this week:"))
         assertTrue(ms.contains("Jangan buat kiraan tarikh dalam satu langkah senyap"))
 
-        // ZH: computed example in Chinese — never a wrong static date.
-        assertTrue(zh.contains("所以这个星期五是$fZh1"))
-        assertTrue(zh.contains("下个星期五是$fZh2"))
-        assertFalse("zh must not demo in English", zh.contains("so this Friday is"))
+        // ZH: computed table in Chinese — never a wrong static date.
+        assertTrue(zh.contains("本周余下：$restZh"))
+        assertTrue(zh.contains("下周：$nextZh"))
+        assertFalse("zh must not demo in English", zh.contains("Rest of this week:"))
         assertTrue(zh.contains("不要一步静默算完"))
 
-        // EN: computed example, shown-work contract retained.
-        assertTrue(en.contains("so this Friday is $fEn1 and next Friday is $fEn2"))
+        // EN: computed table, shown-work contract retained for far dates.
+        assertTrue(en.contains("Rest of this week: $restEn"))
+        assertTrue(en.contains("Next week: $nextEn"))
         assertTrue(en.contains("Do not do date arithmetic in one silent step"))
+    }
+
+    /** Recompute the builder's weekday table exactly as production does. */
+    private fun expectedTable(lang: String): Pair<String, String> {
+        val today = java.time.LocalDate.now()
+        val locale = when (lang) {
+            "ms" -> Locale("ms")
+            "zh" -> Locale.SIMPLIFIED_CHINESE
+            else -> Locale.US
+        }
+        val fmt = java.time.format.DateTimeFormatter.ofPattern(
+            if (lang == "zh") "M月d日EEEE" else "EEEE, d MMMM", locale
+        )
+        val daysToNextMonday = ((8 - today.dayOfWeek.value) % 7).takeIf { it != 0 } ?: 7
+        val nextMonday = today.plusDays(daysToNextMonday.toLong())
+        val rest = (1L until daysToNextMonday.toLong())
+            .map { today.plusDays(it).format(fmt) }.joinToString("; ")
+        val next = (0L..6L).map { nextMonday.plusDays(it).format(fmt) }.joinToString("; ")
+        return rest to next
+    }
+
+    @Test
+    fun `date clause forbids the no-access refusal in every language`() = runBlocking {
+        // DEVICE EVIDENCE (2026-09-29 08:34): on the text-only lane, the en
+        // ask "Is the date for next Friday?" drew "I do not have access to
+        // the current date..." — the model resolved the injected device date
+        // as 'not its own knowledge' (TEXT_ONLY_RULES: "answer from your own
+        // knowledge... never guess") and refused. The ms row escaped because
+        // the computed example made the answer copyable. Precedence line
+        // pinned per language: the device date is INPUT DATA, using it is
+        // mandatory, and the no-access refusal is explicitly banned.
+        val en = builder().buildPrompt(
+            queryOverride = "What is the date for next Friday?",
+            userLocale = Locale.US,
+            dateRulesMode = true,
+        )
+        val ms = builder().buildPrompt(
+            queryOverride = "Jumaat depan tarikh apa",
+            userLocale = Locale("ms"),
+            dateRulesMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "下个星期五是什么日期",
+            userLocale = Locale("zh"),
+            dateRulesMode = true,
+        )
+        assertTrue(en.contains("INPUT DATA supplied by the app"))
+        assertTrue(en.contains("never say you lack access to the current date"))
+        assertTrue(ms.contains("DATA INPUT yang dibekalkan apl"))
+        assertTrue(ms.contains("tiada akses kepada tarikh semasa"))
+        assertTrue(zh.contains("输入数据"))
+        assertTrue(zh.contains("无法获取当前日期"))
+    }
+
+    @Test
+    fun `text-only date ask replaces own-knowledge rules - refusal removed`() = runBlocking {
+        // DEVICE EVIDENCE (2026-09-29, twice): under TEXT_ONLY_RULES the en
+        // ask drew "I do not have access to the current date" even WITH the
+        // precedence line — the "from your own knowledge... never guess"
+        // framing out-ranked the date clause on the 2B model. The fix
+        // REPLACES the rules block on text-only date asks: no own-knowledge
+        // claim exists to out-rank.
+        val en = builder().buildPrompt(
+            queryOverride = "What is the date for next Friday?",
+            userLocale = Locale.US,
+            textOnlyMode = true,
+            dateRulesMode = true,
+        )
+        assertTrue(en.contains("The current date is HANDED TO YOU below"))
+        // The conflicting framing must be GONE, not merely out-shouted.
+        assertFalse(en.contains("from your own knowledge"))
+        assertFalse(en.contains("No camera image is available"))
+        // The date contract still rides along.
+        assertTrue(en.contains("DATE ARITHMETIC RULE"))
+        assertTrue(en.contains("Today's date (from the device):"))
+
+        // ms/zh parity of the replacement block.
+        val ms = builder().buildPrompt(
+            queryOverride = "Jumaat depan tarikh apa",
+            userLocale = Locale("ms"),
+            textOnlyMode = true,
+            dateRulesMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "下个星期五是什么日期",
+            userLocale = Locale("zh"),
+            textOnlyMode = true,
+            dateRulesMode = true,
+        )
+        assertTrue(ms.contains("DIBEKALKAN kepada anda"))
+        assertTrue(zh.contains("已在下方提供给你"))
+
+        // Non-date text-only asks keep the original rules untouched.
+        val plain = builder().buildPrompt(
+            queryOverride = "what is paracetamol used for?",
+            userLocale = Locale.US,
+            textOnlyMode = true,
+        )
+        assertTrue(plain.contains("from your own knowledge"))
+        assertFalse(plain.contains("HANDED TO YOU"))
     }
 
     @Test
@@ -476,11 +572,9 @@ class DynamicPromptBuilderTest {
             dateRulesMode = true,
         )
         assertTrue(ja.contains("DATE ARITHMETIC RULE"))
-        val today = java.time.LocalDate.now()
-        val thisFriday = today.plusDays(((5 - today.dayOfWeek.value + 7) % 7).toLong())
-        val f1 = thisFriday.format(java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale.US))
-        assertTrue(ja.contains("so this Friday is $f1"))
-        assertFalse(ja.contains("Jumaat minggu ini"))
+        val (restEn, _) = expectedTable("en")
+        assertTrue(ja.contains("Rest of this week: $restEn"))
+        assertFalse(ja.contains("Baki minggu ini"))
     }
 
     @Test

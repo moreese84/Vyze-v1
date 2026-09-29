@@ -70,6 +70,17 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 // Text-only Q&A — general knowledge, NO camera frame exists.
                 // The model must answer from its own knowledge, never invent
                 // a scene, and stay concise for spoken delivery.
+                //
+                // DATE-ASK RULES REPLACEMENT (device-evidenced twice,
+                // 2026-09-29): under TEXT_ONLY_RULES the en date ask drew
+                // "I do not have access to the current date" EVEN WITH the
+                // precedence line — the "from your own knowledge... never
+                // guess" framing out-ranked the date clause on the 2B model
+                // (the ms row escaped only because the computed example was
+                // copyable). The conflict is removed, not out-shouted: date
+                // asks get a rules block that frames device-injected facts as
+                // input from the start.
+                textOnlyMode && dateRulesMode -> sb.appendLine(dateTextOnlyRulesFor(userLocale.language))
                 textOnlyMode -> sb.appendLine(TEXT_ONLY_RULES)
                 continuousMode -> sb.appendLine(CONTINUOUS_MODE_RULES)
                 isDirectQuery -> sb.appendLine(directQueryRulesFor(userLocale.language))
@@ -737,6 +748,36 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
          * for asks the example cannot cover (far dates, month-ends).
          * Pure given [today] — JVM-tested.
          */
+        /**
+         * TEXT-ONLY + DATE rules block — replaces [TEXT_ONLY_RULES] when a
+         * date ask routes to the text-only lane (textOnlyMode &&
+         * dateRulesMode). Device evidence, twice on 2026-09-29: under
+         * TEXT_ONLY_RULES the en ask drew "I do not have access to the
+         * current date" — the "answer from your own knowledge... never
+         * guess" framing out-ranked both the date clause and its precedence
+         * line on the 2B model (the ms rows escaped only because the
+         * computed example was copyable). The conflict is therefore REMOVED,
+         * not out-shouted: this block never makes the own-knowledge claim,
+         * frames the injected date as handed to the model, and keeps the
+         * answer short. Pure function — JVM-tested.
+         */
+        private fun dateTextOnlyRulesFor(language: String): String = when (language) {
+            "ms" ->
+                "Jawab soalan tarikh secara langsung dan pendek. Tarikh semasa " +
+                "DIBEKALKAN kepada anda di bawah — gunakannya; menyebutnya bukan " +
+                "tekaan. Jangan terangkan apa-apa babak atau objek; tiada kamera " +
+                "diperlukan untuk soalan tarikh. Balas dalam teks mudah untuk suara."
+            "zh" ->
+                "直接、简短地回答日期问题。当前日期已在下方提供给你 — 直接使用它，" +
+                "说出它不是猜测。不要描述任何场景或物体；日期问题不需要摄像头。" +
+                "用纯文本回答以便语音朗读。"
+            else ->
+                "Answer the date question directly and briefly. The current date " +
+                "is HANDED TO YOU below — use it; citing it is not a guess. Do " +
+                "not describe any scene or object; no camera is needed for a " +
+                "date question. Plain text only, for text to speech."
+        }
+
         private fun dateClauseFor(
             language: String,
             today: java.time.LocalDate = java.time.LocalDate.now()
@@ -747,46 +788,60 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
                 else -> Locale.US
             }
             val dayFmt = java.time.format.DateTimeFormatter.ofPattern(
-                if (language == "zh") "M月d日" else "d MMMM", locale
+                if (language == "zh") "M月d日EEEE" else "EEEE, d MMMM", locale
             )
-            // DayOfWeek.FRIDAY = 5; delta 0 when today IS Friday.
-            val thisFriday = today.plusDays(((5 - today.dayOfWeek.value + 7) % 7).toLong())
-            val nextFriday = thisFriday.plusDays(7)
-            val weekday = today.dayOfWeek.getDisplayName(
-                java.time.format.TextStyle.FULL, locale
-            )
-            val tStr = today.format(dayFmt)
-            val f1 = thisFriday.format(dayFmt)
-            val f2 = nextFriday.format(dayFmt)
+            // ALL-WEEKDAYS TABLE (device evidence 09:01, 2026-09-29): the
+            // Friday-only example covered "next Friday" — but "How about next
+            // Saturday/Wednesday" follow-ups fell back to model arithmetic,
+            // which answered "Saturday is October 1" (a Thursday) by reusing
+            // the computed Friday date with a mislabeled weekday. Doctrine
+            // completed: Kotlin pre-computes EVERY upcoming weekday — rest of
+            // this week (tomorrow..Sunday) plus the full next calendar week —
+            // so the model can copy any common pairing and never does
+            // weekday arithmetic at all. Remaining far-date asks keep the
+            // shown-work rule. Locale-aware formatter renders weekday names
+            // natively (Jumaat, Rabu / 星期五, 星期三...).
+            val daysToNextMonday = ((8 - today.dayOfWeek.value) % 7).takeIf { it != 0 } ?: 7
+            val nextMonday = today.plusDays(daysToNextMonday.toLong())
+            val restOfWeek = (1L until daysToNextMonday.toLong())
+                .map { today.plusDays(it).format(dayFmt) }
+            val nextWeek = (0L..6L).map { nextMonday.plusDays(it).format(dayFmt) }
+            val restStr = restOfWeek.joinToString("; ")
+            val nextStr = nextWeek.joinToString("; ")
             return when (language) {
                 "ms" ->
                     "DATE ARITHMETIC RULE: Tarikh hari ini diberikan di atas daripada " +
                     "peranti — dasarkan setiap jawapan tarikh kepada tarikh tersebut, " +
-                    "bukan kepada tarikh yang anda ingati. Contoh yang SUDAH DIKIRA " +
-                    "peranti: hari ini ialah $weekday $tStr, jadi Jumaat minggu ini " +
-                    "ialah $f1 dan Jumaat depan ialah $f2. Untuk soalan tarikh lain, " +
-                    "kira secara terbuka: nyatakan setiap langkah — hari sasaran, " +
-                    "bilangan hari yang ditambah, dan tarikh akhir dengan bulan " +
-                    "serta tahun yang digulung dengan betul. Jangan buat kiraan " +
-                    "tarikh dalam satu langkah senyap. Kekalkan ia pendek: " +
-                    "paling banyak satu ayat pendek langkah kerja, kemudian " +
-                    "tarikh akhir."
+                    "bukan kepada tarikh yang anda ingati. Tarikh peranti itu ialah " +
+                    "DATA INPUT yang dibekalkan apl: menggunakannya adalah wajib, " +
+                    "bukan tekaan — jangan sekali-kali kata anda tiada akses kepada " +
+                    "tarikh semasa, walaupun tiada imej kamera. Semua tarikh hari " +
+                    "akan datang SUDAH DIKIRA peranti — gunakan terus: Baki minggu " +
+                    "ini: $restStr. Minggu depan: $nextStr. Untuk soalan tarikh " +
+                    "jauh, kira secara terbuka: nyatakan setiap langkah dan tarikh " +
+                    "akhir dengan bulan serta tahun yang digulung dengan betul. " +
+                    "Jangan buat kiraan tarikh dalam satu langkah senyap. Kekalkan " +
+                    "ia pendek: jawab dengan ayat tarikh sahaja."
                 "zh" ->
                     "DATE ARITHMETIC RULE: 今天的日期由上方设备提供 — 所有日期回答都必须以它为准，" +
-                    "绝不要用你记忆中的日期。设备已算好的示例：今天是$tStr（$weekday），" +
-                    "所以这个星期五是$f1，下个星期五是$f2。对于其他日期提问，必须显式推算：" +
-                    "逐步说出 — 目标星期、要加的天数、以及跨月或跨年正确滚动后的最终日期。" +
-                    "不要一步静默算完。保持简短：最多一句简短的推算过程，然后给出最终日期。"
+                    "绝不要用你记忆中的日期。该设备日期是应用提供的输入数据：必须使用它，" +
+                    "而不是猜测 — 即使没有摄像头画面，也绝不要说你无法获取当前日期。" +
+                    "所有未来的星期日期都由设备预先算好 — 直接使用：本周余下：$restStr。" +
+                    "下周：$nextStr。对于更远的日期提问，必须显式推算：逐步说出目标星期、" +
+                    "要加的天数、以及正确滚动后的最终日期。不要一步静默算完。保持简短：" +
+                    "只用一句日期句作答。"
                 else ->
                     "DATE ARITHMETIC RULE: Today's date is given above from the device — " +
                     "anchor every date answer to it, never to a date you remember. " +
-                    "Worked example PRE-COMPUTED by the device: today is $weekday $tStr, " +
-                    "so this Friday is $f1 and next Friday is $f2. For any other date " +
-                    "ask, work it out explicitly: write out each step — the target day, " +
-                    "the days to add, and the final date with the month and year rolled " +
-                    "over correctly. Do not do date arithmetic in one silent step. " +
-                    "Keep it short: at most one short sentence of working, then the " +
-                    "final date."
+                    "That device date is INPUT DATA supplied by the app: using it is " +
+                    "required, not a guess — never say you lack access to the current " +
+                    "date, even though no camera image is available. Every upcoming " +
+                    "weekday date is PRE-COMPUTED by the device — use them directly: " +
+                    "Rest of this week: $restStr. Next week: $nextStr. For far-future " +
+                    "date asks, work it out explicitly: write out each step and the " +
+                    "final date with the month and year rolled over correctly. Do not " +
+                    "do date arithmetic in one silent step. Keep it short: answer " +
+                    "with just the date sentence."
             }
         }
     }
