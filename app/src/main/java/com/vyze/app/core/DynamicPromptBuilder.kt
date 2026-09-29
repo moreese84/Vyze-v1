@@ -217,7 +217,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     Friday is 3 October"), which a blind listener can audit.
             if (dateRulesMode) {
                 sb.appendLine(todayLineFor(userLocale))
-                sb.appendLine(DATE_ARITHMETIC_RULES)
+                sb.appendLine(dateClauseFor(userLocale.language))
             }
 
             // 4. Language mirror — reinforce at bottom (ALL languages now:
@@ -697,7 +697,9 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
             val today = java.time.LocalDate.now()
             val pattern = when (locale.language) {
                 "zh" -> "yyyy年M月d日，EEEE"
-                "ms" -> "EEEE，d MMMM yyyy"
+                // ASCII comma — the earlier full-width copy artifact made TTS
+                // pause oddly inside a Malay sentence (device-evidenced).
+                "ms" -> "EEEE, d MMMM yyyy"
                 else -> "EEEE, d MMMM yyyy"
             }
             val formatted = today.format(
@@ -712,15 +714,80 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
          * visible chain (Gallery pattern) plus a truthful anchor makes the
          * answer auditable — and the chain is SHORT because TTS is the only
          * output channel.
+         *
+         * MIRRORING PARITY (2026-09-29 audit Gap 1): the old single English
+         * constant was the one clause that could countermand the [OUTPUT
+         * LANGUAGE] tag on date asks — English prose plus an English worked
+         * example, injected after the mandate, i.e. the exact conflict shape
+         * the CANNED-PHRASE OVERRIDE removed for currency/card. Like
+         * [medicineMissClauseFor], the rule prose and the worked-example
+         * template are pinned per language so the demonstrated OUTPUT
+         * language always matches the tag. The device-date anchor line
+         * ([todayLineFor]) sits above the clause and stays locale-patterned.
+         *
+         * DEVICE-COMPUTED EXAMPLE (device-evidenced fix, 2026-09-29): the
+         * first shipped version pinned a STATIC example whose dates were
+         * calendar-wrong for the live week — the 2B model obeyed the example
+         * over the anchor and spoke the wrong date ("Next Friday is October
+         * 3, 2026" — copied straight from the example; Oct 3 2026 is a
+         * Saturday). Doctrine restored: Kotlin owns ALL arithmetic, the
+         * model only selects and speaks. The example now embeds this-week
+         * and next-week Friday computed from the device clock, so any date
+         * the model copies is a TRUE fact. The shown-work rule is retained
+         * for asks the example cannot cover (far dates, month-ends).
+         * Pure given [today] — JVM-tested.
          */
-        private val DATE_ARITHMETIC_RULES =
-            "DATE ARITHMETIC RULE: Today's date is given above from the device — " +
-            "anchor every date answer to it, never to a date you remember. For " +
-            "relative asks (\"next Friday\", \"how many days until\"), work it out " +
-            "explicitly: write out each step — the target day, the days to add, " +
-            "and the final date with the month and year rolled over correctly. " +
-            "Do not do date arithmetic in one silent step. Keep it short: at most " +
-            "one short sentence of working, then the final date — e.g. \"Today is " +
-            "Tuesday 29 September, so this Friday is 3 October.\""
+        private fun dateClauseFor(
+            language: String,
+            today: java.time.LocalDate = java.time.LocalDate.now()
+        ): String {
+            val locale = when (language) {
+                "ms" -> Locale("ms")
+                "zh" -> Locale.SIMPLIFIED_CHINESE
+                else -> Locale.US
+            }
+            val dayFmt = java.time.format.DateTimeFormatter.ofPattern(
+                if (language == "zh") "M月d日" else "d MMMM", locale
+            )
+            // DayOfWeek.FRIDAY = 5; delta 0 when today IS Friday.
+            val thisFriday = today.plusDays(((5 - today.dayOfWeek.value + 7) % 7).toLong())
+            val nextFriday = thisFriday.plusDays(7)
+            val weekday = today.dayOfWeek.getDisplayName(
+                java.time.format.TextStyle.FULL, locale
+            )
+            val tStr = today.format(dayFmt)
+            val f1 = thisFriday.format(dayFmt)
+            val f2 = nextFriday.format(dayFmt)
+            return when (language) {
+                "ms" ->
+                    "DATE ARITHMETIC RULE: Tarikh hari ini diberikan di atas daripada " +
+                    "peranti — dasarkan setiap jawapan tarikh kepada tarikh tersebut, " +
+                    "bukan kepada tarikh yang anda ingati. Contoh yang SUDAH DIKIRA " +
+                    "peranti: hari ini ialah $weekday $tStr, jadi Jumaat minggu ini " +
+                    "ialah $f1 dan Jumaat depan ialah $f2. Untuk soalan tarikh lain, " +
+                    "kira secara terbuka: nyatakan setiap langkah — hari sasaran, " +
+                    "bilangan hari yang ditambah, dan tarikh akhir dengan bulan " +
+                    "serta tahun yang digulung dengan betul. Jangan buat kiraan " +
+                    "tarikh dalam satu langkah senyap. Kekalkan ia pendek: " +
+                    "paling banyak satu ayat pendek langkah kerja, kemudian " +
+                    "tarikh akhir."
+                "zh" ->
+                    "DATE ARITHMETIC RULE: 今天的日期由上方设备提供 — 所有日期回答都必须以它为准，" +
+                    "绝不要用你记忆中的日期。设备已算好的示例：今天是$tStr（$weekday），" +
+                    "所以这个星期五是$f1，下个星期五是$f2。对于其他日期提问，必须显式推算：" +
+                    "逐步说出 — 目标星期、要加的天数、以及跨月或跨年正确滚动后的最终日期。" +
+                    "不要一步静默算完。保持简短：最多一句简短的推算过程，然后给出最终日期。"
+                else ->
+                    "DATE ARITHMETIC RULE: Today's date is given above from the device — " +
+                    "anchor every date answer to it, never to a date you remember. " +
+                    "Worked example PRE-COMPUTED by the device: today is $weekday $tStr, " +
+                    "so this Friday is $f1 and next Friday is $f2. For any other date " +
+                    "ask, work it out explicitly: write out each step — the target day, " +
+                    "the days to add, and the final date with the month and year rolled " +
+                    "over correctly. Do not do date arithmetic in one silent step. " +
+                    "Keep it short: at most one short sentence of working, then the " +
+                    "final date."
+            }
+        }
     }
 }

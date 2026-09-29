@@ -412,6 +412,78 @@ class DynamicPromptBuilderTest {
     }
 
     @Test
+    fun `date clause prose and worked example are localized per language`() = runBlocking {
+        // MIRRORING PARITY (audit Gap 1): the date contract was the last
+        // English-only clause — English instructions plus an English worked
+        // example sitting under a zh/ms [OUTPUT LANGUAGE] tag. Each language
+        // now gets rule prose AND a demonstrated worked example in-language.
+        val ms = builder().buildPrompt(
+            queryOverride = "berapa hari lagi sampai raya?",
+            userLocale = Locale("ms"),
+            dateRulesMode = true,
+        )
+        val zh = builder().buildPrompt(
+            queryOverride = "下個星期五是什麼日期？",
+            userLocale = Locale("zh"),
+            dateRulesMode = true,
+        )
+        val en = builder().buildPrompt(
+            queryOverride = "what date is next Friday?",
+            userLocale = Locale.US,
+            dateRulesMode = true,
+        )
+
+        // DEVICE-COMPUTED EXAMPLE (device-evidenced fix): the example dates
+        // are computed from the device clock, never static text — the 2B
+        // model copies demonstrated dates, so a stale example becomes a
+        // spoken lie ("October 3" copied from the wrong static demo).
+        // Recompute the expected strings exactly as the builder does.
+        val today = java.time.LocalDate.now()
+        val delta = ((5 - today.dayOfWeek.value + 7) % 7).toLong()
+        val thisFriday = today.plusDays(delta)
+        val nextFriday = thisFriday.plusDays(7)
+        val enDay = java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale.US)
+        val msDay = java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale("ms"))
+        val zhDay = java.time.format.DateTimeFormatter.ofPattern("M月d日", Locale.SIMPLIFIED_CHINESE)
+        val fEn1 = thisFriday.format(enDay); val fEn2 = nextFriday.format(enDay)
+        val fMs1 = thisFriday.format(msDay); val fMs2 = nextFriday.format(msDay)
+        val fZh1 = thisFriday.format(zhDay); val fZh2 = nextFriday.format(zhDay)
+
+        // MS: computed example in Malay — never a wrong static date.
+        assertTrue(ms.contains("Jumaat minggu ini ialah $fMs1"))
+        assertTrue(ms.contains("Jumaat depan ialah $fMs2"))
+        assertFalse("ms must not demo in English", ms.contains("so this Friday is"))
+        assertTrue(ms.contains("Jangan buat kiraan tarikh dalam satu langkah senyap"))
+
+        // ZH: computed example in Chinese — never a wrong static date.
+        assertTrue(zh.contains("所以这个星期五是$fZh1"))
+        assertTrue(zh.contains("下个星期五是$fZh2"))
+        assertFalse("zh must not demo in English", zh.contains("so this Friday is"))
+        assertTrue(zh.contains("不要一步静默算完"))
+
+        // EN: computed example, shown-work contract retained.
+        assertTrue(en.contains("so this Friday is $fEn1 and next Friday is $fEn2"))
+        assertTrue(en.contains("Do not do date arithmetic in one silent step"))
+    }
+
+    @Test
+    fun `unsupported language falls back to english date clause`() = runBlocking {
+        // Same fall-through discipline as failurePhraseClauseFor: unknown
+        // languages get the English contract, never a missing rule.
+        val ja = builder().buildPrompt(
+            queryOverride = "来週の金曜日は何日ですか？",
+            userLocale = Locale("ja"),
+            dateRulesMode = true,
+        )
+        assertTrue(ja.contains("DATE ARITHMETIC RULE"))
+        val today = java.time.LocalDate.now()
+        val thisFriday = today.plusDays(((5 - today.dayOfWeek.value + 7) % 7).toLong())
+        val f1 = thisFriday.format(java.time.format.DateTimeFormatter.ofPattern("d MMMM", Locale.US))
+        assertTrue(ja.contains("so this Friday is $f1"))
+        assertFalse(ja.contains("Jumaat minggu ini"))
+    }
+
+    @Test
     fun `non-date queries never carry the date rules`() = runBlocking {
         val p = builder().buildPrompt(queryOverride = "describe this room", userLocale = Locale.US)
         assertFalse(p.contains("DATE ARITHMETIC RULE"))

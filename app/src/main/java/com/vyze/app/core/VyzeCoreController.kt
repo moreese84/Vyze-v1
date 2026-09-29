@@ -2472,6 +2472,19 @@ class VyzeCoreController(
                     ocrText = null,
                     currencyMode = false,
                     bankCardMode = false,
+                    // PRIVACY BRANCH parity with the agent lane: the text-only
+                    // path must never become the route around the pinned
+                    // refusal — re-checked per dispatch, same doctrine as
+                    // buildPromptForAgent.
+                    sensitiveIdMode = SensitiveIdPolicy.isSensitiveIdQuery(query),
+                    // P1a PARITY FIX (device-evidenced 2026-09-29): date asks
+                    // with no camera frame route HERE, but this call site
+                    // dropped dateRulesMode — the shown-work contract never
+                    // reached the model, and the unanchored 2B one-shot failed
+                    // exactly as predicted: "Next Friday is October 7, 2026"
+                    // (a Wednesday) and "Jumaat depan ialah 25 Oktober 20000".
+                    // Re-checked per dispatch — deterministic at trigger time.
+                    dateRulesMode = hitsDateQuery(query),
                     memoryContext = recallContext,
                     brevityLevel = preferenceLearner.getBrevityLevel(),
                     // PERSONA SPEC — "refer to past conversation turns": the
