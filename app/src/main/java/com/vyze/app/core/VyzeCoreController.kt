@@ -2086,6 +2086,15 @@ class VyzeCoreController(
      * battery") fall through to the normal pipelines.
      */
     private fun instantAnswerFor(query: String): String? {
+        // DETERMINISTIC WEEKDAY BRANCH — checked FIRST: "what date is next
+        // friday" contains the "what date" trigger of the today-date branch
+        // below and would be misanswered with today's date. Kotlin answers
+        // parseable weekday asks outright (zero inference — the endgame of
+        // the 2026-09-29 date arc; see WeekdayInstantAnswer for the five
+        // device rounds of evidence). Unsupported shapes return null and
+        // fall through to the model + date contract.
+        WeekdayInstantAnswer.answerFor(query, activeUserLocale.language)?.let { return it }
+
         val lower = query.lowercase().trim()
         val words = lower.split(Regex("\\s+")).size
 
@@ -3383,6 +3392,14 @@ class VyzeCoreController(
         )
 
         /**
+         * True when [lower] (already lowercased) carries a visual anchor —
+         * the user is asking about a date IN THE SCENE. Single source for
+         * both the text-only date branch and WeekdayInstantAnswer.
+         */
+        fun companionDateAnchorHit(lower: String): Boolean =
+            DATE_ANCHOR_KEYWORDS.any { lower.contains(it) }
+
+        /**
          * P1a date detection (mirrors the instance [hitsDateQuery]):
          * pure keyword gate over [DATE_KEYWORDS]. Null/blank never triggers.
          * JVM-visible so the route decision is testable without Android.
@@ -3417,9 +3434,7 @@ class VyzeCoreController(
             val lower = query.lowercase().trim()
 
             // ── DATE BRANCH: relative/calendar asks without a visual anchor.
-            if (companionHitsDateQuery(query) &&
-                DATE_ANCHOR_KEYWORDS.none { lower.contains(it) }
-            ) {
+            if (companionHitsDateQuery(query) && !companionDateAnchorHit(lower)) {
                 return true
             }
 
