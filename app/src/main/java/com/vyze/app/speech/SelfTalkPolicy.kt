@@ -48,6 +48,16 @@ object SelfTalkPolicy {
         // normalizer renders both "I'm" and "I am" as "i m" / "i am".
         Regex("\\bi (am|m) sorry\\b.{0,30}\\bi cannot\\b"),
         Regex("\\bi cannot fulfill\\b"),
+        // English refusal-speak on date/fact asks (2026-09-29 09:00 session):
+        // the pre-fix refusal "I do not have access to real-time information
+        // such as the date for next Friday. Please check a calendar." was
+        // captured back as a QUERY and answered with a scene description.
+        // "I cannot tell you" (the earlier refusal form) joins it — both are
+        // assistant-speak, never camera queries. A user asking "why you
+        // cannot tell me" cannot match: the patterns anchor on the
+        // first-person "i cannot / i do not have".
+        Regex("\\bi do not have (access|information)\\b"),
+        Regex("\\bi cannot tell you\\b"),
         // Refusal-speak (ms) — the ms refusal hallucination.
         Regex("\\bsaya (tidak boleh|tidak dapat|tidak mampu)\\b"),
         Regex("\\bsebagai model (bahasa )?besar\\b"),

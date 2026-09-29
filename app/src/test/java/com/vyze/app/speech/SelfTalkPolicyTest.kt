@@ -27,6 +27,24 @@ class SelfTalkPolicyTest {
     }
 
     @Test
+    fun `english date-refusal speak is dropped - 2026-09-29 echo leak`() {
+        // Verbatim from 09:00:41 — the pre-fix date refusal was captured back
+        // as a user query (TTS echo) and answered with a scene description.
+        assertTrue(SelfTalkPolicy.isSelfTalk(
+            "I do not have access to real-time information such as the date " +
+            "for next Friday. Please check a calendar."
+        ))
+        // The earlier refusal form from the same arc.
+        assertTrue(SelfTalkPolicy.isSelfTalk(
+            "I cannot tell you the date for next Friday because I do not have " +
+            "access to a calendar or the current date."
+        ))
+        assertTrue(SelfTalkPolicy.isSelfTalk("I do not have information about that."))
+        // A user ASKING about the refusal must never be dropped.
+        assertFalse(SelfTalkPolicy.isSelfTalk("why you cannot tell me the date"))
+    }
+
+    @Test
     fun `polite refusal form is dropped - Jev teacher gap fix`() {
         // The one genuine miss from the 2026-09-25 corpus run.
         assertTrue(SelfTalkPolicy.isSelfTalk("I'm sorry, I cannot fulfill this request."))
