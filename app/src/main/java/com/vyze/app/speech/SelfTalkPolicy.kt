@@ -3,11 +3,15 @@ package com.vyze.app.speech
 /**
  * LAYER 1 of the anti-hallucination stack (L4, 2026-09-25): a transcript
  * sanity filter. Even a clip that PASSED Layer 0 (real classified speech)
- * can come back as SELF-TALK — the model describing itself or refusing,
- * instead of transcribing the user. Observed verbatim in the device corpus:
+ * can come back as SELF-TALK — the model describing itself, refusing, or
+ * speaking its own confirmation lines, instead of transcribing the user.
+ * Observed verbatim in the device corpus:
  *
  *   "I am a large language model, trained by Google."   (08:00 + 08:20 sessions)
  *   "Saya tidak dapat memproses permintaan anda."       (ms refusal-speak)
+ *   "Tentu saya akan bantu." / "Ya, betul. Saya akan cuba."
+ *                                                        (ms confirmation-
+ *                                                         speak, 09-29)
  *
  * (Silence-fill greetings — "Selamat pagi" on a speechMs=0 clip — are
  * handled UPSTREAM by Layer 0 [com.vyze.app.device.SpeechGatePolicy]:
@@ -47,6 +51,17 @@ object SelfTalkPolicy {
         // Refusal-speak (ms) — the ms refusal hallucination.
         Regex("\\bsaya (tidak boleh|tidak dapat|tidak mampu)\\b"),
         Regex("\\bsebagai model (bahasa )?besar\\b"),
+        // Confirmation/commitment-speak (ms) — 2026-09-29 device session:
+        // Vyze's own spoken confirmation lines ("Tentu saya akan bantu.",
+        // "Ya, betul. Saya akan cuba.") captured back as user queries and
+        // ANSWERED with scene descriptions. First-person commitments are
+        // assistant-speak, never a camera query. Anchored on "saya akan +
+        // verb" so a bare user confirmation ("Ya, betul") still passes —
+        // the askQueryConfirmation flow depends on it. A user replying
+        // "saya akan cuba lagi" after a failure would match; the contract
+        // below makes that cost one re-ask, not a lost query — cheaper than
+        // another echoed turn burning a 5-second inference.
+        Regex("\\bsaya akan (bantu|membantu|cuba|tolong)\\b"),
         // Refusal-speak (zh) — the same class in the third supported language.
         Regex("作为一个(大型)?语言模型"),
         Regex("我无法处理"),

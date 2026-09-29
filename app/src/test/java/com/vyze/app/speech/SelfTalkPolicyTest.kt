@@ -34,6 +34,30 @@ class SelfTalkPolicyTest {
     }
 
     @Test
+    fun `malay confirmation-speak is dropped - 2026-09-29 device leak`() {
+        // Verbatim from the 2026-09-29 session: Vyze's own spoken
+        // confirmation lines were captured back as user queries and
+        // answered with scene descriptions (echo/barge-in slips).
+        assertTrue(SelfTalkPolicy.isSelfTalk("Tentu saya akan bantu."))
+        assertTrue(SelfTalkPolicy.isSelfTalk("Ya, betul. Saya akan cuba."))
+        // Normalized variants.
+        assertTrue(SelfTalkPolicy.isSelfTalk("saya akan membantu dengan itu"))
+        assertTrue(SelfTalkPolicy.isSelfTalk("SAYA AKAN CUBA"))
+        assertTrue(SelfTalkPolicy.isSelfTalk("Saya akan tolong encik."))
+    }
+
+    @Test
+    fun `bare user confirmations still pass through`() {
+        // askQueryConfirmation flow: a bare user "yes/correct" must never
+        // be dropped — the pattern anchors on the first-person commitment,
+        // not the agreement word.
+        assertFalse(SelfTalkPolicy.isSelfTalk("Ya, betul"))
+        assertFalse(SelfTalkPolicy.isSelfTalk("ya betul"))
+        assertFalse(SelfTalkPolicy.isSelfTalk("betul"))
+        assertFalse(SelfTalkPolicy.isSelfTalk("Ya"))
+    }
+
+    @Test
     fun `malay refusal-speak is dropped`() {
         assertTrue(SelfTalkPolicy.isSelfTalk("Saya tidak dapat memproses permintaan anda."))
         assertTrue(SelfTalkPolicy.isSelfTalk("Saya tidak boleh membantu dengan itu."))
