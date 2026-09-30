@@ -90,3 +90,9 @@ tools/*
 
 # Secrets — never commit (Typesafe API key etc.)
 .env
+
+# Real device transcripts (rolling corpus + jev_export pulls) may contain
+# health/banking context — NEVER commit. The README's canonical append.py
+# commands write to root-level corpus/; tools/jev_harness/corpus/ is
+# covered by its own .gitignore.
+/corpus/
