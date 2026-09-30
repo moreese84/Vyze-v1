@@ -75,6 +75,14 @@ object SelfTalkPolicy {
         // Refusal-speak (zh) — the same class in the third supported language.
         Regex("作为一个(大型)?语言模型"),
         Regex("我无法处理"),
+        // Identity self-talk (zh) — 2026-09-30 device session (corpus row
+        // ir_151, Jev 0.93): "你好,我是AI。" captured back as a user query
+        // and answered with a scene description. zh parity for the en
+        // identity family above, closing it across all three languages.
+        // The normalizer renders "AI" as "ai". Anchored on the first-person
+        // "我是" so a user asking ABOUT the model ("你是AI吗") never matches.
+        // Watch-list sibling (1 occurrence, no pattern yet): "我是人工智能".
+        Regex("我是ai"),
     )
 
     /** Lowercase, strip punctuation to spaces, collapse whitespace. */

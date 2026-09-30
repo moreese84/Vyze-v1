@@ -88,6 +88,24 @@ class SelfTalkPolicyTest {
     }
 
     @Test
+    fun `identity self-talk corpus rows are dropped - en x3 and zh`() {
+        // Verbatim corpus rows ir_97 / ir_102 / ir_127 (2026-09-22 + 09-24
+        // sessions, Jev conf 0.90-0.98): the model's identity preamble was
+        // captured back as a user query and answered with scene descriptions
+        // (relevance 0.01-0.15). One string, three device occurrences — the
+        // en pattern shipped with the 2026-09-25 policy; this pins it.
+        assertTrue(SelfTalkPolicy.isSelfTalk("I am a large language model, trained by Google."))
+        // ir_151 (2026-09-30 session, Jev 0.93): zh identity self-talk —
+        // parity shape closing the identity family across all three
+        // languages. ASCII and fullwidth comma variants.
+        assertTrue(SelfTalkPolicy.isSelfTalk("你好,我是AI。"))
+        assertTrue(SelfTalkPolicy.isSelfTalk("你好，我是AI。"))
+        // A user asking ABOUT the model must never be dropped.
+        assertFalse(SelfTalkPolicy.isSelfTalk("你是AI吗"))
+        assertFalse(SelfTalkPolicy.isSelfTalk("are you an AI"))
+    }
+
+    @Test
     fun `case and punctuation variance still matches`() {
         assertTrue(SelfTalkPolicy.isSelfTalk("I AM A LARGE LANGUAGE MODEL!"))
         assertTrue(SelfTalkPolicy.isSelfTalk("saya tidak dapat memproses permintaan anda"))
