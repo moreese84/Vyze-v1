@@ -42,6 +42,7 @@ object SuspectMarker {
     const val TAG_PRIOR_ASR_FAILURE = "suspect_prior_asr_failure"
     const val TAG_LANG_MISMATCH = "suspect_lang_mismatch"
     const val TAG_REPEAT_60S = "suspect_repeat_60s"
+    const val TAG_TEXT_GROUNDING = "suspect_text_grounding"
 
     /** Answer-didn't-satisfy window for repeat detection (plan: ~60s). */
     const val REPEAT_WINDOW_MS = 60_000L
@@ -65,6 +66,61 @@ object SuspectMarker {
         "请再说一遍", "再说一遍", "再说一次", "我没听清", "我没有听清",
         "你说什么", "你說什麼",
     )
+
+    /**
+     * TEXT-GROUNDING mark (fix #4, 2026-10-01): the response names printed
+     * text that is ABSENT from the frame's OCR ground truth. When OCR text
+     * exists for the frame (text/tap/pointing/currency/card queries all run
+     * the ML Kit pre-pass), every confident-looking brand/product name in
+     * the answer must be traceable to it — an answer naming text the OCR
+     * never saw is the hallucinated-brand class the corpus keeps showing
+     * (「KOPI SAIGON」 on a cup described at 256px; "Amlodipine 5mg" beside
+     * a card; Maggi named from a blurred packet).
+     *
+     * DELIBERATELY CONSERVATIVE — only flags when it is very likely right:
+     *  - Only ASCII letter-initial runs of length ≥ 4 are examined, and
+     *    they must LOOK like quoted text: ALL-CAPS (labels, logos),
+     *    camelCase (PowerClean, McDonalds), or a MID-SENTENCE Capitalized
+     *    word (Amlodipine, Kopi, Maybank — brands appear exactly there).
+     *    Sentence-INITIAL capitals are normal grammar and never examined;
+     *    lowercase words are never examined. Sentence boundaries are
+     *    en + CJK terminals (. ! ? \n 。 ！ ？) before the token.
+     *  - Pure numbers are unreachable by the letter-initial regex (a
+     *    threshold dispute is not a text dispute; OCR digit merging is
+     *    too unreliable to adjudicate).
+     *  - CJK claims are never examined — the token regex sees ASCII only;
+     *    zh text claims ride the watch-list. A Latin brand EMBEDDED in a
+     *    zh answer IS checked (the ir_215 evidence row is exactly that
+     *    shape: 那是一杯Kopi Saigon的饮品).
+     *  - Matching is on ALPHANUMERIC-ONLY uppercase forms (punctuation,
+     *    spacing and case folds away): "KOPI-SAIGON" in OCR matches
+     *    "Kopi Saigon" in the answer.
+     * A miss (OCR missed tiny text the model could see) costs a marker in
+     * the feedback column — never speech. The tag exists so the teacher
+     * pass can MEASURE the class; it gates nothing by itself.
+     */
+    fun findsTextNotInOcr(response: String?, ocrText: String?): Boolean {
+        if (response.isNullOrBlank() || ocrText.isNullOrBlank()) return false
+        val ocrFolded = ocrText.uppercase().filter { it.isLetterOrDigit() && it.code < 128 }
+        if (ocrFolded.isEmpty()) return false
+        val tokenRegex = Regex("[A-Za-z][A-Za-z0-9]{3,}")
+        val sentenceBreaks = charArrayOf('.', '!', '?', '\n', '\u3002', '\uFF01', '\uFF1F')
+        var prevEnd = 0
+        for (m in tokenRegex.findAll(response)) {
+            val token = m.value
+            val sentenceStart = m.range.first == 0 ||
+                response.substring(prevEnd, m.range.first).any { it in sentenceBreaks }
+            prevEnd = m.range.last + 1
+            val allCaps = token == token.uppercase()
+            val camelCase = token.drop(1).any { it.isUpperCase() }
+            val midSentenceCap = token.first().isUpperCase() && !sentenceStart
+            if (allCaps || camelCase || midSentenceCap) {
+                val folded = token.uppercase().filter { it.isLetterOrDigit() }
+                if (folded.length >= 4 && !ocrFolded.contains(folded)) return true
+            }
+        }
+        return false
+    }
 
     /**
      * True when the transcript is a recovery cue — ASR just failed and the
@@ -126,11 +182,13 @@ object SuspectMarker {
         priorAsrFailure: Boolean,
         langMismatch: Boolean,
         repeatWithinWindow: Boolean,
+        textGrounding: Boolean = false,
     ): String = buildList {
         if (priorBargeIn) add(TAG_BARGE_IN_PRIOR)
         if (priorAsrFailure) add(TAG_PRIOR_ASR_FAILURE)
         if (langMismatch) add(TAG_LANG_MISMATCH)
         if (repeatWithinWindow) add(TAG_REPEAT_60S)
+        if (textGrounding) add(TAG_TEXT_GROUNDING)
     }.joinToString(" ")
 
     /**

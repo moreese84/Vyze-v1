@@ -577,7 +577,51 @@ class DynamicPromptBuilderTest {
         assertFalse(ja.contains("Baki minggu ini"))
     }
 
+    // ── OCR grounding clause (fix #4, 2026-10-01) ─────────────────
+
     @Test
+    fun `sparse ocr text triggers the grounding license`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "what is this",
+            userLocale = Locale.US,
+            ocrText = "250ml",
+        )
+        assertTrue(p.contains("too small or blurred to read reliably"))
+        assertTrue(p.contains("a wrong name is worse than an honest description"))
+    }
+
+    @Test
+    fun `dense ocr text does not carry the grounding license`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "read this label",
+            userLocale = Locale.US,
+            // ≥ 60 chars — a real read with plenty of ground truth.
+            ocrText = "PARACETAMOL 500mg TABLETS. Contains paracetamol. Dosage: adults 1-2 tablets every 4 hours.",
+        )
+        assertFalse(p.contains("too small or blurred to read reliably"))
+    }
+
+    @Test
+    fun `no ocr text never carries the grounding license`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "what is in front of me",
+            userLocale = Locale.US,
+        )
+        assertFalse(p.contains("too small or blurred to read reliably"))
+    }
+
+    @Test
+    fun `grounding trigger companion mirrors the inline threshold`() {
+        assertTrue(DynamicPromptBuilder.companionShouldGroundOcr("250ml"))
+        // No OCR ground truth → no clause (the buildPrompt branch only runs
+        // inside the non-blank check; the mirror must agree).
+        assertFalse(DynamicPromptBuilder.companionShouldGroundOcr(""))
+        assertFalse(DynamicPromptBuilder.companionShouldGroundOcr(null))
+        assertFalse(DynamicPromptBuilder.companionShouldGroundOcr("x".repeat(60)))
+        // Boundary: 59 chars fires, 60 does not.
+        assertTrue(DynamicPromptBuilder.companionShouldGroundOcr("x".repeat(59)))
+    }
+
     fun `non-date queries never carry the date rules`() = runBlocking {
         val p = builder().buildPrompt(queryOverride = "describe this room", userLocale = Locale.US)
         assertFalse(p.contains("DATE ARITHMETIC RULE"))

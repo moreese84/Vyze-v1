@@ -1942,11 +1942,20 @@ class VyzeCoreController(
                     )
                     val langMismatch = query != null && SuspectMarker
                         .isLangMismatch(query, response)
+                    // TEXT-GROUNDING mark (fix #4): when this frame has OCR
+                    // ground truth, an answer naming printed text the OCR never
+                    // saw is the hallucinated-brand class — tagged so the
+                    // teacher pass can measure it. Diagnostic only; the answer
+                    // still delivers (the OCR pre-pass can miss tiny text the
+                    // model legitimately saw at full resolution).
+                    val textGroundingSuspect = SuspectMarker
+                        .findsTextNotInOcr(response, ocrText)
                     val suspectTags = SuspectMarker.tagsForStoredRecord(
                         priorBargeIn = suspectPriorBargeIn,
                         priorAsrFailure = suspectPriorAsrFailure,
                         langMismatch = langMismatch,
                         repeatWithinWindow = repeatWithinWindow,
+                        textGrounding = textGroundingSuspect,
                     )
                     if (suspectTags.isNotEmpty()) {
                         CrashLogFile.log(TAG, "Suspect marks: $suspectTags")

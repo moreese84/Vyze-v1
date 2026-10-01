@@ -103,6 +103,23 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 "When reading text aloud, the two sentence limit does NOT apply — read every " +
                 "word of the OCR text completely. Output plain spoken text only: never " +
                 "markdown symbols, bullets, dashes, asterisks, or emoji.")
+            // 2c-text. GROUNDING LICENSE (fix #4, 2026-10-01): when OCR text
+            //     exists but is sparse — tiny glyphs at 256-384px sit below ML
+            //     Kit's floor even though the eye-level model can see shapes —
+            //     the model previously CONFABULATED brand names (「KOPI SAIGON」
+            //     named from a cup at 256px; Maggi named from a blurred
+            //     packet). Give it a legitimate way out instead: speak the
+            //     readable text and admit the limits, per the removal-beats-
+            //     out-shouting doctrine this prompt architecture runs on.
+            //     Appended after the ground-truth directive so the two never
+            //     conflict; the OCR carve-out above still overrides brevity.
+            if (ocrText.length < 60) {
+                sb.appendLine("Some printed text may be too small or blurred to read reliably. " +
+                    "Name ONLY the words you can actually read clearly (the OCR text helps " +
+                    "here). If the brand or product name is unclear, say so plainly and " +
+                    "describe the object by its visible features instead — a wrong name is " +
+                    "worse than an honest description.")
+            }
             }
 
             // 2b-bis. LEARNED BREVITY — silently adapted answer length.
@@ -321,6 +338,26 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
     companion object {
         private const val TAG = "DynamicPromptBuilder"
+
+        /**
+         * Grounding-clause threshold (fix #4, 2026-10-01): OCR text shorter
+         * than this is SPARSE — tiny glyphs at 256-384px sit below ML Kit's
+         * floor even though the eye-level model can see label shapes, and
+         * that is the regime where the model confabulates brand names
+         * (「KOPI SAIGON」 on a cup at 256px; Maggi from a blurred packet).
+         * The clause's firing condition is mirrored by
+         * [companionShouldGroundOcr] — both must change together.
+         */
+        private const val SPARSE_OCR_GROUNDING_THRESHOLD = 60
+
+        /**
+         * Grounding-clause trigger (fix #4): OCR text is present but sparse —
+         * the confabulation regime. Pure and JVM-visible so the clause's
+         * firing condition is testable without Android. Mirrors the inline
+         * threshold in [buildPrompt] (both must change together).
+         */
+        fun companionShouldGroundOcr(ocrText: String?): Boolean =
+            !ocrText.isNullOrBlank() && ocrText.length < SPARSE_OCR_GROUNDING_THRESHOLD
 
         /**
          * NAVIGATION MODE — used for generic taps and automatic spatial descriptions.
