@@ -2811,8 +2811,7 @@ class VyzeCoreController(
      */
     private fun isTextExtractionQuery(query: String?): Boolean {
         if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
-        return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        return companionIsTextExtractionQuery(query)
     }
 
     /**
@@ -3202,7 +3201,15 @@ class VyzeCoreController(
             "tertulis", "ditulis", "bertulis", "ada tulis",
             "bungkusan", "pembungkusan", "pekej", "botol", "tin",
             // Chinese
-            "写的是什么", "写着什么", "上面写着", "上面写", "包装", "瓶", "罐"
+            "写的是什么", "写着什么", "上面写着", "上面写", "包装", "瓶", "罐",
+            // Spoken NUMBER-READING asks (2026-09-30 corpus, read-lane fix):
+            // unit-value asks carry no read/number keyword and fell to the
+            // scene lane at 256px with NO OCR pre-pass — the printed value
+            // was unreadable (row ir_114 "how many milligram potassium"
+            // answered "bottle of water with mineral content"). zh also had
+            // no "number" form at all (en "number" / ms "nombor" existed).
+            "milligram", "miligram", "毫克",
+            "号码", "號碼", "卡号", "卡號"
         )
 
         /**
@@ -3264,7 +3271,11 @@ class VyzeCoreController(
             // Chinese
             "银行卡", "借记卡", "信用卡", "什么卡", "哪家银行",
             // Traditional (Gemma ASR emits Traditional)
-            "銀行卡", "借記卡", "信用卡", "什麼卡", "哪家銀行"
+            "銀行卡", "借記卡", "信用卡", "什麼卡", "哪家銀行",
+            // zh card-NUMBER asks ("卡号是多少") — the list had only full
+            // card-name forms, so a number ask missed this bank entirely and
+            // the bank-card prompt rules never engaged.
+            "卡号", "卡號"
         )
 
         /**
@@ -3408,6 +3419,21 @@ class VyzeCoreController(
             if (query.isNullOrBlank()) return false
             val lower = query.lowercase()
             return DATE_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        }
+
+        /**
+         * Read-lane detector (mirrors the instance [isTextExtractionQuery]):
+         * pure keyword gate over [TEXT_KEYWORDS]. JVM-visible so the
+         * number-reading routing is testable without Android. A hit means
+         * the query wants text READ from the frame — the capture router
+         * takes the full-resolution still and the OCR pre-pass runs. Scene
+         * queries get neither (256px, no OCR — printed digits are then
+         * unreadable, which is exactly the ir_114 failure).
+         */
+        fun companionIsTextExtractionQuery(query: String?): Boolean {
+            if (query.isNullOrBlank()) return false
+            val lower = query.lowercase()
+            return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
         }
 
         /**

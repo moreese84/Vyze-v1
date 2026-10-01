@@ -32,6 +32,39 @@ class VyzeCoreControllerRouteTest {
         assertTrue(VyzeCoreController.companionIsTextOnlyQuery("esok hari apa"))
     }
 
+    // ── Number-reading asks route to the read lane (fix #2, 2026-09-30) ──
+
+    @Test
+    fun `number and unit-reading asks route to the read lane`() {
+        // ir_114 (2026-09-22): "how many milligram potassium" carried no read
+        // keyword and fell to the scene lane — 256px, NO OCR pre-pass — so the
+        // printed milligram value was unreadable ("bottle of water with
+        // mineral content listed on the label"). Unit-value asks are reads.
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("how many milligram potassium"))
+        // ms unit form (en "milligram" existed nowhere before this fix).
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("berapa miligram garam ini"))
+        // zh number asks: the zh banks had no "number" form at all (en
+        // "number" / ms "nombor" already existed) — 卡号/卡號 also pull the
+        // bank-card prompt rules via BANK_CARD_KEYWORDS.
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("卡号是多少"))
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("這張卡的卡號是什麼"))
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("上面写的号码是什么"))
+        // Regression pins: forms that already routed must keep routing.
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("read the card number"))
+        assertTrue(VyzeCoreController.companionIsTextExtractionQuery("berapa nombor kad ini"))
+    }
+
+    @Test
+    fun `scene and currency asks stay off the read lane`() {
+        assertFalse(VyzeCoreController.companionIsTextExtractionQuery("what is in front of me"))
+        assertFalse(VyzeCoreController.companionIsTextExtractionQuery("what color is this shirt"))
+        assertFalse(VyzeCoreController.companionIsTextExtractionQuery("apa kat depan saya"))
+        // Currency stays on the analyzer-frame OCR path by design: banknote
+        // denomination is barcode+vision (frozen fixture e6 = VLM_VOICE_QUERY
+        // for the seed row) — only the TEXT bank drives the full-res still.
+        assertFalse(VyzeCoreController.companionIsTextExtractionQuery("berapa nilai duit ini"))
+    }
+
     @Test
     fun `date ask with garbled asr still routes text-only`() {
         // The garbled row from 07:55:23 — "Jumaat" garbled to "Jubarat",
