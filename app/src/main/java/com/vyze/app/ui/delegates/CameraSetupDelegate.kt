@@ -103,6 +103,12 @@ class CameraSetupDelegate {
         /** Decode attempts used (transient OOM/recycle-race failures retry). */
         var attempts = 0
 
+        /** Uniform frames this waiter has been pushed back by (readiness gate). */
+        var readinessDrops = 0
+
+        /** Distinct failure message (set before completion, read on delivery). */
+        var failure: String? = null
+
         /** Signalled (result set) or failed by exactly one party. */
         val done = CompletableDeferred<Unit>()
 
@@ -111,6 +117,9 @@ class CameraSetupDelegate {
     }
 
     private val captureWaiters = ArrayDeque<CaptureWaiter>()
+
+    /** Readiness verdict for a delivered frame (see the gate in the analyzer). */
+    enum class FrameReadiness { READY, TOO_DARK, UNIFORM }
 
     // ── High-Resolution Still Capture (OCR) ────────────────────────
     // A bound ImageCapture use case gives text queries a full-resolution
@@ -166,6 +175,42 @@ class CameraSetupDelegate {
         private const val BRIGHT_THRESHOLD = 65
         /** Check luminance every N frames (~600ms at 30fps) to minimize CPU load. */
         private const val LUMINANCE_CHECK_INTERVAL = 20L
+
+        // ── Capture-Readiness Gate (fix #1, 2026-10-01) ──────────
+        // Device evidence: 「您面前是纯绿色的背景」×2 — a snapshot taken in
+        // the surface-init window (bind/resume) served a UNIFORM GREEN frame
+        // to the VLM, which dutifully described a green background nobody
+        // was looking at. The gate delays serving a capture until the
+        // camera delivers a frame with real image CONTENT.
+        /** Extra frames a waiter may be pushed back while the surface warms up. */
+        private const val READINESS_RETRIES = 3
+        /** Subsample grid for stats (every Nth pixel per axis) — cheap, sufficient. */
+        private const val READY_SAMPLE_STEP = 4
+        /** Variance below this on the sampled Y plane = no image content.
+         *  Real scenes (even walls) carry sensor noise well above std≈5. */
+        private const val UNIFORM_VARIANCE_MAX = 25.0
+        /** Mean luma below this (textured) = dark scene — SERVED, logged only:
+        *  the auto-torch system owns brightness, and dark scenes legitimately
+        *  contain content. Never refuse a dark frame. */
+        private const val READINESS_DARK_MEAN = 10
+
+        /**
+         * Classify a frame's readiness from its Y plane statistics.
+         * PURE — same stats, same verdict; JVM-tested in CameraReadinessTest.
+         *
+         *  - UNIFORM: variance ≤ [UNIFORM_VARIANCE_MAX] — no image content
+         *    (the surface-init window that produced the green-background
+         *    hallucinations). The ONLY verdict the gate acts on.
+         *  - TOO_DARK: mean luma < [READINESS_DARK_MEAN] with content — logged
+         *    for diagnostics, never refused (the auto-torch owns brightness;
+         *    a dark scene is still a scene).
+         *  - READY: everything else — real content at usable brightness.
+         */
+        fun readinessVerdict(meanLuma: Double, variance: Double): FrameReadiness = when {
+            variance <= UNIFORM_VARIANCE_MAX -> FrameReadiness.UNIFORM
+            meanLuma < READINESS_DARK_MEAN -> FrameReadiness.TOO_DARK
+            else -> FrameReadiness.READY
+        }
     }
 
     /**
@@ -276,6 +321,32 @@ class CameraSetupDelegate {
                     null
                 }
                 if (waiter != null) {
+                    // ── READINESS GATE ────────────────────────
+                    // A frame with no image content (uniform surface-init
+                    // window) must not be served to the VLM — it produces
+                    // the green-background hallucination class. Push the
+                    // waiter back to be served by a LATER frame, up to
+                    // READINESS_RETRIES, then serve anyway (never hang).
+                    // Dark frames are SERVED (only logged): the auto-torch
+                    // system owns brightness, and dark scenes legitimately
+                    // contain content.
+                    when (frameReadiness(imageProxy)) {
+                        FrameReadiness.READY -> {}
+                        FrameReadiness.TOO_DARK -> {
+                            Log.d(TAG, "Readiness: dark frame (serving anyway)")
+                        }
+                        FrameReadiness.UNIFORM -> {
+                            if (waiter.readinessDrops < READINESS_RETRIES) {
+                                waiter.readinessDrops++
+                                synchronized(captureWaiters) {
+                                    captureWaiters.addFirst(waiter)
+                                }
+                                Log.d(TAG, "Readiness: uniform frame — retry ${waiter.readinessDrops}/$READINESS_RETRIES")
+                                return@setAnalyzer
+                            }
+                            Log.w(TAG, "Readiness: still uniform after $READINESS_RETRIES — serving anyway")
+                        }
+                    }
                     val bitmap = doDecodeFrame(imageProxy)
                     if (bitmap != null) {
                         serveWaiter(waiter, bitmap)
@@ -296,7 +367,7 @@ class CameraSetupDelegate {
                 // every ImageProxy delivered here is closed exactly once,
                 // whether it was luminance-sampled, decoded for a waiter,
                 // or discarded because nobody demanded it.
-                try { imageProxy.close() } catch (_: Throwable) {}
+                try {                imageProxy.close() } catch (_: Throwable) {}
             }
         }
 
@@ -361,13 +432,14 @@ class CameraSetupDelegate {
         waiter.done.invokeOnCompletion {
             waiter.timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
             val bitmap = waiter.result
+            val failure = waiter.failure
             mainHandler.post {
                 try {
                     if (bitmap != null && !bitmap.isRecycled) {
                         onBitmap(bitmap)
                     } else {
                         bitmap?.recycle()
-                        onError("Camera frame unavailable")
+                        onError(failure ?: "Camera frame unavailable")
                     }
                 } catch (e: Throwable) {
                     Log.w(TAG, "takeSnapshot callback error: ${e.message}")
@@ -404,6 +476,55 @@ class CameraSetupDelegate {
     /** Fail a waiter (timeout or exhausted decode attempts). */
     private fun failWaiter(waiter: CaptureWaiter) {
         waiter.done.complete(Unit)
+    }
+
+    // ── Capture-Readiness Gate (pure fns) ───────────
+
+    /**
+     * Mean and variance of the frame's Y plane on a subsampled grid
+     * (every [READY_SAMPLE_STEP]-th pixel per axis) — O(w·h/step²), no
+     * allocation beyond the accumulator. Mirrors the Y-plane read of
+     * [sampleLuminance] and tolerates the same stride/layout quirks.
+     * Returns null when the plane is unreadable (serve the frame — a
+     * diagnostics miss must never stall a capture).
+     */
+    private fun frameStats(imageProxy: ImageProxy): Pair<Double, Double>? {
+        val plane = try {
+            imageProxy.planes[0].buffer
+        } catch (_: Throwable) {
+            return null
+        }
+        var sum = 0.0
+        var sumSq = 0.0
+        var n = 0
+        val rowStride = imageProxy.planes[0].rowStride
+        val pixelStride = imageProxy.planes[0].pixelStride
+        var y = 0
+        while (y < imageProxy.height) {
+            var x = 0
+            val rowBase = y * rowStride
+            while (x < imageProxy.width) {
+                val idx = rowBase + x * pixelStride
+                if (idx < plane.capacity()) {
+                    val v = plane.get(idx).toInt() and 0xFF
+                    sum += v
+                    sumSq += v * v
+                    n++
+                }
+                x += READY_SAMPLE_STEP
+            }
+            y += READY_SAMPLE_STEP
+        }
+        if (n == 0) return null
+        val mean = sum / n
+        val variance = sumSq / n - mean * mean
+        return mean to variance.coerceAtLeast(0.0)
+    }
+
+    /** Verdict for this frame; unreadable planes default to READY (serve). */
+    private fun frameReadiness(imageProxy: ImageProxy): FrameReadiness {
+        val stats = frameStats(imageProxy) ?: return FrameReadiness.READY
+        return readinessVerdict(stats.first, stats.second)
     }
 
     // ── High-Resolution Still Capture (OCR text reads) ────────────
