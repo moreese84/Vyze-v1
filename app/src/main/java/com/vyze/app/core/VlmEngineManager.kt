@@ -227,7 +227,7 @@ class VlmEngineManager(
         val midGpu = try { isMidRangeGpu(hardware) } catch (_: Throwable) { false }
         val gles = try { detectGlesVersion() } catch (_: Throwable) { "GLES unknown" }
 
-        val tier = classifyTier(totalRamMb, flagship, midGpu)
+        val tier = classifyTier(totalRamMb, flagship, midGpu, isLowRamDevice)
         val profile = DeviceProfile(tier, totalRamMb, hardware, flagship, midGpu, gles)
 
         Log.i(TAG, "Device tier detected: ${profileSummary(profile)}")
@@ -236,31 +236,6 @@ class VlmEngineManager(
         CrashLogFile.log(TAG, "Total RAM: ${totalRamMb}MB (reported) | hw=$hardware | flagshipGPU=$flagship | midGPU=$midGpu | $gles")
         CrashLogFile.log(TAG, "Low-RAM flag (Android): $isLowRamDevice")
         return profile
-    }
-
-    /**
-     * Tier classification from total RAM + GPU class:
-     *  - Tier 0  : reported RAM below the ~4 GB floor → VLM bypassed.
-     *  - Tier 1  : reported RAM >= ~8 GB floor AND flagship GPU.
-     *  - Tier 2  : reported RAM >= ~6 GB floor, OR a flagship GPU with
-     *              squeezed RAM (still gets the GPU→CPU chain).
-     *  - Tier 3  : everything else → CPU directly.
-     */
-    private fun classifyTier(totalRamMb: Long, flagship: Boolean, midGpu: Boolean): DeviceTier {
-        if (totalRamMb <= 0) {
-            // Detection failed — never disable VLM on a guess; use the tier
-            // whose backend chain is safest (GPU attempt with CPU fallback).
-            return DeviceTier.TIER_2
-        }
-        if (totalRamMb < VLM_BYPASS_TOTAL_RAM_MB) return DeviceTier.TIER_DISABLED
-        return when {
-            totalRamMb >= TIER1_MIN_TOTAL_RAM_MB && flagship -> DeviceTier.TIER_1
-            totalRamMb >= TIER2_MIN_TOTAL_RAM_MB -> DeviceTier.TIER_2
-            // High-end GPU with less RAM: the certified OpenCL/Vulkan drivers
-            // are more trustworthy than raw capacity — still try GPU → CPU.
-            flagship -> DeviceTier.TIER_2
-            else -> DeviceTier.TIER_3
-        }
     }
 
     /**
@@ -449,7 +424,7 @@ class VlmEngineManager(
      *  | 1    | >= ~8GB RAM + flagship GPU               | GPU                                   | 4096    | on  |
      *  | 2    | ~6-8GB RAM or mid-range GPU/Mali         | GPU → CPU (4 threads)                 | 3072    | off |
      *  | 3    | < ~6GB RAM                               | CPU (4 threads) directly              | 2048    | off |
-     *  | 0    | < ~4GB RAM                               | none — VLM bypassed, TTS fallback msg | —       | —   |
+     *  | 0    | OS low-RAM flag, or < ~4GB reported RAM  | none — VLM bypassed, TTS fallback msg | —       | —   |
      *
      * Every engine-creation failure (JNI/C++ driver errors, OOM, GPU-init
      * cancellations like "m0 was canceled") is caught HERE and either retried
@@ -492,20 +467,33 @@ class VlmEngineManager(
         }
 
         // ── Pre-flight RAM Check ──────────────────────────────────
-        // Gemma 4 E2B requires ~3 GB of RAM at peak (model weights
-        // + KV-cache + image encoding). Reject early on constrained devices
-        // with a clear error instead of crashing mid-inference with OOM.
+        // Gemma 4 E2B's ~2.59 GB model mmap + KV-cache + image encoding peak
+        // far above what a memory-constrained device sustains. Reject early
+        // instead of dying mid-init with an uncatchable NATIVE OOM (a Java
+        // try-catch cannot stop a native allocator abort). The bar is
+        // TIER-AWARE — see [requiredFreeRamMB]: the CPU-direct tier keeps
+        // weights, KV-cache and activations all in system RAM.
         // Trigger GC first to reclaim idle memory before measuring.
         System.gc()
         Thread.sleep(100)
         val freeMB = availableHeapMB()
-        val requiredMB = if (isLowRamDevice) MIN_RAM_LOW_RAM_DEVICE_MB else MIN_RAM_STANDARD_MB
+        val requiredMB = requiredFreeRamMB(deviceProfile.tier, isLowRamDevice)
         if (freeMB < requiredMB) {
-            val errorMsg = "Insufficient RAM: ${freeMB}MB free, need ${requiredMB}MB. " +
-                "Gemma 4 E2B requires a device with at least ${if (isLowRamDevice) "3" else "4"}GB RAM."
-            Log.e(TAG, errorMsg)
-            CrashLogFile.logError(TAG, errorMsg)
-            onError?.invoke(errorMsg, "")
+            // A deterministic condition, not a transient backend fault — the
+            // device will not find hundreds of MB in the next seconds. The
+            // technical numbers go to LOGS ONLY; the user hears the friendly
+            // fallback on the FIRST attempt (the old path spoke raw
+            // "Insufficient RAM: …" strings to a blind user) and the failure
+            // counts toward the circuit breaker so retries stop churning.
+            // Fast-path tools (OCR, light, color) stay fully operational.
+            initFailureCount++
+            gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            val detail = "Pre-flight RAM check failed: ${freeMB}MB free, need ${requiredMB}MB " +
+                "[tier=${deviceProfile.tier.label}, lowRam=$isLowRamDevice] — $VLM_UNAVAILABLE_MESSAGE"
+            Log.e(TAG, detail)
+            CrashLogFile.logError(TAG, detail)
+            onStepProgress?.invoke(100, "Fast tools ready")
+            onError?.invoke(VLM_UNAVAILABLE_MESSAGE, "")
             return@withContext false
         }
         Log.i(TAG, "RAM check passed: ${freeMB}MB free (lowRam=$isLowRamDevice, required=${requiredMB}MB)")
@@ -1974,6 +1962,13 @@ class VlmEngineManager(
         private const val MIN_RAM_STANDARD_MB = 1200L
         /** Minimum free device RAM (MB) required on devices flagged as low-RAM. */
         private const val MIN_RAM_LOW_RAM_DEVICE_MB = 800L
+        /**
+         * Extra free-RAM headroom the pre-flight demands of the CPU-direct
+         * tier (Tier 3): weights + KV-cache + activations all live in system
+         * RAM there (no GPU offload). FIRST-CUT constant — tune from real
+         * low-end device data; the tier-awareness is the load-bearing part.
+         */
+        private const val MIN_RAM_TIER3_EXTRA_MB = 400L
         /** Log a warning if free device RAM drops below this during inference (Tier 1). */
         private const val LOW_RAM_THRESHOLD_MB = 500L
         /** Tier-aware memory-pressure warning thresholds (free MB). */
@@ -1989,8 +1984,70 @@ class VlmEngineManager(
         private const val TIER1_MIN_TOTAL_RAM_MB = 7168L
         /** Reported-RAM floor for Tier 2 (nominal 6 GB); below it → Tier 3. */
         private const val TIER2_MIN_TOTAL_RAM_MB = 5500L
-        /** Reported-RAM floor below which VLM generation is bypassed (nominal 4 GB). */
-        private const val VLM_BYPASS_TOTAL_RAM_MB = 3400L
+        /**
+         * Reported-RAM floor below which VLM generation is bypassed.
+         * Calibrated so a NOMINAL 4 GB phone (kernel-adjusted totalMem
+         * ~3.6-3.9 GB) lands in Tier 0, matching the init path's own spoken
+         * claim "requires a device with at least 4 GB RAM". The old 3400
+         * floor let nominal-4GB phones slip past it into Tier 3 CPU-direct
+         * VLM — the reported low-end crash band (native OOM during init).
+         * Reported 4.0 GB ≈ nominal 4.5 GB+.
+         */
+        private const val VLM_BYPASS_TOTAL_RAM_MB = 4000L
+
+        /**
+         * Tier classification from total RAM + GPU class + the OS low-RAM
+         * flag. Pure + JVM-testable (VlmEngineManagerTierTest pins every
+         * boundary) — companion so tests never construct the manager.
+         *
+         *  - Tier 0  : OS-declared low-RAM device, or reported RAM below the
+         *              bypass floor → VLM bypassed.
+         *  - Tier 1  : reported RAM >= ~8 GB floor AND flagship GPU.
+         *  - Tier 2  : reported RAM >= ~6 GB floor, OR a flagship GPU with
+         *              squeezed RAM (still gets the GPU→CPU chain).
+         *  - Tier 3  : everything else → CPU directly.
+         */
+        internal fun classifyTier(
+            totalRamMb: Long,
+            flagship: Boolean,
+            midGpu: Boolean,
+            isLowRamDevice: Boolean
+        ): DeviceTier {
+            // The OS itself declares this device memory-constrained — honor
+            // the flag before any RAM arithmetic (the totalMem probe is least
+            // reliable on exactly the devices the flag covers).
+            if (isLowRamDevice) return DeviceTier.TIER_DISABLED
+            if (totalRamMb <= 0) {
+                // Probe failed — never disable VLM on a guess (documented
+                // intent): use the tier with the safest backend chain. The
+                // tier-aware pre-flight (requiredFreeRamMB) is the net that
+                // degrades a genuinely weak probe-failed device gracefully
+                // instead of crashing it.
+                return DeviceTier.TIER_2
+            }
+            if (totalRamMb < VLM_BYPASS_TOTAL_RAM_MB) return DeviceTier.TIER_DISABLED
+            return when {
+                totalRamMb >= TIER1_MIN_TOTAL_RAM_MB && flagship -> DeviceTier.TIER_1
+                totalRamMb >= TIER2_MIN_TOTAL_RAM_MB -> DeviceTier.TIER_2
+                // High-end GPU with less RAM: the certified OpenCL/Vulkan
+                // drivers are more trustworthy than raw capacity — still try
+                // GPU → CPU.
+                flagship -> DeviceTier.TIER_2
+                else -> DeviceTier.TIER_3
+            }
+        }
+
+        /**
+         * Free-RAM bar for the pre-flight check in [initialize], scaled by
+         * the chosen tier: the CPU-direct tier (Tier 3) carries model
+         * weights, KV-cache AND vision/audio activations entirely in system
+         * RAM (no GPU offload), so the same free reading is riskier there
+         * than on a GPU attempt. First-cut margin — tune from device data.
+         */
+        internal fun requiredFreeRamMB(tier: DeviceTier, isLowRamDevice: Boolean): Long {
+            val base = if (isLowRamDevice) MIN_RAM_LOW_RAM_DEVICE_MB else MIN_RAM_STANDARD_MB
+            return if (tier == DeviceTier.TIER_3) base + MIN_RAM_TIER3_EXTRA_MB else base
+        }
 
         /** Engine context window (EngineConfig.maxNumTokens) per tier. */
         private const val CONTEXT_TOKENS_TIER1 = 4096
@@ -2061,8 +2118,12 @@ class VlmEngineManager(
     }
 }
 
-/** Hardware classification of the running device (detected once, cached). */
-private enum class DeviceTier(val label: String) {
+/**
+ * Hardware classification of the running device (detected once, cached).
+ * `internal` (not file-private) so the JVM tier-boundary test can pin
+ * [VlmEngineManager.classifyTier] without constructing the manager.
+ */
+internal enum class DeviceTier(val label: String) {
     TIER_1("Tier 1 (high-end)"),
     TIER_2("Tier 2 (mid-range)"),
     TIER_3("Tier 3 (lower-end)"),
