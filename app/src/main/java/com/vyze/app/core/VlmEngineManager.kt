@@ -28,7 +28,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -548,25 +550,61 @@ class VlmEngineManager(
             }
 
             // All backends in the tier's plan failed — count the failure.
-            // Past the threshold, degrade gracefully: friendly message via
-            // onError (spoken as TTS); fast-path tools stay untouched.
+            // FIRST failure already speaks the FRIENDLY message (whitepaper
+            // §: "the old path spoke raw 'Insufficient RAM: …' strings to a
+            // blind user" — same discipline applies to every init failure:
+            // exception text is a logs-only detail, never a screen/TTS
+            // payload). The circuit breaker (initFailureCount) then stops
+            // retry churn at MAX_INIT_FAILURES.
             initFailureCount++
             isInitialized = false
             val degrade = initFailureCount >= MAX_INIT_FAILURES
-            if (degrade) gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
-            val errorMsg = "VLM init failed: all backends for $tier exhausted." +
-                if (degrade) " $VLM_UNAVAILABLE_MESSAGE" else " (attempt $initFailureCount/$MAX_INIT_FAILURES)"
-            Log.e(TAG, errorMsg)
-            CrashLogFile.logError(TAG, errorMsg)
-            onError?.invoke(errorMsg, "")
+            gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            Log.e(TAG, "VLM init failed: all backends for $tier exhausted." +
+                if (degrade) " (circuit breaker OPEN)" else " (attempt $initFailureCount/$MAX_INIT_FAILURES)")
+            CrashLogFile.logError(TAG, "VLM init failed: all backends for $tier exhausted (attempt $initFailureCount/$MAX_INIT_FAILURES)")
+            onError?.invoke(VLM_UNAVAILABLE_MESSAGE, "")
             false
 
         } catch (e: kotlinx.coroutines.CancellationException) {
-            // The CALLER's coroutine was cancelled (app teardown / session
-            // switch) — propagate silently. This is NOT an engine failure and
-            // must not count toward the circuit breaker.
-            CrashLogFile.log(TAG, "Init cancelled by caller — not an engine failure")
-            throw e
+            // Disambiguate TRUE caller cancellation (app teardown / session
+            // switch) from an ENGINE failure disguised as a cancellation.
+            //
+            // Why: litertlm-android:0.16.1 runs parts of engine init through
+            // its own internal coroutines (see the SendChannel.close note in
+            // build.gradle.kts). On some mid-range MediaTek chipsets
+            // (Helio G88 / Mali-G57 class, e.g. Infinix Hot 40i) a silent
+            // GPU-init failure surfaces as
+            // CancellationException("StandaloneCoroutine was cancelled")
+            // instead of a proper JNI/OOM error. Treating every
+            // CancellationException as caller-cancellation let that failure
+            // escape the guarded backend chain entirely: no CPU fallback, no
+            // circuit breaker, no friendly message — a dead loading screen
+            // showing raw exception text.
+            //
+            // Discriminator: the COROUTINE'S own context. If this job is
+            // still active, nobody cancelled us from outside — the
+            // cancellation came from the engine side and IS an engine
+            // failure. Route it into the normal failure path (circuit-breaker
+            // count + graceful degradation message) instead of rethrowing.
+            if (!currentCoroutineContext().isActive) {
+                CrashLogFile.log(TAG, "Init cancelled by caller — not an engine failure")
+                throw e
+            }
+            CrashLogFile.logError(
+                TAG,
+                "Init failed with a DISGUISED cancellation (caller still active): " +
+                    "${e.javaClass.simpleName}: ${e.message} — treating as engine failure"
+            )
+            initFailureCount++
+            isInitialized = false
+            val degrade = initFailureCount >= MAX_INIT_FAILURES
+            gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            Log.e(TAG, "VLM init failed: ${e.javaClass.simpleName}: ${e.message}" +
+                if (degrade) " (circuit breaker OPEN)" else " (attempt $initFailureCount/$MAX_INIT_FAILURES)")
+            CrashLogFile.logError(TAG, "VLM init failed: ${e.javaClass.simpleName}: ${e.message} (attempt $initFailureCount/$MAX_INIT_FAILURES)", e)
+            onError?.invoke(VLM_UNAVAILABLE_MESSAGE, "")
+            false
         } catch (e: Throwable) {
             // Catches Errors too (OutOfMemoryError, UnsatisfiedLinkError from
             // native init) — a VLM init failure must never cancel the parent
@@ -574,12 +612,11 @@ class VlmEngineManager(
             initFailureCount++
             isInitialized = false
             val degrade = initFailureCount >= MAX_INIT_FAILURES
-            if (degrade) gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
-            val errorMsg = "VLM init failed: ${e.javaClass.simpleName}: ${e.message}" +
-                if (degrade) " — $VLM_UNAVAILABLE_MESSAGE" else ""
-            Log.e(TAG, errorMsg, e)
-            CrashLogFile.logError(TAG, errorMsg, e)
-            onError?.invoke(errorMsg, "")
+            gracefulFallbackMessage = VLM_UNAVAILABLE_MESSAGE
+            Log.e(TAG, "VLM init failed: ${e.javaClass.simpleName}: ${e.message}" +
+                if (degrade) " (circuit breaker OPEN)" else " (attempt $initFailureCount/$MAX_INIT_FAILURES)")
+            CrashLogFile.logError(TAG, "VLM init failed: ${e.javaClass.simpleName}: ${e.message} (attempt $initFailureCount/$MAX_INIT_FAILURES)", e)
+            onError?.invoke(VLM_UNAVAILABLE_MESSAGE, "")
             false
         }
     }
@@ -714,7 +751,19 @@ class VlmEngineManager(
                     EngineConfig(
                         modelPath = modelFile.absolutePath,
                         backend = step.backend,
-                        visionBackend = step.backend,
+                        // VISION SEPARATION (2026-10-09, Infinix Hot 60i / Mali):
+                        // on Mali-G57 class GPUs the vision-encoder path HANGS
+                        // indefinitely — first image inference produced no token
+                        // in 90 s (watchdog logs 09:32–09:34), while the text
+                        // path on the SAME GPU engine works and earlier sessions
+                        // produced full answers (memory DB: "gray refrigerator").
+                        // The vision encoder therefore always runs on CPU on
+                        // non-flagship tiers; image prefill on CPU is slower
+                        // per-token but PROGRESSES (it cannot hang the way the
+                        // Mali OpenCL vision path does). Text/decoder keeps the
+                        // tier's GPU where available. Tier 1 keeps vision on GPU
+                        // (flagship drivers are certified).
+                        visionBackend = if (tier == DeviceTier.TIER_1) step.backend else Backend.CPU(),
                         // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
                         // separate from the text/vision path and loads on demand.
                         audioBackend = Backend.CPU(),
@@ -1546,6 +1595,71 @@ class VlmEngineManager(
     /** True when the device is Tier 0 (VLM bypassed; fast-path tools remain). */
     fun isVlmBypassed(): Boolean = deviceProfile.tier == DeviceTier.TIER_DISABLED
 
+    /**
+     * First-token watchdog budget for THIS device (ms).
+     *
+     * Why it exists: the controller's watchdog re-arms on every RECEIVED
+     * token, but prefill produces no tokens — on lower-tier SoCs the vision
+     * encoder + prompt prefill of an image query can legitimately take
+     * longer than a flagship's whole first sentence. A single fixed 15 s
+     * budget executed a healthy mid-prefill query on an Infinix (Helio G-series)
+     * as "Inference timed out" (observed 2026-10-09: watchdog fired at 15 s
+     * while prefill was still running → "Sorry, I did not get an answer").
+     *
+     * Tiered first-token grace — must stay well below the engine latch
+     * (INFERENCE_TIMEOUT_SEC = 180 s):
+     *   - Tier 1 (flagship, GPU, MTP): 15 s — unchanged, tuned here.
+     *   - Tier 2 (mid-range): 25 s — slower GPU or CPU fallback.
+     *   - Tier 3 (lower-end, CPU-direct): 40 s — CPU image prefill dominates.
+     *   - Tier 0: irrelevant (no VLM), returns the Tier-3 value harmlessly.
+     */
+    fun firstTokenWatchdogBudgetMs(): Long = when (deviceProfile.tier) {
+        DeviceTier.TIER_1 -> 15_000L
+        DeviceTier.TIER_2 -> 25_000L
+        else -> 40_000L
+    }
+
+    /**
+     * One-time grace for the FIRST image inference after engine creation.
+     * The vision encoder's OpenCL/Vulkan kernels compile lazily on the first
+     * real image (init warm-up is deliberately text-only after the SIGSEGV
+     * incident), and on Mali-class GPUs that compile alone can exceed a
+     * minute. Observed 2026-10-09 on Infinix Hot 60i: the tier budget (25 s)
+     * killed the first-ever image query while vision-kernel compile/prefill
+     * was still running — the engine latch would have waited 180 s.
+     */
+    @Volatile
+    private var firstImageInferencePending = true
+
+    /**
+     * Watchdog budget for a query about to start. [isImageQuery] queries on a
+     * fresh engine get the one-time [FIRST_IMAGE_INFERENCE_BUDGET_MS] grace;
+     * everything else uses the tier budget. Must stay below the engine
+     * inference latch (180 s / 60 s low-RAM).
+     *
+     * CPU-vision image queries (Tier 2/3, see the visionBackend separation in
+     * createEngineGuarded) get [CPU_VISION_IMAGE_BUDGET_MS] for EVERY image
+     * query, not just the first: observed on the Hot 60i (2026-10-09) the
+     * first CPU-vision query answered correctly in 74 s, but a follow-up was
+     * killed at the 25 s tier budget — CPU image prefill on Helio-class SoCs
+     * legitimately exceeds GPU-tuned budgets every time. The progress-aware
+     * re-arm still protects long ANSWERS; this budget only bounds the wait
+     * for the FIRST token.
+     */
+    fun watchdogBudgetMs(isImageQuery: Boolean): Long {
+        if (!isImageQuery) return firstTokenWatchdogBudgetMs()
+        return if (deviceProfile.tier == DeviceTier.TIER_1) {
+            if (firstImageInferencePending) FIRST_IMAGE_INFERENCE_BUDGET_MS else firstTokenWatchdogBudgetMs()
+        } else {
+            CPU_VISION_IMAGE_BUDGET_MS
+        }
+    }
+
+    /** Consume the one-time first-image grace (call when the image watchdog arms). */
+    fun markImageInferenceStarted() {
+        firstImageInferencePending = false
+    }
+
     /** Human-readable device tier (for status lines / telemetry). */
     fun getDeviceTierName(): String = deviceProfile.tier.label
 
@@ -2081,6 +2195,17 @@ class VlmEngineManager(
         private const val CPU_ENGINE_CREATE_TIMEOUT_MS = 60_000L
         /** Max wait for a timed-out engine build to materialize before it is closed. */
         private const val PENDING_BUILD_DRAIN_MS = 60_000L
+
+        /** One-time first-image-inference grace (vision-kernel compile on Mali GPUs). */
+        private const val FIRST_IMAGE_INFERENCE_BUDGET_MS = 90_000L
+
+        /**
+         * Per-query budget for image inference with the vision encoder on CPU
+         * (Tier 2/3). CPU image prefill on Helio-class SoCs takes 60-75 s
+         * (observed: correct answer in 74 s); every image query needs this
+         * headroom, not just the first.
+         */
+        private const val CPU_VISION_IMAGE_BUDGET_MS = 120_000L
 
         /** Friendly fallback (spoken as TTS) when VLM is bypassed on < ~4 GB devices. */
         private const val VLM_BYPASS_MESSAGE =

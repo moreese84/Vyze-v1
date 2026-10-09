@@ -23,6 +23,7 @@ import com.vyze.app.data.SuspectMarker
 import com.vyze.app.memory.MemoryRepository
 import com.vyze.app.memory.PreferenceLearner
 import com.vyze.app.memory.SimilarInteraction
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -666,17 +667,36 @@ class VyzeCoreController(
                         onStatusUpdate?.invoke("Error: Model failed to load")
                     }
                 }
+            } catch (e: CancellationException) {
+                // TRUE caller cancellation (fragment teardown / retry re-launch)
+                // must stay SILENT — never formatted as an error, never spoken.
+                // Rethrowing preserves the coroutine-machine contract: a cancelled
+                // launch must not be observed as a failed one. (The
+                // "VLM init crashed: CancellationException: StandaloneCoroutine
+                // was cancelled" loading-screen leak came from this catch.
+                // Disguised ENGINE-side cancellations are already disambiguated
+                // and converted to normal failures inside VlmEngineManager —
+                // anything reaching HERE while the scope is dead is genuine
+                // caller cancellation.)
+                CrashLogFile.log(TAG, "Init coroutine cancelled by caller — staying silent")
+                throw e
             } catch (e: Throwable) {
+                // Blind-first discipline: the SPOKEN and DISPLAYED message must
+                // stay friendly — raw exception text (e.g. "StandaloneCoroutine
+                // was cancelled") is a logs-only detail. A visible retry affordance
+                // already exists on the loading screen.
                 val errorMsg = "VLM init crashed: ${e.javaClass.simpleName}: ${e.message}"
                 Log.e(TAG, errorMsg, e)
                 engineReady = false
                 mainHandler.post {
                     try {
                         ttsManager.speakImmediate(
-                            "AI engine failed to start. ${e.message ?: "Please restart the app."}"
+                            "Visual AI could not start on this device. " +
+                                "Text reading, color and light detection still work. " +
+                                "Tap the screen to try again."
                         )
                     } catch (_: Throwable) {}
-                    onStatusUpdate?.invoke("Error: $errorMsg")
+                    onStatusUpdate?.invoke("Error: Visual AI could not start. Tap the screen to try again.")
                 }
             }
         }
@@ -1437,17 +1457,28 @@ class VyzeCoreController(
         // itself whenever tokens are still flowing (lastInferenceActivityMs
         // updated on every received token), so a long text read-back is
         // never force-killed mid-sentence — only a stall with NO output for
-        // WATCHDOG_TIMEOUT_MS triggers the force reset.
+        // The first-token budget comes from vlmEngine.firstTokenWatchdogBudgetMs()
+        // (tier-aware — 15/25/40 s); a stale-constant reference is kept below only
+        // as documentation of the original flagship tuning.
         lastInferenceActivityMs = System.currentTimeMillis()
+        // Tier-aware first-token grace: prefill emits NO tokens, so on lower-tier
+        // SoCs image prefill alone can outlast the old fixed 15 s budget (observed:
+        // watchdog executed a healthy mid-prefill image query on Infinix Hot 60i).
+        // The FIRST image inference after engine creation additionally gets a
+        // one-time extended budget: the vision encoder's GPU kernels compile
+        // lazily on that first real image (init warm-up is text-only by design),
+        // and that compile alone can exceed a minute on Mali GPUs.
+        val watchdogBudgetMs = vlmEngine.watchdogBudgetMs(isImageQuery = true)
+        vlmEngine.markImageInferenceStarted()
         val watchdogRunnable = object : Runnable {
             override fun run() {
                 if (isInferring.get() && activeSessionId == currentSessionId) {
                     val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
-                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
+                    if (idleMs < watchdogBudgetMs) {
                         // Still making progress — re-arm and keep watching.
-                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                        mainHandler.postDelayed(this, watchdogBudgetMs)
                     } else {
-                        Log.e(TAG, "Watchdog: no output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        Log.e(TAG, "Watchdog: no output for ${watchdogBudgetMs}ms — force resetting")
                         CrashLogFile.log(TAG, "WATCHDOG FIRED — forcing pipeline reset")
                         isInferring.set(false)
                         cancelInference()
@@ -1460,7 +1491,7 @@ class VyzeCoreController(
                 }
             }
         }
-        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
+        mainHandler.postDelayed(watchdogRunnable, watchdogBudgetMs)
 
         inferenceJob = scope.launch {
             var inferenceBitmap: Bitmap = bitmap
@@ -2270,14 +2301,15 @@ class VyzeCoreController(
         resetSentenceBuffer()
 
         lastInferenceActivityMs = System.currentTimeMillis()
+        val watchdogBudgetMs = vlmEngine.firstTokenWatchdogBudgetMs()
         val watchdogRunnable = object : Runnable {
             override fun run() {
                 if (isInferring.get() && activeSessionId == currentSessionId) {
                     val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
-                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
-                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                    if (idleMs < watchdogBudgetMs) {
+                        mainHandler.postDelayed(this, watchdogBudgetMs)
                     } else {
-                        Log.e(TAG, "Watchdog: no expanded output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        Log.e(TAG, "Watchdog: no expanded output for ${watchdogBudgetMs}ms — force resetting")
                         isInferring.set(false)
                         cancelInference()
                         resetSentenceBuffer()
@@ -2289,7 +2321,7 @@ class VyzeCoreController(
                 }
             }
         }
-        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
+        mainHandler.postDelayed(watchdogRunnable, watchdogBudgetMs)
 
         inferenceJob = scope.launch {
             try {
@@ -2410,14 +2442,15 @@ class VyzeCoreController(
 
         // Progress-aware watchdog — same protection as image inference
         lastInferenceActivityMs = System.currentTimeMillis()
+        val watchdogBudgetMs = vlmEngine.firstTokenWatchdogBudgetMs()
         val watchdogRunnable = object : Runnable {
             override fun run() {
                 if (isInferring.get() && activeSessionId == currentSessionId) {
                     val idleMs = System.currentTimeMillis() - lastInferenceActivityMs
-                    if (idleMs < WATCHDOG_TIMEOUT_MS) {
-                        mainHandler.postDelayed(this, WATCHDOG_TIMEOUT_MS)
+                    if (idleMs < watchdogBudgetMs) {
+                        mainHandler.postDelayed(this, watchdogBudgetMs)
                     } else {
-                        Log.e(TAG, "Watchdog: no text output for ${WATCHDOG_TIMEOUT_MS}ms — force resetting")
+                        Log.e(TAG, "Watchdog: no text output for ${watchdogBudgetMs}ms — force resetting")
                         isInferring.set(false)
                         cancelInference()
                         resetSentenceBuffer()
@@ -2429,7 +2462,7 @@ class VyzeCoreController(
                 }
             }
         }
-        mainHandler.postDelayed(watchdogRunnable, WATCHDOG_TIMEOUT_MS)
+        mainHandler.postDelayed(watchdogRunnable, watchdogBudgetMs)
 
         inferenceJob = scope.launch {
             try {
@@ -3063,7 +3096,7 @@ class VyzeCoreController(
          * fires within this window, the pipeline is force-reset to prevent
          * indefinite ANALYZING state.
          */
-        private const val WATCHDOG_TIMEOUT_MS = 15_000L
+        private const val WATCHDOG_TIMEOUT_MS = 15_000L  // legacy Tier-1 budget (now superseded by firstTokenWatchdogBudgetMs())
 
         /** Agent-path direct text generation timeout (native-watchdog parity). */
         private const val TEXT_QUERY_TIMEOUT_MS = 15_000L

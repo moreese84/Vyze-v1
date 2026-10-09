@@ -304,15 +304,23 @@ class LoadingFragment : Fragment() {
         try {
             val app = requireActivity().applicationContext as VyzeApplication
 
-            coreController = VyzeCoreController(
+            // REUSE the app-scoped controller across retries (do NOT rebuild it
+            // per attempt). Why: VlmEngineManager's 3-strike circuit breaker and
+            // failure counter live on the manager instance — a fresh controller
+            // per retry reset them to zero, so the breaker could NEVER trip and
+            // every tap re-ran the identical failing GPU init, re-allocating the
+            // engine's multi-GB memory each time (observed on Infinix Hot 60i as
+            // an endless error/retry loop until the OS killed the process).
+            // Reusing the instance keeps failure history, lets the circuit
+            // breaker open after 3 strikes, and the manager's early-return paths
+            // (already failed / already degraded) speak the friendly fallback
+            // instead of retrying.
+            coreController = app.coreController ?: VyzeCoreController(
                 context = requireContext().applicationContext,
                 ttsManager = app.ttsManager,
                 memoryDao = app.memoryDao,
                 interactionDao = app.interactionDao
-            )
-
-            // Store immediately so CameraFragment can reuse if it ever gets there
-            app.coreController = coreController
+            ).also { app.coreController = it }
 
             // Progress callback → update UI
             coreController?.onProgressUpdate = { percent, step ->
