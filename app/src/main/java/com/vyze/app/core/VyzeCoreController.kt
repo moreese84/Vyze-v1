@@ -1549,6 +1549,37 @@ class VyzeCoreController(
                 // pointing and continuous frames drop to the policy size;
                 // text and tap queries keep their OCR-quality dimensions —
                 // thermal heat is temporary, label readability is not.
+                // Tier-aware scene downscale (A) — CPU-vision tiers only.
+                // Runs BEFORE thermal policy so the effective ceiling is
+                // min(CPU_VISION_SCENE_DIM, thermal dim) when both apply.
+                val cpuVisionTier = when (vlmEngine.currentTier()) {
+                    DeviceTier.TIER_2, DeviceTier.TIER_3 -> true
+                    else -> false
+                }
+                if (cpuVisionTier && !isTextQuery && !isTapQuery &&
+                    inferenceBitmap.width > CPU_VISION_SCENE_DIM
+                ) {
+                    val dim = CPU_VISION_SCENE_DIM
+                    val previous = inferenceBitmap
+                    inferenceBitmap = try {
+                        vlmEngine.onInferenceLane {
+                            val size = minOf(previous.width, previous.height)
+                            val cx = (previous.width - size) / 2
+                            val cy = (previous.height - size) / 2
+                            val cropped = android.graphics.Bitmap.createBitmap(previous, cx, cy, size, size)
+                            val scaled = android.graphics.Bitmap.createScaledBitmap(cropped, dim, dim, true)
+                            if (scaled !== cropped) cropped.recycle()
+                            scaled
+                        }
+                    } catch (e: Throwable) {
+                        CrashLogFile.logError(TAG, "Tier downscale failed: ${e.message}", e)
+                        previous
+                    }
+                    if (inferenceBitmap !== previous && previous !== bitmap && !previous.isRecycled) {
+                        previous.recycle()
+                    }
+                    CrashLogFile.log(TAG, "Tier downscale: ${CPU_VISION_SCENE_DIM}px (CPU-vision)")
+                }
                 if (thermalPolicy.sceneImageDimension > 0 && !isTextQuery && !isTapQuery &&
                     inferenceBitmap.width > thermalPolicy.sceneImageDimension
                 ) {
@@ -1829,7 +1860,16 @@ class VyzeCoreController(
                 ) {
                     dialogueContextForPrompt()
                 } else null
-                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null})")
+                // B (lean): prompts get a shorter memory block on CPU-vision
+                // tiers (Tier 2/3). The session was started before this flag
+                // existed on the downscaled lane, so the lean decision repeats
+                // the same tier check the downscale gate used.
+                val cpuVisionPromptLean = !isTextQuery && runCatching {
+                    vlmEngine.currentTier()
+                }.getOrNull() in listOf(
+                    DeviceTier.TIER_2, DeviceTier.TIER_3
+                )
+                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null}, lean=$cpuVisionPromptLean)")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = taggedQuery ?: "User triggered a camera snapshot.",
                     queryOverride = taggedQuery,
@@ -1843,7 +1883,8 @@ class VyzeCoreController(
                     dateRulesMode = dateModeActive,
                     memoryContext = memoryContext,
                     brevityLevel = brevityLevel,
-                    dialogueContext = dialogueContext
+                    dialogueContext = dialogueContext,
+                    leanMode = cpuVisionPromptLean
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
@@ -3103,6 +3144,17 @@ class VyzeCoreController(
 
         /** Max dimension for continuous mode bitmap downsampling. */
         private const val CONTINUOUS_MAX_DIM = 256
+
+        /**
+         * Tier-aware scene resolution (A): Tier 2/3 run vision on CPU, where
+         * prefill time scales roughly with input pixels. 192px keeps scene (not
+         * text/tap) queries usable on the Infinix Hot-class reference devices —
+         * measured worst-case CPU image answer was 74–79s at 256px and the goal
+         * of the NLnet-funded latency work is roughly a 45s typical budget.
+         * Text and tap queries are NEVER downscaled here — OCR-quality pixel
+         * budget is preserved (thermal policy already handles those separately).
+         */
+        private const val CPU_VISION_SCENE_DIM = 192
         /**
          * If the model emits this many characters without sentence-ending
          * punctuation, flush anyway so speech never stalls mid-generation.

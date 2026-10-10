@@ -1663,6 +1663,12 @@ class VlmEngineManager(
     /** Human-readable device tier (for status lines / telemetry). */
     fun getDeviceTierName(): String = deviceProfile.tier.label
 
+    /**
+     * Raw tier value for callers that branch on it (tier-aware budgets,
+     * dimension presets). Never a UI string — use [getDeviceTierName] for that.
+     */
+    internal fun currentTier(): DeviceTier = deviceProfile.tier
+
     /** Full hardware profile summary (for logs / diagnostics screens). */
     fun getDeviceProfileSummary(): String = profileSummary(deviceProfile)
 
@@ -2179,9 +2185,18 @@ class VlmEngineManager(
         private const val IMAGE_DIMENSION_TIER2 = 384
         private const val IMAGE_DIMENSION_TIER3 = 256
 
-        /** Visual token budget caps (ExperimentalFlags) for image encoding on lower tiers. */
-        private const val VISUAL_TOKEN_BUDGET_TIER2 = 320
-        private const val VISUAL_TOKEN_BUDGET_TIER3 = 192
+        /**
+         * Visual token budget caps (ExperimentalFlags) for image encoding on
+         * lower tiers. C (tuned 2026-10-10 after commit 878f made CPU vision
+         * stable): Tier 2 320→256, Tier 3 192→160. Prefill encode time scales
+         * roughly linearly with visual tokens; on the 8 GB Tier-2 reference
+         * (Infinix Hot 60i) the 74–79 s worst-case answers overlap the window
+         * with A (192px input) — two axes, both trims, per the plan recorded
+         * before implementation. If answer quality regresses, back off to
+         * 320/192 — these are budgets, not correctness guarantees.
+         */
+        private const val VISUAL_TOKEN_BUDGET_TIER2 = 256
+        private const val VISUAL_TOKEN_BUDGET_TIER3 = 160
 
         /** CPU threads for the CPU-fallback backend (Tier 2 fallback / Tier 3). */
         private const val CPU_FALLBACK_THREADS = 4

@@ -35,7 +35,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         memoryContext: String? = null,
         textOnlyMode: Boolean = false,
         brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL,
-        dialogueContext: String? = null
+        dialogueContext: String? = null,
+        leanMode: Boolean = false
     ): String {
         return try {
             val sb = StringBuilder()
@@ -141,6 +142,22 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL -> { /* no adaptation */ }
             }
 
+            if (leanMode) {
+                // B (lean): condense the memory dialogue block. NO other
+                // section is trimmed — every directive above (language mirror,
+                // anti-echo, safety/refusal contracts, OCR ground-truth) is
+                // load-bearing and stays byte-identical.
+                if (!dialogueContext.isNullOrBlank()) {
+                    val head = dialogueContext.lines().take(6).joinToString("\n")
+                    sb.appendLine("Recent conversation (context only — never repeat, echo, or quote these lines):")
+                    sb.appendLine(head)
+                    sb.appendLine("Resolve 'it', 'that', 'the one' from the conversation above; answer the follow-up directly in the [OUTPUT LANGUAGE] tag's language. NEVER echo the user's question.")
+                    sb.appendLine()
+                } else {
+                    sb.appendLine("MEMORY: None. Answer from the fresh frame only.")
+                    sb.appendLine()
+                }
+            } else {
             // 2c-pre. DIALOGUE MEMORY — recent voice exchanges for follow-ups.
             //     Enables pronoun resolution across turns ("what about the one
             //     behind it?") and lets the model answer CONVERSATIONALLY
@@ -170,6 +187,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                     "ONLY what you now see — never repeat the prior description if it does not " +
                     "match the current image.")
                 sb.appendLine()
+            }
             }
 
             // 3. Task specification.
