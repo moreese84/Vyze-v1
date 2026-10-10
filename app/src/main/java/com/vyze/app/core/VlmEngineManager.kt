@@ -2229,9 +2229,17 @@ class VlmEngineManager(
         private const val MAX_TOKENS_TIER_CAP_TIER2 = 320
         private const val MAX_TOKENS_TIER_CAP_TIER3 = 256
 
-        /** Image pre-processing dimension cap per tier (vision-token memory ~quadratic). */
-        private const val IMAGE_DIMENSION_TIER2 = 384
-        private const val IMAGE_DIMENSION_TIER3 = 256
+        /**
+         * Image pre-processing dimension cap per tier (vision-token memory
+         * ~quadratic). Tuned 2026-10-10 (run 1+2): the profiling evidence
+         * (9890214) showed prefill is 94-99% of wall time, so the engine-side
+         * cap was aligned to what the controller actually feeds: Tier 2
+         * 384→256 ( Hot 60i receives 192px scenes — 384 only ever mattered
+         * for tap-lane 1024px frames, which get preprocessed to 256 now
+         * instead of 384), Tier 3 256→192 to match its 160-token budget.
+         */
+        private const val IMAGE_DIMENSION_TIER2 = 256
+        private const val IMAGE_DIMENSION_TIER3 = 192
 
         /**
          * Visual token budget caps (ExperimentalFlags) for image encoding on
@@ -2242,8 +2250,17 @@ class VlmEngineManager(
          * with A (192px input) — two axes, both trims, per the plan recorded
          * before implementation. If answer quality regresses, back off to
          * 320/192 — these are budgets, not correctness guarantees.
+         *
+         * RUN 1+2 (2026-10-10, post-profiling 9890214): Tier 2 256→128 — the
+         * profiling breakdown proved prefill dominates (94-99%), and the
+         * scene lane ("what's here?", user's most common ask) does NOT do
+         * brand/label reads by design; text/tap lanes route to the OCR path
+         * and keep their own full-quality pipeline, so a scene-lane token
+         * cut does not touch brand accuracy. Quality gate: if corpus/desktop
+         * sanity or user testing shows scene descriptions losing salient
+         * objects, revert to 256.
          */
-        private const val VISUAL_TOKEN_BUDGET_TIER2 = 256
+        private const val VISUAL_TOKEN_BUDGET_TIER2 = 128
         private const val VISUAL_TOKEN_BUDGET_TIER3 = 160
 
         /** CPU threads for the CPU-fallback backend (Tier 2 fallback / Tier 3). */
