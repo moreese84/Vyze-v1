@@ -143,7 +143,7 @@ abstract class VyzeDatabase : RoomDatabase() {
                         `frequency` TEXT NOT NULL,
                         `warnings` TEXT NOT NULL,
                         `category` TEXT NOT NULL,
-                        `searchName` TEXT NOT
+                        `searchName` TEXT NOT NULL
                     )"""
                 )
                 db.execSQL(
