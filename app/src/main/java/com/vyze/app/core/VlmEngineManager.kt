@@ -753,17 +753,20 @@ class VlmEngineManager(
                         backend = step.backend,
                         // VISION SEPARATION (2026-10-09, Infinix Hot 60i / Mali):
                         // on Mali-G57 class GPUs the vision-encoder path HANGS
-                        // indefinitely — first image inference produced no token
-                        // in 90 s (watchdog logs 09:32–09:34), while the text
-                        // path on the SAME GPU engine works and earlier sessions
-                        // produced full answers (memory DB: "gray refrigerator").
-                        // The vision encoder therefore always runs on CPU on
-                        // non-flagship tiers; image prefill on CPU is slower
-                        // per-token but PROGRESSES (it cannot hang the way the
-                        // Mali OpenCL vision path does). Text/decoder keeps the
-                        // tier's GPU where available. Tier 1 keeps vision on GPU
-                        // (flagship drivers are certified).
-                        visionBackend = if (tier == DeviceTier.TIER_1) step.backend else Backend.CPU(),
+                        // indefinitely at the ORIGINAL heavy settings (384px
+                        // input, 320-token budget) — first image inference
+                        // produced no token in 90 s. GPU-vision RETRY EXPERIMENT
+                        // (2026-10-10): the same GPU never got a chance at the
+                        // NEW light settings (controller feeds Tier 2 at 192px,
+                        // visualBudget 256) — ~75% fewer visual tokens than the
+                        // hang conditions. If GPU vision still hangs at this
+                        // weight the image watchdog kills the query and the CPU
+                        // vision path below (existing fallback chain) serves the
+                        // answer instead; if it responds, CPU prefill latency
+                        // (~68 s) drops to GPU speed. Revert this line to
+                        // `Backend.CPU()` unconditionally if the experiment
+                        // shows a hang-then-timeout pattern.
+                        visionBackend = step.backend,
                         // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
                         // separate from the text/vision path and loads on demand.
                         audioBackend = Backend.CPU(),
