@@ -6,7 +6,7 @@
 ![LiteRT-LM](https://img.shields.io/badge/LiteRT--LM-0.16.1-green)
 ![Google ADK](https://img.shields.io/badge/Google_ADK-Kotlin_0.2.0-4285F4?logo=google)
 ![Min SDK](https://img.shields.io/badge/Min%20SDK-26-orange)
-![License](https://img.shields.io/badge/License-Apache%202.0-blue)
+![License](https://img.shields.io/badge/License-GPLv3-blue?logo=gnu-bash)
 
 > **Vyze** is a fully offline AI vision assistant for visually impaired users. Powered by Gemma 4 E2B (2B parameter multimodal model) running on-device via Google's LiteRT-LM framework, with an agent-orchestration layer built on Google ADK for Kotlin. Zero internet dependency. Zero subscription costs. Works anywhere.
 
@@ -314,7 +314,12 @@ The promotion bar (≥30 attempts, ≥20 answered, ≥80% answer rate, declines 
 
 ## License
 
-Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE) for details.
+Licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+
+This project is free and open source software: you may use, study, share and
+improve it. Vision inference runs on Google's Gemma E2B weights via LiteRT-LM
+(Apache-2.0); model weights are obtained by opt-in download or sideload and are
+not redistributed from this repository.
 
 ---
 
