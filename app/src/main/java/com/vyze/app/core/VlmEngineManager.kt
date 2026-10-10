@@ -1018,14 +1018,22 @@ class VlmEngineManager(
         var scaledBitmap: Bitmap? = null
         try {
             val startTime = System.currentTimeMillis()
-            CrashLogFile.log(TAG, "=== ANALYZE IMAGE ===")
+            var tPreprocess = 0L
+            var tJpeg = 0L
+            var tPayload = 0L
+            var tLane = 0L
+            var tPrefill = 0L
+            var firstTokenAt = 0L
+            CrashLogFile.log(TAG, "=== ANALYZE IMAGE [PROFILED] ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
             // 1. Preprocess bitmap — proportional scale to the TIER-ADJUSTED
             //    target dimension (no center-crop; vision-token memory on
             //    lower tiers is bounded by the smaller dimension).
             val effectiveTarget = clampTargetDimension(targetDimension)
+            var stageStart = System.currentTimeMillis()
             scaledBitmap = preprocessBitmap(bitmap, effectiveTarget)
+            tPreprocess = System.currentTimeMillis() - stageStart
             CrashLogFile.log(
                 TAG,
                 "Preprocessed: ${scaledBitmap.width}x${scaledBitmap.height} " +
@@ -1033,17 +1041,21 @@ class VlmEngineManager(
             )
 
             // 2. Encode image to JPEG bytes
+            stageStart = System.currentTimeMillis()
             val imageBytes = bitmapToJpegBytes(scaledBitmap)
+            tJpeg = System.currentTimeMillis() - stageStart
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
             // 3. Build the user payload + Gemma 4 turn format.
             //    System directive is folded into the user turn (Gemma has no system role).
             //    User rules come from DynamicPromptBuilder inside the user payload.
+            stageStart = System.currentTimeMillis()
             val userPayload = buildUserPayload(prompt, memoryContext)
             val formattedPrompt = buildGemmaTurnPrompt(
                 userPayload,
                 SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
             )
+            tPayload = System.currentTimeMillis() - stageStart
             CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
 
             // 4. Build multimodal contents — formatted prompt text + clamped bitmap.
@@ -1057,8 +1069,38 @@ class VlmEngineManager(
             // 5. Shared inference core — conversation lifecycle, streaming, and
             //    interrupt-safe close all live in runConversation (one place for
             //    the image, text-only, and audio paths).
+            // PROFILING: the first onTokenGenerated arrival marks the end of
+            // PREFILL (image encode + prompt ingest + vision tower) and the
+            // start of DECODE — the boundary we have never been able to see
+            // from outside. tLane covers the mutex/drain wait inside
+            // runConversation; [PREFILL-T0] arrives from the callback below.
+            stageStart = System.currentTimeMillis()
+            val firstTokenFlag = booleanArrayOf(false)
+            val outerCallback = onTokenGenerated
+            onTokenGenerated = { token, sid ->
+                if (!firstTokenFlag[0] && sid == sessionId) {
+                    firstTokenFlag[0] = true
+                    firstTokenAt = System.currentTimeMillis()
+                    tPrefill = firstTokenAt - (startTime + tPreprocess + tJpeg + tPayload + tLane)
+                    CrashLogFile.log(
+                        TAG,
+                        "[PIPELINE-BREAKDOWN] preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
+                            "payload=${tPayload}ms lane-wait=${tLane}ms " +
+                            "PREFILL=${tPrefill}ms DECODE=${firstTokenAt - startTime - tPrefill - tLane}ms-so-far"
+                    )
+                }
+                outerCallback?.invoke(token, sid)
+            }
             val response = runConversation(contents, maxTokens, sessionId)
+            tLane = System.currentTimeMillis() - stageStart -
+                (if (firstTokenFlag[0]) (System.currentTimeMillis() - firstTokenAt) else 0)
             val elapsed = System.currentTimeMillis() - startTime
+            CrashLogFile.log(
+                TAG,
+                "[ANALYZE-BREAKDOWN] total=${elapsed}ms preprocess=${tPreprocess}ms " +
+                    "jpeg=${tJpeg}ms payload=${tPayload}ms lane-wait=${tLane}ms " +
+                    "prefill(firstToken)=${tPrefill}ms decode-first-token=EOF"
+            )
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
             response
 
