@@ -1505,6 +1505,26 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "=== TRIGGER SNAPSHOT (session=$currentSessionId) ===")
                 CrashLogFile.log(TAG, "Bitmap: ${bitmap.width}x${bitmap.height}")
 
+                // ── DEAD-AIR FILLER (perceived latency) ──────────
+                // Prefill is compute-bound (~60s on Tier 2 even after the
+                // A/B/C/Backend work). Left unacknowledged, the user hears
+                // SECONDS of silence with no signal that the app even
+                // captured — the single-worst perceived-latency failure.
+                // Speak a localized 2-word acknowledgement immediately.
+                // QUEUE_ADD (not FLUSH): never clips an in-flight answer or
+                // status utterance. VLM lane only — OCR reads/color/light
+                // answer in their own fast time and don't need a filler.
+                if (!isTextQuery) {
+                    ttsManager.speakQueued(
+                        ttsManager.localized(
+                            "Let me look.",
+                            "Sekejap, saya tengok.",
+                            "我看一下。"
+                        )
+                    )
+                    CrashLogFile.log(TAG, "Dead-air filler spoken at capture")
+                }
+
                 CrashLogFile.log(TAG, "Querying similar interactions (async)...")
 
                 val similarInteractionsDeferred = async(Dispatchers.IO) {

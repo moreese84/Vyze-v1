@@ -252,9 +252,12 @@ class VlmEngineManager(
             // Qualcomm Snapdragon 8-series SoC identifiers
             "sm8", "sdm8", "msmn8", "qcs8", "msmnile", "kona", "lahaina",
             "taro", "kalama", "pineapple", "sun",
-            // MediaTek Dimensity 8000/9000 series
+            // MediaTek Dimensity 8000/9000 series (mt6899 = Dimensity 8400/
+            // 8400-Ultimate — Infinix GT 50 Pro class; verified 2026-10-10
+            // that this SoC was falling through to Tier 2 and running
+            // throttled budgets it does not need)
             "mt6983", "mt6985", "mt6989", "mt6893", "mt6895", "mt6896",
-            "mt6879", "mt6886",
+            "mt6991", "mt6899", "mt6879", "mt6886",
             // Google Tensor
             "tensor", "gs101", "gs201", "zuma", "zumapro"
         )
