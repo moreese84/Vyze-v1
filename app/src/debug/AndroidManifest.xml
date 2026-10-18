@@ -111,6 +111,16 @@
             android:exported="true" />
 
         <!--
+            #3165 repeat-query probe (debug only): fires the same question N
+            times as separate Conversations on the shared engine to reproduce
+            the model card's recurrent-state contamination finding. No
+            release counterpart.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.RepeatQueryProbeReceiver"
+            android:exported="true" />
+
+        <!--
             Sticky brain override restore (debug only): same discipline as
             the pre-gate/gemma-always sticky providers — survives OEM kills
             during test cycles. Stub provider; does not exist in release
@@ -119,6 +129,19 @@
         <provider
             android:name="com.vyze.app.debug.BrainStickyProvider"
             android:authorities="${applicationId}.debug.brainsticky"
+            android:exported="false" />
+
+        <!--
+            #3165 repeat-query probe provider (debug only): content
+            providers run at process start (manifest broadcasts to a
+            cached/background app never dispatched on this Android 16
+            target), so the probe arms here when repeat_probe_times is
+            present in vyze_debug_flags.xml. Stub provider — no
+            authorities, nothing queryable.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.RepeatQueryProbeProvider"
+            android:authorities="${applicationId}.debug.repeatqueryprobe"
             android:exported="false" />
 
         <!--

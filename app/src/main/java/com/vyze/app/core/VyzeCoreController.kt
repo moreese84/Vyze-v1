@@ -66,7 +66,10 @@ class VyzeCoreController(
     private var inferenceJob: kotlinx.coroutines.Job? = null
 
     private val memoryRepository = MemoryRepository(interactionDao)
-    private val vlmEngine = VlmEngineManager(context, memoryRepository)
+    // internal (not private): the DEBUG-ONLY RepeatQueryProbeReceiver fires
+    // same-question repeats on the shared engine to reproduce LiteRT-LM
+    // #3165; release builds never reach this debug receiver.
+    internal val vlmEngine = VlmEngineManager(context, memoryRepository)
     private val promptBuilder = DynamicPromptBuilder(memoryDao)
     private val ocrHelper = OcrHelper()
     private val barcodeHelper = BarcodeHelper()
