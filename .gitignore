@@ -96,3 +96,11 @@ tools/*
 # commands write to root-level corpus/; tools/jev_harness/corpus/ is
 # covered by its own .gitignore.
 /corpus/
+
+# Local-only working documents (2026-10-18, owner instruction): internal
+# design/pitch material and AI-review tool state stay OUT of the repo —
+# do not push unrelated or sensitive info to GitHub.
+/DESIGN.md
+/PRODUCT.md
+/pitch/
+/.impeccable/
