@@ -632,6 +632,16 @@ class MainActivity : AppCompatActivity() {
      * MUST be called with NO active SpeechRecognizer (mic contention).
      */
     private fun startGemmaPrimaryCapture(core: VyzeCoreController) {
+        // Safety check: if brain doesn't support audio, fall back to error handling
+        if (!core.brainSupportsAudioInput()) {
+            Log.w(TAG, "GEMMA-PRIMARY requested but brain has no audio support; treating as nothing understood")
+            mainHandler.post {
+                if (voiceSessionWanted) {
+                    onSpeechError?.invoke("I didn't catch that — tap the mic to try again")
+                }
+            }
+            return
+        }
         isListening = true
         lastPartialText = ""
         Log.i(TAG, "OFFLINE voice: Gemma-primary capture (no cloud recognizer)")
@@ -1239,6 +1249,7 @@ class MainActivity : AppCompatActivity() {
                     deviceOffline = offline,
                     engineReady = core != null && core.isEngineReady(),
                     engineIdle = core == null || !core.isCurrentlyInferring(),
+                    brainSupportsAudioInput = core?.brainSupportsAudioInput() ?: true,
                 )
                 if (engine == VoiceEnginePolicy.Engine.GEMMA_PRIMARY && core != null) {
                     if (noisePaused) {

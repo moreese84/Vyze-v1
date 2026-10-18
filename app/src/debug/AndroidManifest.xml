@@ -79,6 +79,49 @@
             android:exported="false" />
 
         <!--
+            CPU thread-count toggle (debug only): overrides the CPU backend
+            thread count for the XNNPack thread-scaling experiment on
+            device (same scene, one cold restart per value, no rebuild).
+            Process-local + sticky within debug builds; release always uses
+            the tier default formula.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.CpuThreadsToggleReceiver"
+            android:exported="true" />
+
+        <!--
+            Sticky CPU thread override restore (debug only): same discipline
+            as the pre-gate/gemma-always sticky providers — survives OEM
+            kills during test cycles. Stub provider; does not exist in
+            release builds.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.CpuThreadsStickyProvider"
+            android:authorities="${applicationId}.debug.cputhreadssticky"
+            android:exported="false" />
+
+        <!--
+            Brain toggle (debug only): forces which .litertlm brain the VLM
+            engine loads (minicpm | gemma | auto) for corridor A/B sessions.
+            Process-local + sticky within debug builds; release always uses
+            production auto-resolution.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.BrainToggleReceiver"
+            android:exported="true" />
+
+        <!--
+            Sticky brain override restore (debug only): same discipline as
+            the pre-gate/gemma-always sticky providers — survives OEM kills
+            during test cycles. Stub provider; does not exist in release
+            builds.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.BrainStickyProvider"
+            android:authorities="${applicationId}.debug.brainsticky"
+            android:exported="false" />
+
+        <!--
             Auto-export provider (debug only). initOrder default; no
             authorities — every stub method returns null/0, nothing can
             query it. Multiprocess=false (default) keeps the export in the

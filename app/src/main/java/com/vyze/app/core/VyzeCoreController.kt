@@ -205,6 +205,13 @@ class VyzeCoreController(
     @Volatile
     private var firstChunkSent = false
 
+    // ── Local performance telemetry (privacy-safe; V1) ────────────
+    // One row per completed/failed VLM inference: task-type bucket,
+    // active backend, latency, failure kind. NO task text, NO image or
+    // content of any kind leaves the device (see VyzeLocalTelemetry).
+    private var snapshotStartMs = 0L
+    private var snapshotTaskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.SCENE_DIRECT
+
     /**
      * Playback-aware batching gate (Phase 2): true once the most recently
      * posted chunk utterance has STARTED playing — or failed/dropped (never
@@ -413,6 +420,10 @@ class VyzeCoreController(
                 isInferring.set(false)
             } else {
                 Log.e(TAG, "onError: session=$sessionId error=$error")
+                recordTelemetry(
+                    success = false,
+                    failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN,
+                )
                 flushRemainingSentenceBuffer()
                 isInferring.set(false)
                 mainHandler.post {
@@ -520,6 +531,7 @@ class VyzeCoreController(
                 isInferring.set(false)
             } else {
                 CrashLogFile.log(TAG, "onComplete fired: session=$sessionId, ${fullResponse.length} chars")
+                recordTelemetry(success = true)
                 try {
                     // ── REPETITION-LOOP GUARD (net at onComplete) ────
                     // Tokens may have arrived faster than the streaming
@@ -656,6 +668,14 @@ class VyzeCoreController(
                     // Rebind on every readiness report (model reload
                     // (resetSession re-init) re-lands on the fresh engine).
                     bindMasterAgentLane()
+                    // Eager warm-up: prime the pipeline so first real tap feels responsive
+                    scope.launch {
+                        try {
+                            withContext(kotlinx.coroutines.Dispatchers.Default) {
+                                analyzeTextDirect("hi", "warmup")
+                            }
+                        } catch (_: Throwable) {}
+                    }
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
                     mainHandler.post {
@@ -1322,6 +1342,10 @@ class VyzeCoreController(
         val currentSessionId = activeSessionId
 
         resetSentenceBuffer()
+
+        // ── TELEMETRY ARM: task bucket + latency clock start ──────
+        snapshotTaskType = taskTypeForTelemetry(query)
+        snapshotStartMs = System.currentTimeMillis()
 
         // ── Dynamic Resolution Scaling ──────────────────────────
         // Text-extraction queries ("read", "label", etc.) and tap queries
@@ -2101,6 +2125,18 @@ class VyzeCoreController(
                     }
                 }
 
+            } catch (e: CancellationException) {
+                // WATCHDOG/SILENT-CANCELLATION DISCIPLINE (2026-10-18): a
+                // watchdog force-reset cancels THIS coroutine by design and
+                // already reported "Inference timed out"; scope teardown
+                // (session switch) cancels it too. Landing here with the raw
+                // exception turns a deliberate stop into a user-visible
+                // "Inference crashed: JobCancellationException: Standalone-
+                // Coroutine was cancelled" (observed mid-prefill CPU kills) —
+                // end SILENTLY instead. Non-cancellation failures below.
+                CrashLogFile.log(TAG, "Snapshot inference cancelled (${e.message}) — deliberate stop, silent end")
+                isInferring.set(false)
+                flushRemainingSentenceBuffer()
             } catch (e: Throwable) {
                 CrashLogFile.logError(TAG, "Snapshot trigger FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
                 // ALWAYS reset isInferring + flush buffer — prevents stuck ANALYZING
@@ -2444,6 +2480,13 @@ class VyzeCoreController(
                     // and dialogue memory carries the prior expansions.
                     recordDialogueTurn("more detail", response)
                 }
+            } catch (e: CancellationException) {
+                // Same discipline as the snapshot lane: watchdog force-reset
+                // or scope teardown — reported already (or nothing to report),
+                // never a raw "Inference crashed: StandaloneCoroutine ...".
+                CrashLogFile.log(TAG, "Expanded-answer inference cancelled (${e.message}) — deliberate stop, silent end")
+                isInferring.set(false)
+                flushRemainingSentenceBuffer()
             } catch (e: Throwable) {
                 CrashLogFile.logError(TAG, "Expanded answer FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
                 isInferring.set(false)
@@ -2630,6 +2673,13 @@ class VyzeCoreController(
                     // Completion (speak + IDLE) fires via the shared onComplete
                     // callback with session gating — same as image responses.
                 }
+            } catch (e: CancellationException) {
+                // Same discipline as the snapshot lane: watchdog force-reset
+                // or scope teardown — reported already (or nothing to report),
+                // never a raw "Inference crashed: StandaloneCoroutine ...".
+                CrashLogFile.log(TAG, "Text-query inference cancelled (${e.message}) — deliberate stop, silent end")
+                isInferring.set(false)
+                flushRemainingSentenceBuffer()
             } catch (e: Throwable) {
                 CrashLogFile.logError(TAG, "Text query FAILED: ${e.javaClass.simpleName}: ${e.message}", e)
                 isInferring.set(false)
@@ -2772,6 +2822,63 @@ class VyzeCoreController(
         Log.d(TAG, "cancelAndReset: pipeline fully reset")
     }
 
+    // ── Local performance telemetry helpers (privacy-safe; V1) ───────────
+
+    /**
+     * Map a query into the telemetry TASK bucket (checklist item 6). Read-
+     * family asks route via the OCR-first router buckets; everything else —
+     * scene/object/tap — is the scene lane (image goes to the engine).
+     */
+    private fun taskTypeForTelemetry(query: String?): String {
+        val task = when (com.vyze.app.performance.VyzePerformanceRouter.classifyIntent(query)) {
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.ReadText,
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.ReadLabel,
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.ReadDocument,
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.ReadBarcode,
+            -> com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.OCR_FIRST
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.SceneDescribe ->
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.SCENE_DIRECT
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.SceneObject ->
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.VLM_IMAGE
+            is com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.Knowledge ->
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.TEXT_ONLY
+            com.vyze.app.performance.VyzePerformanceRouter.TaskIntent.Unknown ->
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.SCENE_DIRECT
+        }
+        return task
+    }
+
+    /**
+     * One innocent CSV row (local-only, no network — VyzeLocalTelemetry is
+     * the same guarantee as ReportManager: OS share sheet or nothing).
+     *
+     * One-shot guard: [snapshotStartMs] is armed ONLY by the image lane
+     * [triggerSnapshot]; it is cleared as it is consumed, so text-only and
+     * other lanes (which never arm it) can never emit rows with a stale
+     * task type or a bogus latency.
+     */
+    private fun recordTelemetry(success: Boolean, failureKind: String = "") {
+        val startMs = snapshotStartMs
+        snapshotStartMs = 0L
+        if (startMs <= 0L) return
+        try {
+            val latencyMs = (System.currentTimeMillis() - startMs).coerceAtLeast(0L)
+            com.vyze.app.performance.VyzeLocalTelemetry.record(
+                context = context,
+                taskType = snapshotTaskType,
+                backend = getEngineBackend().lowercase().ifBlank {
+                    com.vyze.app.performance.VyzePerformanceConfig.TelemetryBackend.NONE
+                },
+                latencyMs = latencyMs,
+                success = success,
+                failureKind = failureKind,
+            )
+            com.vyze.app.performance.VyzeLocalTelemetry.flushIfNeeded(context)
+        } catch (_: Throwable) {
+            // Telemetry must never affect the user's answer path.
+        }
+    }
+
     // ── Language Mirroring ────────────────────────────────────────
 
     /**
@@ -2838,9 +2945,21 @@ class VyzeCoreController(
 
     fun getPromptBuilder(): DynamicPromptBuilder = promptBuilder
     fun getStorageSettingsIntent(): android.content.Intent? = vlmEngine.buildStorageSettingsIntent()
-    fun isEngineReady(): Boolean = engineReady
+    fun isEngineReady(): Boolean = engineReady && !vlmEngine.isSessionResetting()
+    /** Whether the currently loaded brain supports audio input. */
+    fun brainSupportsAudioInput(): Boolean = vlmEngine.brainSupportsAudioInput()
+
+    /** Check if currently inferring. */
     fun isCurrentlyInferring(): Boolean = isInferring.get()
     fun getEngineBackend(): String = vlmEngine.getActiveBackend()
+
+    /**
+     * Device tier of the active hardware profile (the performance layer's
+     * low-RAM auto-tuning decision input). Internal tier enum stays behind the
+     * controller boundary on purpose — the degradation layer must not reach
+     * into the engine directly.
+     */
+    internal fun currentDeviceTier(): DeviceTier = vlmEngine.currentTier()
     fun getActiveSessionId(): String = activeSessionId
 
     fun isStreamingActive(): Boolean = firstChunkSent
@@ -2861,11 +2980,19 @@ class VyzeCoreController(
     // ── Lifecycle ──────────────────────────────────────────────────
 
     fun resetSessionState() {
-        Log.d(TAG, "resetSessionState: clearing debounce + pending + engine session")
+        Log.d(TAG, "resetSessionState: clearing debounce + pending (engine session KEPT)")
         lastDescribedObject = ""
         lastDescribedTime = 0L
         resetSentenceBuffer()
-        vlmEngine.resetSession()
+        // DO NOT call vlmEngine.resetSession() here. Measured on-device
+        // (2026-10-17): that full engine teardown+reinit costs ~20-25 s on the
+        // MiniCPM brain (CPU backend), and CameraFragment.onResume invoked it
+        // on EVERY entry — destroying the just-initialized engine before the
+        // user could tap, then leaving every early tap dead-silent ("AI model
+        // not ready", never spoken). Tap prompts are self-contained and each
+        // analyzeImage run creates a fresh Conversation, so the engine holds no
+        // stale dialogue: the teardown bought nothing on resume. If a heavy
+        // reset is ever needed, call vlmEngine.resetSession() explicitly.
     }
 
     fun destroy() {

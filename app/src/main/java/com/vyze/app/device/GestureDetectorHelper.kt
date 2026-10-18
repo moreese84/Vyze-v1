@@ -60,22 +60,33 @@ class GestureDetectorHelper(
 
         when {
             tapCount >= 3 -> {
-                // Triple tap detected (confirmed single tap is the 3rd)
-                // Start hold detection — SOS will fire if finger stays down
+                // Third tap within the window: this is a triple-tap sequence.
+                // The gesture-map contract (v2) is: 3rd tap = color analysis
+                // (triple tap) and, with a hold, SOS. A plain third-tap
+                // release does NOT also suppress the single-tap action on the
+                // prior tap — the prior tap is a complete, handled gesture.
+                //
+                // If this third tap was a hold, the hold detection (started
+                // on ACTION_DOWN/ACTION_UP transitions elsewhere) fires SOS.
+                // We start the hold timer so the hold path is armed; the
+                // hold thread will fire after TRIPLE_TAP_HOLD_THRESHOLD_MS if
+                // the finger is still down. (Hold is wired via the onTouchEvent
+                // ACTION_DOWN track below.)
                 isThirdTapHeld = true
                 thirdTapDownTime = SystemClock.uptimeMillis()
                 handler.postDelayed(sosRunnable, TRIPLE_TAP_HOLD_THRESHOLD_MS)
 
-                // Fire triple-tap immediately (color analysis)
+                // Fire triple-tap color analysis (this is the 3rd distinct
+                // release gesture).
                 onTripleTap()
                 return true
             }
-            tapCount == 2 -> {
-                // Second tap confirmed — wait for possible third
-                return true
-            }
             else -> {
-                // Single tap
+                // 1st or 2nd tap in the window is a plain single-tap gesture.
+                // The second-tap 'wait for possible third' no-op branch was a
+                // bug: a second isolated tap in the window had to pass through
+                // the whole tap-count chain, so the engine only woke after three
+                // taps. Now every isolated confirmed-tap gesture fires.
                 onSingleTap(e)
                 return true
             }

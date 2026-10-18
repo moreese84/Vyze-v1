@@ -426,6 +426,13 @@ class CameraFragment : Fragment() {
     private var lastTriggerTime = 0L
     private val TRIGGER_DEBOUNCE_MS = 1000L
 
+    /** Throttle for the 'brain still waking' spoken notices (drops repeat spam
+     *  when an impatient user taps several times while the VLM loads). */
+    private var lastWakingUpNoticeMs = 0L
+    /** Throttle for the 'engine busy' spoken notice. */
+    private var lastBusyNoticeMs = 0L
+    private val STATUS_NOTICE_REPEAT_MS = 6000L
+
     /**
      * Atomic capture lock — prevents re-entry during the async window
      * between takeSnapshot() start and onBitmap/onError callback.
@@ -617,7 +624,14 @@ class CameraFragment : Fragment() {
                     }
                     appState = AppState.IDLE
                     updateStatus("Error: $error")
-                    Log.e(TAG, "VLM error (not spoken to user): $error")
+                    Log.e(TAG, "VLM error: $error")
+                    // SAFETY NET (blind-first): if a tap raced a session reset
+                    // and reached a dead engine, inference fails async with
+                    // "AI model not ready". The throttle inside keeps repeated
+                    // errors from spamming speech.
+                    if (error.contains("AI model not ready", ignoreCase = true)) {
+                        maybeSpeakBrainWaking()
+                    }
                     // ── VOICE-QUERY RECOVERY ────────────────────────
                     // A voice query that dies (null model response, timeout,
                     // crash) must NEVER end in silence — the user is waiting
@@ -1264,6 +1278,14 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "VLM not ready yet")
             isCapturing.set(false)
             updateStatus("Model still loading...")
+            // BLIND-FIRST RULE: updateStatus is visual-only, so a silently
+            // dropped tap reads as a dead app to a blind user (reported:
+            // "engine wakes only after the third tap" with the new brain —
+            // the longer adaptive-backend load window made every early tap
+            // a silent no-op). Speak why nothing happened, throttled, and
+            // restore IDLE so the barge-in ANALYZING claim doesn't leak.
+            maybeSpeakBrainWaking()
+            if (appState == AppState.ANALYZING) appState = AppState.IDLE
             return
         }
 
@@ -1271,6 +1293,7 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "Engine busy — ignoring")
             isCapturing.set(false)
             updateStatus("Already analyzing...")
+            maybeSpeakEngineBusy()
             return
         }
 
@@ -2804,6 +2827,36 @@ class CameraFragment : Fragment() {
                 fragmentCameraBinding.statusText.text = text
             }
         }
+    }
+
+    /** Spoken (throttled) notice for taps landing while the brain is still
+     *  loading — replaces the silent drop for blind users. */
+    private fun maybeSpeakBrainWaking() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastWakingUpNoticeMs < STATUS_NOTICE_REPEAT_MS) return
+        lastWakingUpNoticeMs = now
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                "The camera brain is still waking up. Give it a few more seconds, then tap again.",
+                "Otak kamera masih bangun. Tunggu beberapa saat lagi, kemudian ketik sekali lagi.",
+                "摄像头大脑还在启动。请稍等几秒，再点击一次。"
+            )
+        )
+    }
+
+    /** Spoken (throttled) notice for taps landing while an inference is in
+     *  flight — blind users previously got haptics but no sound. */
+    private fun maybeSpeakEngineBusy() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastBusyNoticeMs < STATUS_NOTICE_REPEAT_MS) return
+        lastBusyNoticeMs = now
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                "Still answering the previous request. Try again in a moment.",
+                "Masih menjawab permintaan sebelumnya. Cuba lagi sebentar.",
+                "还在回答上一个请求。请稍后再试。"
+            )
+        )
     }
 
     companion object {

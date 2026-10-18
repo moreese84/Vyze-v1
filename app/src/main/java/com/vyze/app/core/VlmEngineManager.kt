@@ -1,4 +1,5 @@
 package com.vyze.app.core
+import com.vyze.app.performance.VyzeAdaptiveBackend
 import com.vyze.app.util.CrashLogFile
 
 import android.app.ActivityManager
@@ -52,8 +53,13 @@ import java.util.concurrent.TimeUnit
  * On-device VLM engine wrapper using Google's LiteRT-LM framework.
  *
  * ## Model
- * Gemma 4 E2B (Edge 2 Billion) — multimodal vision-language model.
- * File: gemma-4-E2B-it.litertlm (2.59 GB) — generic variant with vision encoder
+ * SWAPPABLE BRAIN (see [BrainModel]): MiniCPM-V-4.7-1B (int8vis, 1.70 GB) is the
+ * ONLY production brain (owner decision 2026-10-16, single-model rule: no phone
+ * carries two brains). gemma-4-E2B-it.litertlm (2.59 GB) is debug-corridor A/B
+ * only — production never auto-loads it. Both load through the same LiteRT-LM
+ * engine below — per-brain differences (turn format, backend plan, image feed
+ * floor, audio capability, experimental flags) resolve through [BrainModel],
+ * never hardcoded here.
  *
  * ## Hardware Acceleration — TIERED ENGINE INITIALIZATION STRATEGY
  * The device is classified ONCE at startup into a hardware tier from
@@ -138,6 +144,53 @@ class VlmEngineManager(
      * memory-pressure thresholds and MTP gating for this session.
      */
     private val deviceProfile: DeviceProfile by lazy { detectDeviceProfile() }
+
+    /**
+     * The brain bound to the CURRENT engine lifecycle. Set once in [initialize]
+     * (production default per [BrainModel.PROD_DEFAULT]; debug
+     * override via [brainOverride]) and kept across [resetSession] so a
+     * mid-session reinit can never hot-swap brains. Every inference seam
+     * (turn format, feed dimensions, audio capability, experimental flags)
+     * reads from here.
+     */
+    @Volatile
+    private var activeBrain: BrainModel? = null
+
+    /** Brain for inference-time seams; prod default until init resolves the file. */
+    private fun brainForTurn(): BrainModel = activeBrain ?: BrainModel.PROD_DEFAULT
+
+    /**
+     * Choose the brain for THIS engine lifecycle:
+     *  1. Debug-forced ([brainOverride] — BrainToggleReceiver): return it and
+     *     let a missing file fail LOUDLY (forced means corridor A/B, not
+     *     fallback).
+     *  2. Otherwise: PROD_DEFAULT — the ONLY production brain. A missing file
+     *     is a loud not-found error naming the file the fleet needs;
+     *     there is deliberately NO auto-fallback to a second model.
+     */
+    private fun resolveBrainForInit(): BrainModel {
+        brainOverride?.let { forced ->
+            CrashLogFile.log(TAG, "Brain FORCED by debug selector: ${forced.displayName} (missing file = loud failure)")
+            return forced
+        }
+        CrashLogFile.log(TAG, "Brain resolved: ${BrainModel.PROD_DEFAULT.displayName} (production default)")
+        return BrainModel.PROD_DEFAULT
+    }
+
+    /** True when [brain]'s file is present in a resolved location with a sane size. */
+    private fun modelFileExistsFor(brain: BrainModel): Boolean {
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (downloadsDir != null) {
+            val f = File(downloadsDir, brain.fileName)
+            if (f.exists() && f.length() > MIN_MODEL_SIZE) return true
+        }
+        val externalDir = context.getExternalFilesDir(null)
+        if (externalDir != null) {
+            val f = File(externalDir, brain.fileName)
+            if (f.exists() && f.length() > MIN_MODEL_SIZE) return true
+        }
+        return false
+    }
 
     /**
      * Friendly fallback message (spoken as TTS by the controller) when VLM
@@ -440,7 +493,7 @@ class VlmEngineManager(
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) return@withContext true
 
-        CrashLogFile.log(TAG, "=== INIT START (Gemma 4 E2B, tiered) ===")
+        CrashLogFile.log(TAG, "=== INIT START (tiered) ===")
 
         // ── Tier 0: VLM bypassed entirely (< ~4GB RAM) ───────────────
         // Keep fast-path tools (OCR, haptics, light check, color analysis)
@@ -505,19 +558,33 @@ class VlmEngineManager(
         CrashLogFile.log(TAG, "RAM: ${freeMB}MB free, lowRam=$isLowRamDevice")
 
         try {
-            Log.i(TAG, "Starting Gemma 4 E2B initialization [tier=${deviceProfile.tier.label}]...")
+            // Step -1: Drop the unrestorable MASTER program caches BEFORE any
+            // build. Every GPU attempt appends ~246 MB of unusable copies
+            // (restore fails with DATA_LOSS on every cold launch — upstream
+            // litert-lm/ml-drift bug) and three launches grew the file
+            // 993 MB → 1.5 GB on this device. Deleting bounds storage to one
+            // build generation; the small working caches (vision encoder /
+            // mtp drafter / xnnpack) are kept.
+            cleanupUnrestorableProgramCaches()
 
             // Step 0: Ensure native library is loaded
             CrashLogFile.log(TAG, "Step 0: Loading native library")
             ensureNativeLibLoaded()
 
-            // Step 1: Resolve model file
+            // Step 1: Resolve brain + model file. Single brain — MiniCPM is
+            // the only production brain (owner decision); its missing file is
+            // a LOUD not-found error, never a fallback to a second model.
+            // Debug selector can force a different brain for corridor A/B.
             onStepProgress?.invoke(10, "Resolving model file...")
             CrashLogFile.log(TAG, "Step 1: Resolving model file")
 
-            val modelFile = resolveModelFile()
+            val brain = resolveBrainForInit()
+            activeBrain = brain
+            Log.i(TAG, "Starting brain init [${brain.displayName}, tier=${deviceProfile.tier.label}]...")
+
+            val modelFile = resolveModelFile(brain)
             if (modelFile == null) {
-                val errorMsg = buildModelNotFoundError()
+                val errorMsg = buildModelNotFoundError(brain)
                 Log.e(TAG, errorMsg)
                 CrashLogFile.logError(TAG, errorMsg)
                 onError?.invoke(errorMsg, "")
@@ -525,29 +592,154 @@ class VlmEngineManager(
             }
 
             Log.i(TAG, "Model resolved: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
-            CrashLogFile.log(TAG, "Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)}MB)")
+            CrashLogFile.log(TAG, "Brain: ${brain.displayName} | Model: ${modelFile.absolutePath} (${modelFile.length() / (1024 * 1024)}MB)")
 
             // Step 2: Walk the tier's backend plan (GPU → CPU per tier).
             // NPU is skipped — the Gemma 4 E2B generic model does not ship with
             // TF_LITE_PREFILL_DECODE for NPU, so NPU init always fails and
             // wastes 5-10s on mid-tier Dimensity/Snapdragon devices.
+            // ── ADAPTIVE BACKEND POLICY (persisted calibration) ──────
+            // Checklist item 3: read what this exact device/store learned
+            // last time. A persisted overtemp-gated CPU-only verdict (or a
+            // stale GPU preference) skips GPU attempts entirely — the
+            // one build adapts; nothing is hard-coded per vendor.
+            // The persisted gate now lives INSIDE backendPlanFor so the
+            // resetSession path follows the same verdict as the cold path.
             val tier = deviceProfile.tier
-            val plan = backendPlanFor(tier)
-            CrashLogFile.log(TAG, "Backend plan [$tier]: ${plan.joinToString(" → ") { it.backendName }}")
+            var plan = backendPlanFor(brain, tier)
+            CrashLogFile.log(TAG, "Backend plan [${brain.displayName}, $tier]: ${plan.joinToString(" → ") { it.backendName }}")
+
+            // ── CPU-FIRST / BACKGROUND GPU SWAP ───────────────────────
+            // When the device memory remembers GPU (calibrated, fresh, no
+            // backoff), the blocking GPU attempt (≈90 s OpenCL compile on
+            // MT6899) is DEFERRED: CPU builds first (~10 s) and serves
+            // queries immediately; a background job builds the GPU engine
+            // with the same crash-guards, warms it, records the adaptive
+            // verdict, and the engines swap at the first quiet instant.
+            // UNCALIBRATED devices keep the synchronous GPU→CPU calibration
+            // trial — verdicts must be learned before they can be deferred.
+            val deferredGpu = plan.firstOrNull { it.backendName.equals("GPU", true) } != null &&
+                rememberedBackendPrefersGpu()
+            if (deferredGpu) {
+                CrashLogFile.log(
+                    TAG,
+                    "Adaptive CPU-first: remembered GPU verdict — CPU starts NOW, " +
+                        "GPU engine builds in the background and swaps in"
+                )
+            }
 
             for ((index, step) in plan.withIndex()) {
+                if (deferredGpu && step.backendName.equals("GPU", true)) {
+                    // Deferred, not skipped: the verdict + swap happen in
+                    // [launchBackgroundGpuBuild] once CPU serves.
+                    continue
+                }
                 onStepProgress?.invoke(30 + index * 10, progressMessageFor(step))
-                val ok = createEngineGuarded(modelFile, step, tier)
+                val ok = createEngineGuarded(brain, modelFile, step, tier)
                 if (ok) {
                     // Warm-up — pre-compile GPU kernels / warm the CPU decoder
                     onStepProgress?.invoke(75, "Sharpening my focus (this takes a moment)...")
                     CrashLogFile.log(TAG, "Step 3: Engine warm-up (dummy inference) [${step.backendName}]...")
-                    warmUp()
+                    val warmupLatencyMs = warmUp()
+
+                    // ── STARTUP CALIBRATION VERDICT ───────────────────
+                    // Checklist item 3: latency of the fixed warm-up pass +
+                    // RAM delta decides whether THIS backend is persisted as
+                    // this device's best config.
+                    // OWNER POLICY (2026-10-17, supersedes the v1
+                    // "unhealthy-but-initialized still serves this session"):
+                    // an UNHEALTHY GPU backend does NOT serve the session — a
+                    // blind user must not spend 16 s per answer (measured
+                    // 16375ms GPU vs 2073ms CPU on this X6891) because the
+                    // engine technically built. Unhealthy GPU = failed step:
+                    // record the device memory, tear down the sick engine,
+                    // and let CPU serve (also freeing the engine's VRAM).
+                    var acceptStep = true
+                    try {
+                        val ramMB = runCatching { availableHeapMB() }.getOrDefault(0L)
+                        val healthy = VyzeAdaptiveBackend.warmupHealthy(warmupLatencyMs)
+                        when {
+                            step.backendName.equals("GPU", true) && healthy -> {
+                                // GPU passed: persist it as this device's best config.
+                                VyzeAdaptiveBackend.saveBestBackend(context, "GPU")
+                                // Clear the failure memory — the device just
+                                // re-validated GPU (device may have updated its
+                                // driver after the backoff window allowed a retry).
+                                VyzeAdaptiveBackend.clearGpuFailures(context)
+                                VyzeAdaptiveBackend.recordGpuWarmup(
+                                    context,
+                                    VyzeAdaptiveBackend.GPU_WARMUP_ROUNDS_BEFORE_JUDGMENT,
+                                )
+                            }
+                            step.backendName.equals("GPU", true) -> {
+                                // Built but unhealthy: serves NO session and
+                                // never becomes the persisted preference.
+                                // Track this as a device-level GPU memory.
+                                acceptStep = false
+                                try {
+                                    VyzeAdaptiveBackend.recordGpuFailure(context)
+                                } catch (_: Throwable) { /* advisory */ }
+                                CrashLogFile.log(
+                                    TAG,
+                                    "Backend GPU: warm-up unhealthy (${warmupLatencyMs}ms) — NOT persisted; falling through to next backend",
+                                )
+                            }
+                            else -> {
+                                // CPU won (or was the only attempt). CPU is the
+                                // persisted DEFAULT — nothing to overwrite; a
+                                // persisted GPU preference would have affected
+                                // the next init's re-validation, not this CPU win.
+                            }
+                        }
+                        CrashLogFile.log(TAG, "Calibration verdict: backend=${step.backendName}, warmup=${warmupLatencyMs}ms, healthy=$healthy, freeRam=${ramMB}MB")
+                        com.vyze.app.performance.VyzeLocalTelemetry.record(
+                            context = context,
+                            taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.BACKEND_SELECTION,
+                            backend = step.backendName.lowercase(),
+                            latencyMs = warmupLatencyMs,
+                            success = healthy,
+                        )
+                    } catch (_: Throwable) { /* calibration persistence is advisory */ }
+
+                    if (!acceptStep) {
+                        // Tear down the sick engine BEFORE the next backend
+                        // attempts — GPU allocates significant system RAM for
+                        // its KV cache (measured freeRam 1511MB while built).
+                        try {
+                            engine?.close()
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "unhealthy-step close error: ${e.message}")
+                        }
+                        engine = null
+                        isInitialized = false
+                        continue
+                    }
 
                     onStepProgress?.invoke(95, "Finalizing...")
                     CrashLogFile.log(TAG, "=== INIT SUCCESS [${step.backendName}, $tier] ===")
-                    Log.i(TAG, "Gemma 4 E2B loaded successfully [backend=${step.backendName}, tier=$tier]")
+                    Log.i(TAG, "${brain.displayName} loaded successfully [backend=${step.backendName}, tier=$tier]")
+                    if (deferredGpu) {
+                        // CPU now serves. Start the background GPU build +
+                        // quiet-point swap (owner option 1).
+                        launchBackgroundGpuBuild(brain, modelFile, tier)
+                    }
                     return@withContext true
+                }
+                if (step.backendName.equals("GPU", true)) {
+                    // SYMMETRIC MEMORY (owner policy): a capable device keeps
+                    // its GPU verdict; an incapable one must keep its CPU
+                    // verdict too — otherwise every cold launch re-burns the
+                    // full GPU attempt budget (measured 92 s timeout on this
+                    // X6891). Record the failure; the plan gate skips GPU
+                    // for the backoff window (24 h).
+                    try {
+                        VyzeAdaptiveBackend.recordGpuFailure(context)
+                        CrashLogFile.log(
+                            TAG,
+                            "Adaptive policy: GPU failure recorded — GPU attempts skipped for " +
+                                "${VyzeAdaptiveBackend.GPU_FAIL_BACKOFF_MS / (60 * 60 * 1000)}h"
+                        )
+                    } catch (_: Throwable) { /* failure memory is advisory */ }
                 }
                 CrashLogFile.log(TAG, "Backend ${step.backendName} failed — moving to next in plan")
             }
@@ -634,26 +826,174 @@ class VlmEngineManager(
     )
 
     /**
-     * The backend chain for a tier:
-     *  - Tier 1: GPU only (flagship — certified drivers; a failure here is
-     *    treated as a real fault, not a tiering issue).
-     *  - Tier 2: GPU with catch-fallback to CPU (4 threads) — the mid-range
-     *    Mali/OpenCL driver belt.
-     *  - Tier 3: CPU directly — never waste 5-10s on a GPU init that will
-     *    fail on low-end chipsets.
+     * The backend chain for a brain+tier:
+     *  - Gemma Tier 1: GPU only (flagship — certified drivers; a failure here
+     *    is treated as a real fault, not a tiering issue).
+     *  - Gemma Tier 2: GPU with catch-fallback to CPU (4 threads) — the
+     *    mid-range Mali/OpenCL driver belt.
+     *  - Gemma Tier 3: CPU directly — never waste 5-10s on a GPU init that
+     *    will fail on low-end chipsets.
+     *  - MiniCPM (ALL tiers): CPU DIRECTLY, single step — HF's own device
+     *    testing showed the GPU decoder engine of this bundle fails to BUILD
+     *    on 8-GB-class Mali phones (Pixel 8a, memory safety line during
+     *    signature init). A tier-1 GPU attempt would either waste up to a
+     *    90 s failed-init budget on Tensor/Mali flagships or risk the same
+     *    "m0 was canceled" class of silent hangs. CPU-only v1; revisit
+     *    per-tier GPU for Adreno only after corridor data (swap plan §6).
      */
-    private fun backendPlanFor(tier: DeviceTier): List<TierBackendPlan> = when (tier) {
-        DeviceTier.TIER_1 -> listOf(
-            TierBackendPlan("GPU", Backend.GPU(), CONTEXT_TOKENS_TIER1)
-        )
-        DeviceTier.TIER_2 -> listOf(
-            TierBackendPlan("GPU", Backend.GPU(), CONTEXT_TOKENS_TIER2),
-            TierBackendPlan("CPU", cpuBackendForDevice(), CONTEXT_TOKENS_TIER2)
-        )
-        DeviceTier.TIER_3 -> listOf(
-            TierBackendPlan("CPU", cpuBackendForDevice(), CONTEXT_TOKENS_TIER3)
-        )
-        DeviceTier.TIER_DISABLED -> emptyList()
+    private fun backendPlanFor(brain: BrainModel, tier: DeviceTier): List<TierBackendPlan> {
+        if (tier == DeviceTier.TIER_DISABLED) return emptyList()
+        if (brain.cpuOnly) {
+            return listOf(
+                TierBackendPlan("CPU", cpuBackendForDevice(), contextTokensFor(brain, tier))
+            )
+        }
+        // ── ADAPTIVE PLAN GATE ──────────────────────────────────
+        // The plan is device-adaptive, per the owner's policy: GPU when the
+        // phone proves capable, CPU when it doesn't, and the verdict is
+        // persisted either way (see VyzeAdaptiveBackend: stale after 24 h,
+        // overtemp fallback). GPU steps are dropped when:
+        //   a) hardware is a known-bad GPU driver class (Mali hangs → never
+        //      waste the warm-up rounds there), or
+        //   b) the persisted calibration for THIS device said CPU-only.
+        // Previously the persisted filter ran only on the cold-init path (a
+        // resetSession reinit could resurrect a GPU attempt the calibration
+        // had already rejected).
+        // Device-adaptive verdict (first-run caveat fixed): a brand-new
+        // device has NO persisted calibration record, and loadPersistentState
+        // defaults preferredBackend="CPU" when the prefs file is absent. The
+        // original isCpuOnlyForDevice() therefore treated "never calibrated"
+        // as "proven incapable" — this plan gate dropped GPU for every
+        // Tier-1 device on its first launch and the trial never ran. The
+        // verdict is only respected once a calibration pass actually
+        // persisted it (lastValidatedMs > 0). "Nothing learned" = try GPU.
+        // HW a) stands for the known-bad driver list.
+        // Gate conditions live in the SHARED [adaptiveGpuGate] so the plan
+        // builder and the CPU-first/background-swap probe cannot diverge.
+        val (gpuDisallowed, gpuBlockWhy) = adaptiveGpuGate()
+        if (gpuDisallowed) {
+            CrashLogFile.log(TAG, "Adaptive plan: GPU skipped — $gpuBlockWhy")
+        }
+        val gpuFirstPlan = when (tier) {
+            DeviceTier.TIER_1 -> listOf(
+                TierBackendPlan("GPU", Backend.GPU(), contextTokensFor(brain, tier)),
+                TierBackendPlan("CPU", cpuBackendForDevice(), contextTokensFor(brain, tier))
+            )
+            DeviceTier.TIER_2 -> listOf(
+                TierBackendPlan("GPU", Backend.GPU(), contextTokensFor(brain, tier)),
+                TierBackendPlan("CPU", cpuBackendForDevice(), contextTokensFor(brain, tier))
+            )
+            // Tier 3: below the adaptive line — CPU only, as before.
+            else -> listOf(
+                TierBackendPlan("CPU", cpuBackendForDevice(), contextTokensFor(brain, tier))
+            )
+        }
+        return if (gpuDisallowed) gpuFirstPlan.filter { it.backendName != "GPU" }
+               else gpuFirstPlan
+    }
+
+    /**
+     * SHARED adaptive GPU gate, consumed by BOTH call sites that must never
+     * diverge in their memory semantics:
+     *   1. [backendPlanFor] — which backend steps the plan carries.
+     *   2. [rememberedBackendPrefersGpu] — whether the CPU-first path is
+     *      allowed to defer the blocking GPU attempt into a background build.
+     * Returns (disallowed?, reason-why-disallowed) so a single policy edit
+     * affects the plan, the deferral and its log line together.
+     *
+     * "Nothing learned yet" (never calibrated) deliberately reads as
+     * ALLOWED — see the plan-gate comment above.
+     */
+    private fun adaptiveGpuGate(): Pair<Boolean, String> = try {
+        val state = VyzeAdaptiveBackend.loadPersistentState(context)
+        val calibrated = state.lastValidatedMs > 0L
+        when {
+            VyzeAdaptiveBackend.deviceLooksCpuOnly(deviceProfile.hardware) ->
+                true to "known-bad GPU driver (hardware heuristic)"
+            state.overtempCount >= VyzeAdaptiveBackend.OVERTEMP_FALLBACK_THRESHOLD ->
+                true to "overtemp CPU fallback active"
+            !calibrated -> false to ""
+            state.preferredBackend.uppercase() == "CPU" ->
+                true to "calibrated device memory (CPU verdict)"
+            VyzeAdaptiveBackend.gpuBackoffActive(context) ->
+                true to "calibrated device memory (24h GPU-failure backoff)"
+            else -> false to ""
+        }
+    } catch (_: Throwable) {
+        // Policy reads are advisory and the GPU attempt itself is
+        // crash-guarded — on any read failure, let the trial happen.
+        false to ""
+    }
+
+    /**
+     * True when THIS device's persisted calibration currently says GPU
+     * (validated verdict, no failure backoff, no overtemp fallback, not a
+     * known-bad driver). The CPU-first/background-swap path defers ONLY the
+     * blocking GPU attempt on a remembered-GPU device — an uncalibrated or
+     * CPU-verdict device keeps the synchronous behavior.
+     */
+    private fun rememberedBackendPrefersGpu(): Boolean = try {
+        val state = VyzeAdaptiveBackend.loadPersistentState(context)
+        val (disallowed, _) = adaptiveGpuGate()
+        state.lastValidatedMs > 0L &&
+            state.preferredBackend.uppercase() == "GPU" &&
+            !disallowed
+    } catch (_: Throwable) {
+        false
+    }
+
+    /**
+     * Deletes the unrestorable MASTER program-cache files before any build.
+     *
+     * Why (upstream litert-lm 0.18.0 / ml-drift bug, reproduced 3× on this
+     * TIER_1 MT6899): the OpenCL serialize→deserialize round-trip fails on
+     * EVERY cold start for the heavy subgraphs — logcat,
+     *   delegate_kernel.cc:875 "Deserialization failed: DATA_LOSS"
+     * — while each attempt still APPENDS ~246 MB of unusable copies
+     * (one cache file grew 993→1,239→1,485 MB in three launches). The only
+     * entries that restore are two ~4.7 MB ones; the master cache is pure
+     * write-only churn. Deleting it bounds storage to roughly one build
+     * generation without losing the residency behavior of a runtime that
+     * never restores anyway.
+     *
+     * KEPT (they restore cleanly and never grew): *.vision_encoder_* and
+     * *.mtp_drafter_* program caches + all xnnpack weight caches.
+     */
+    private fun cleanupUnrestorableProgramCaches() {
+        try {
+            val dir = context.cacheDir ?: return
+            var freedBytes = 0L
+            dir.listFiles()?.forEach { f ->
+                val name = f.name
+                if (name.endsWith("_mldrift_program_cache.bin") &&
+                    !name.contains(".vision_encoder_") &&
+                    !name.contains(".mtp_drafter_")
+                ) {
+                    freedBytes += f.length()
+                    if (!f.delete()) Log.w(TAG, "program-cache cleanup: could not delete $name")
+                }
+            }
+            if (freedBytes > 0) {
+                CrashLogFile.log(
+                    TAG,
+                    "GPU program-cache cleanup: freed ${freedBytes / (1024 * 1024)}MB " +
+                        "(unrestorable master cache — upstream DATA_LOSS bug)"
+                )
+            }
+        } catch (e: Throwable) {
+            // Advisory — a failed cleanup never blocks initialization.
+            Log.w(TAG, "program-cache cleanup skipped: ${e.message}")
+        }
+    }
+
+    /** Tier context window clamped by the brain's bundle KV budget. */
+    private fun contextTokensFor(brain: BrainModel, tier: DeviceTier): Int {
+        val tierTokens = when (tier) {
+            DeviceTier.TIER_1 -> CONTEXT_TOKENS_TIER1
+            DeviceTier.TIER_2 -> CONTEXT_TOKENS_TIER2
+            else -> CONTEXT_TOKENS_TIER3
+        }
+        return minOf(tierTokens, brain.contextTokenCap)
     }
 
     /** CPU backend with the tier's thread budget (4 threads, capped by cores). */
@@ -668,6 +1008,19 @@ class VlmEngineManager(
             Runtime.getRuntime().availableProcessors().coerceAtLeast(1)
         } catch (_: Throwable) {
             4
+        }
+        // DEBUG-ONLY override (set via CpuThreadsToggleReceiver, debug builds
+        // only): lets a device session A/B unlock the thread-scaling answer
+        // for BOTH prefill and decode without an APK rebuild — spending a
+        // cold restart per value. Release builds never set it.
+        cpuThreadCountOverride?.let { requested ->
+            val clamped = requested.coerceIn(1, cores)
+            CrashLogFile.log(
+                TAG,
+                "CPU backend thread override: requested=$requested clamped=$clamped (cores=$cores, default would be " +
+                    "${minOf(CPU_FALLBACK_THREADS, maxOf(2, cores / 2))})"
+            )
+            return clamped
         }
         return minOf(CPU_FALLBACK_THREADS, maxOf(2, cores / 2))
     }
@@ -691,8 +1044,26 @@ class VlmEngineManager(
      * previous attempt's flags can never leak into the next one.
      */
     @OptIn(ExperimentalApi::class)
-    private fun applyTierExperimentalFlags(tier: DeviceTier) {
+    private fun applyTierExperimentalFlags(brain: BrainModel, tier: DeviceTier) {
         try {
+            if (brain == BrainModel.MINICPM_V47_1B) {
+                // MiniCPM bundle (fast_vlm + Qwen3.5 hybrid decoder): vision
+                // tokens are FIXED at 64 by the bundle contract — a
+                // visualTokenBudget flag is meaningless at best and
+                // out-of-contract at worst; MTP/speculative decoding was not
+                // built into this conversion. Engine defaults, always.
+                // NOTE: keyed on brain IDENTITY, not brain.cpuOnly — that
+                // flag now controls the ADAPTIVE backend chain only, while
+                // the bundle's generation contract is per-conversion and
+                // cannot change behavior from a backend swap.
+                ExperimentalFlags.enableSpeculativeDecoding = null
+                ExperimentalFlags.visualTokenBudget = null
+                CrashLogFile.log(
+                    TAG,
+                    "Experimental flags [brain=${brain.displayName}]: fixed-bundle defaults (no MTP, fixed 64-token vision)"
+                )
+                return
+            }
             ExperimentalFlags.enableSpeculativeDecoding = when (tier) {
                 DeviceTier.TIER_1 -> true
                 else -> null  // MTP off — reset to engine default
@@ -704,7 +1075,7 @@ class VlmEngineManager(
             }
             CrashLogFile.log(
                 TAG,
-                "Experimental flags [tier=$tier]: mtp=${tier == DeviceTier.TIER_1}, " +
+                "Experimental flags [brain=${brain.displayName}, tier=$tier]: mtp=${tier == DeviceTier.TIER_1}, " +
                     "visualBudget=${ExperimentalFlags.visualTokenBudget ?: "default"}"
             )
         } catch (e: Throwable) {
@@ -728,14 +1099,56 @@ class VlmEngineManager(
      * @return true when the engine is ready on this backend.
      */
     private suspend fun createEngineGuarded(
+        brain: BrainModel,
         modelFile: File,
         step: TierBackendPlan,
         tier: DeviceTier
     ): Boolean {
+        // WIRING WRAPPER: the guarded build lives in [buildEngineForBackend]
+        // (mutex / timers / crash-guards identical, so one code path owns the
+        // build discipline). The CPU-first path also uses that builder —
+        // WITHOUT the wiring — to hold a background GPU engine.
+        val eng = buildEngineForBackend(brain, modelFile, step, tier)
+        return if (eng != null) {
+            onStepProgress?.invoke(45, "Getting my vision ready...")
+            CrashLogFile.log(TAG, "Engine created + initialized [${step.backendName}]")
+            engine = eng
+            activeBackend = step.backendName
+            isInitialized = true
+            true
+        } else {
+            false
+        }
+    }
+
+    /**
+     * Create + initialize an engine for ONE backend attempt WITHOUT wiring it
+     * as the active serving engine. Every guard of the blocking path applies:
+     *
+     *  - serialized by [engineInitMutex] (one native build at a time),
+     *  - GC + trim BEFORE the native side allocates KV-cache tensors,
+     *  - hard time budget per attempt (a hung native constructor can no
+     *    longer stall initialization forever),
+     *  - ALL Throwables (JNI/C++ driver errors, OOM, GPU-init
+     *    cancellations) are caught and classified — nothing propagates as
+     *    an uncaught Job cancellation,
+     *  - external caller cancellation is rethrown untouched.
+     *
+     * @return the ready engine, or null on failure (build error, timeout).
+     * @see createEngineGuarded for the wiring behavior.
+     * @see launchBackgroundGpuBuild for the CPU-first consumer.
+     */
+    private suspend fun buildEngineForBackend(
+        brain: BrainModel,
+        modelFile: File,
+        step: TierBackendPlan,
+        tier: DeviceTier,
+        timeoutOverrideMs: Long? = null
+    ): Engine? {
         return engineInitMutex.withLock {
             CrashLogFile.log(
                 TAG,
-                "Trying ${step.backendName} backend (tier=$tier, contextTokens=${step.contextTokens})..."
+                "Trying ${step.backendName} backend [${brain.displayName}] (tier=$tier, contextTokens=${step.contextTokens})..."
             )
             onStepProgress?.invoke(35, "Preparing my vision...")
 
@@ -743,12 +1156,12 @@ class VlmEngineManager(
             // tensors — on lower-tier hardware every reclaimed MB counts.
             reclaimMemoryBeforeTensorAllocation(aggressive = tier != DeviceTier.TIER_1)
 
-            val timeoutMs =
-                if (step.backend is Backend.CPU) CPU_ENGINE_CREATE_TIMEOUT_MS
+            val timeoutMs = timeoutOverrideMs
+                ?: if (step.backend is Backend.CPU) CPU_ENGINE_CREATE_TIMEOUT_MS
                 else ENGINE_CREATE_TIMEOUT_MS
 
             try {
-                applyTierExperimentalFlags(tier)
+                applyTierExperimentalFlags(brain, tier)
 
                 val eng = buildEngineTimed(
                     EngineConfig(
@@ -770,9 +1183,16 @@ class VlmEngineManager(
                         // `Backend.CPU()` unconditionally if the experiment
                         // shows a hang-then-timeout pattern.
                         visionBackend = step.backend,
-                        // Audio encoder runs on CPU — Gemma 4 E2B's audio model is
-                        // separate from the text/vision path and loads on demand.
-                        audioBackend = Backend.CPU(),
+                        // EXECUTOR SEPARATION (M0.2, 2026-10-16): only attach
+                        // executors the ACTIVE bundle actually contains. The
+                        // MiniCPM int8vis bundle has NO audio tower — hardcoding
+                        // audioBackend made the runtime look up
+                        // tf_lite_audio_encoder_hw on EVERY Conversation creation
+                        // and every inference died with NOT_FOUND (0.16.1 AND
+                        // 0.18.0; version was never the bug). Per litert-lm
+                        // Config.kt: "If null, audio executor will not be
+                        // initialized" — so vision-only brains skip audio.
+                        audioBackend = if (brain.supportsAudioInput) Backend.CPU() else null,
                         maxNumTokens = step.contextTokens,
                         cacheDir = context.cacheDir.path
                     ),
@@ -784,16 +1204,13 @@ class VlmEngineManager(
                         TAG,
                         "${step.backendName} build exceeded ${timeoutMs / 1000}s budget — treating as failure"
                     )
-                    return@withLock false
+                    return@withLock null
                 }
 
-                onStepProgress?.invoke(45, "Getting my vision ready...")
-                CrashLogFile.log(TAG, "Engine created + initialized [${step.backendName}]")
-
-                engine = eng
-                activeBackend = step.backendName
-                isInitialized = true
-                true
+                // Success — the CALLER decides whether this engine becomes
+                // the active serving engine ([createEngineGuarded]) or stays
+                // parked for a background swap ([launchBackgroundGpuBuild]).
+                eng
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // External cancellation (caller scope) — rethrow untouched;
@@ -809,7 +1226,7 @@ class VlmEngineManager(
                     e
                 )
                 Log.e(TAG, "${step.backendName} init failed: ${e.message}", e)
-                false
+                null
             }
         }
     }
@@ -858,6 +1275,217 @@ class VlmEngineManager(
         pendingBuild = result
         CrashLogFile.log(TAG, "Engine build timed out after ${timeoutMs / 1000}s — parked for drain")
         return null
+    }
+
+    // ── CPU-FIRST / BACKGROUND GPU SWAP (owner option 1, 2026-10-18) ─────
+    //
+    // OWNER PROBLEM: a remembered-GPU device paid the full ~87 s OpenCL GPU
+    // build on EVERY cold launch before the UI could take a query — and the
+    // compiled-program cache could not help (restore fails every cold start
+    // for the heavy subgraphs: delegate_kernel.cc:875 DATA_LOSS — upstream
+    // litert-lm 0.18.0 / ml-drift bug) while still appending ~246 MB per
+    // attempt. "Remember" existed in the adaptive memory but not in the
+    // latency.
+    //
+    // DESIGN: on a remembered-GPU device the CPU engine builds first (~10 s)
+    // and serves queries immediately; the GPU engine builds in the BACKGROUND
+    // with the identical crash-guards/budgets, gets its text warm-up BEFORE
+    // the wiring, records the adaptive verdict exactly like the blocking
+    // path did, and the engines swap at the first quiet instant (no
+    // generation in flight). A build failure/timeout or unhealthy warm-up
+    // records the same 24 h GPU-failure memory the blocking path used —
+    // verdicts stay symmetric in both directions.
+
+    /** Engine built in the background, awaiting the quiet-point swap. */
+    @Volatile
+    private var pendingGpuEngine: Engine? = null
+
+    /** Serializes background GPU builds — one native GPU build at a time. */
+    private val backgroundGpuBuildActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Idle-swap polling cadence and overall patience. */
+    private val swapPollIntervalMs = 2_000L
+    private val swapMaxWaitMs = 180_000L
+
+    /**
+     * Build budget for the BACKGROUND GPU engine. The 90 s blocking budget
+     * exists to protect the INIT UX; nothing waits on the background build,
+     * and Android can cache-freeze the process mid-build (observed: a build
+     * declared "failed" 7 min after start because freeze time consumed the
+     * deadline) — a background build gets a generous budget instead.
+     */
+    private val backgroundEngineCreateTimeoutMs = 300_000L
+
+    /**
+     * Build the GPU engine IN THE BACKGROUND for a remembered-GPU device
+     * whose CPU engine is already serving. Verdict discipline mirrors the
+     * blocking path: build-fail or unhealthy-warmup → [recordGpuFailure]
+     * (24 h backoff, plan drops GPU); healthy → [saveBestBackend("GPU")]
+     * + failure memory cleared. On health, the engine is parked and the
+     * swap is scheduled — never wired while a generation is running.
+     */
+    private fun launchBackgroundGpuBuild(brain: BrainModel, modelFile: File, tier: DeviceTier) {
+        if (!backgroundGpuBuildActive.compareAndSet(false, true)) {
+            CrashLogFile.log(TAG, "Background GPU build already running — not spawning another")
+            return
+        }
+        scope.launch {
+            try {
+                if (sessionResetInProgress) {
+                    // A session reset owns the engine lifecycle right now;
+                    // its own loops spawn their own background build.
+                    return@launch
+                }
+                val step = TierBackendPlan("GPU", Backend.GPU(), contextTokensFor(brain, tier))
+                CrashLogFile.log(TAG, "Background GPU build: starting (queries keep serving on CPU meanwhile)...")
+
+                val gpuEngine = buildEngineForBackend(
+                    brain,
+                    modelFile,
+                    step,
+                    tier,
+                    timeoutOverrideMs = backgroundEngineCreateTimeoutMs
+                )
+                if (gpuEngine == null) {
+                    // Symmetric memory with the blocking path: a GPU build
+                    // failure keeps this device remembering CPU-only for the
+                    // backoff window instead of re-burning ~90 s next launch.
+                    try {
+                        VyzeAdaptiveBackend.recordGpuFailure(context)
+                        CrashLogFile.log(
+                            TAG,
+                            "Adaptive policy: background GPU failure recorded — GPU attempts skipped for " +
+                                "${VyzeAdaptiveBackend.GPU_FAIL_BACKOFF_MS / (60 * 60 * 1000)}h"
+                        )
+                    } catch (_: Throwable) { /* failure memory is advisory */ }
+                    return@launch
+                }
+
+                // Warm up the GPU engine BEFORE it becomes the serving
+                // engine — the first swapped-in query must not pay warm-up.
+                // TWO text-only rounds, judged on the SECOND: while the CPU
+                // engine serves concurrently, the first round pays lazy
+                // kernel state + resource contention the blocking path
+                // never saw (measured 11.3 s contended vs 5.8-6.9 s idle —
+                // over the 9 s healthy cap by the noise alone). The second
+                // round is the steady state the session would ride.
+                val warmupFirstMs = warmUp(gpuEngine)
+                val warmupLatencyMs = warmUp(gpuEngine)
+                CrashLogFile.log(
+                    TAG,
+                    "Background GPU warm-up: contended=${warmupFirstMs}ms steady=${warmupLatencyMs}ms"
+                )
+                val healthy = try {
+                    VyzeAdaptiveBackend.warmupHealthy(warmupLatencyMs)
+                } catch (_: Throwable) { warmupLatencyMs > 0L }
+                if (!healthy) {
+                    // Owner policy (same as blocking): built-but-sick GPU
+                    // never serves and never becomes the preference.
+                    try { VyzeAdaptiveBackend.recordGpuFailure(context) } catch (_: Throwable) { }
+                    try { gpuEngine.close() } catch (e: Throwable) { Log.w(TAG, "unhealthy parked GPU close error: ${e.message}") }
+                    CrashLogFile.log(
+                        TAG,
+                        "Adaptive policy: background GPU warm-up unhealthy (${warmupLatencyMs}ms) — engine discarded, staying on CPU"
+                    )
+                    return@launch
+                }
+
+                try {
+                    VyzeAdaptiveBackend.saveBestBackend(context, "GPU")
+                    VyzeAdaptiveBackend.clearGpuFailures(context)
+                    VyzeAdaptiveBackend.recordGpuWarmup(
+                        context,
+                        VyzeAdaptiveBackend.GPU_WARMUP_ROUNDS_BEFORE_JUDGMENT,
+                    )
+                } catch (_: Throwable) { /* calibration persistence is advisory */ }
+                runCatching {
+                    com.vyze.app.performance.VyzeLocalTelemetry.record(
+                        context = context,
+                        taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.BACKEND_SELECTION,
+                        backend = "gpu",
+                        latencyMs = warmupLatencyMs,
+                        success = true,
+                    )
+                }
+                CrashLogFile.log(TAG, "Calibration verdict: backend=GPU(background), warmup=${warmupLatencyMs}ms, healthy=true")
+
+                pendingGpuEngine = gpuEngine
+                CrashLogFile.log(TAG, "Background GPU build ready (${warmupLatencyMs}ms warm-up) — swap armed")
+                swapGpuEngineWhenIdle()
+
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Scope teardown (app close) — the timed-out native build is
+                // drained by the next attempt or lost with the process.
+                throw e
+            } catch (e: Throwable) {
+                // Advisory: the CPU engine keeps serving whatever happens here.
+                CrashLogFile.log(TAG, "Background GPU build error: ${e.javaClass.simpleName}: ${e.message}")
+                Log.e(TAG, "Background GPU build error", e)
+            } finally {
+                backgroundGpuBuildActive.set(false)
+            }
+        }
+    }
+
+    /**
+     * Swap [pendingGpuEngine] in at the first QUIET instant. "Quiet" means
+     * the generation mutex is free — every conversation lives inside that
+     * mutex, so acquiring it here guarantees no generation is running or
+     * starting, and the swap can never race an inference. Polls at
+     * [swapPollIntervalMs] for up to [swapMaxWaitMs]; on give-up the parked
+     * engine is closed (its KV-cache RAM/VRAM must not leak for the
+     * process lifetime) and the GPU advantage is re-earned next launch.
+     */
+    private fun swapGpuEngineWhenIdle() {
+        scope.launch(engineInitDispatcher) {
+            val deadline = System.currentTimeMillis() + swapMaxWaitMs
+            while (pendingGpuEngine != null &&
+                engine != null && isInitialized &&
+                System.currentTimeMillis() < deadline
+            ) {
+                if (generationMutex.tryLock()) {
+                    try {
+                        val gpuEngine = pendingGpuEngine
+                        if (gpuEngine == null) return@launch  // swapped elsewhere
+                        if (engine == null || !isInitialized) return@launch  // torn down mid-wait
+
+                        // Conversations belong to their engine — the CPU one
+                        // dies with its engine. Drop the reference BEFORE the
+                        // close so an interrupt() can never cancelProcess() a
+                        // dead engine's conversation.
+                        activeConversation = null
+                        val cpuEngine = engine
+                        engine = gpuEngine
+                        activeBackend = "GPU"
+                        pendingGpuEngine = null
+
+                        // GPU vision kernels compile lazily on the first real
+                        // image — re-arm the one-time grace budget the fresh
+                        // engine needs.
+                        firstImageInferencePending = true
+
+                        CrashLogFile.log(
+                            TAG,
+                            "=== ENGINE SWAP: serving now on GPU (CPU engine closing) ==="
+                        )
+                        try { cpuEngine?.close() } catch (e: Throwable) { Log.w(TAG, "CPU engine close error: ${e.message}") }
+                    } finally {
+                        generationMutex.unlock()
+                    }
+                    CrashLogFile.log(TAG, "Background GPU swap complete — queries now ride GPU speed for this session")
+                    return@launch
+                }
+                delay(swapPollIntervalMs)
+            }
+
+            // Give-up path: engine torn down (close/reset) or no quiet instant.
+            val leftover = pendingGpuEngine
+            pendingGpuEngine = null
+            if (leftover != null) {
+                try { leftover.close() } catch (e: Throwable) { Log.w(TAG, "parked GPU engine close error: ${e.message}") }
+                CrashLogFile.log(TAG, "Background GPU swap: no quiet instant in ${swapMaxWaitMs / 1000}s — parked engine discarded")
+            }
+        }
     }
 
     /**
@@ -943,21 +1571,37 @@ class VlmEngineManager(
         return clamped
     }
 
-    /** Image pre-processing dimension cap for the device tier. */
-    private fun clampTargetDimension(requested: Int): Int = when (deviceProfile.tier) {
-        DeviceTier.TIER_1 -> requested
-        DeviceTier.TIER_2 -> minOf(requested, IMAGE_DIMENSION_TIER2)
-        else -> minOf(requested, IMAGE_DIMENSION_TIER3)
+    /**
+     * Image pre-processing dimension clamp for the ACTIVE brain.
+     *
+     * Gemma: tier caps (192-256 px scene feeds were the CPU-vision latency
+     * lever; vision-token count scales with frame size).
+     * MiniCPM: NO downsampling — instead a FLOOR at the bundle's own 448×448
+     * contract. The runtime resizes whatever it receives to 448 px, so our
+     * old 192/256 px frames would be lossily UPSCALED by it. Every lane
+     * (scene / tap / OCR) feeds ≥448 px so the bundle sees native-scale
+     * pixels; prefill cost is bounded by the fixed 64-token vision budget.
+     */
+    private fun clampTargetDimension(requested: Int): Int {
+        val brain = brainForTurn()
+        if (brain.minFeedDimension > 0) {
+            return maxOf(requested, brain.minFeedDimension)
+        }
+        return when (deviceProfile.tier) {
+            DeviceTier.TIER_1 -> requested
+            DeviceTier.TIER_2 -> minOf(requested, IMAGE_DIMENSION_TIER2)
+            else -> minOf(requested, IMAGE_DIMENSION_TIER3)
+        }
     }
 
-    private fun buildModelNotFoundError(): String {
+    private fun buildModelNotFoundError(brain: BrainModel): String {
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val downloadsFile = downloadsDir?.let { File(it, MODEL_FILE) }
+        val downloadsFile = downloadsDir?.let { File(it, brain.fileName) }
         val externalDir = context.getExternalFilesDir(null)
-        val externalFile = externalDir?.let { File(it, MODEL_FILE) }
+        val externalFile = externalDir?.let { File(it, brain.fileName) }
 
         val sb = StringBuilder()
-        sb.appendLine("$MODEL_FILE not found.")
+        sb.appendLine("${brain.fileName} not found.")
         sb.appendLine()
         sb.appendLine("Locations checked:")
 
@@ -965,19 +1609,19 @@ class VlmEngineManager(
             sb.appendLine("  1. ${downloadsFile.absolutePath}")
             sb.appendLine("     exists=${downloadsFile.exists()}, size=${downloadsFile.length()} bytes")
         } else {
-            sb.appendLine("  1. /storage/emulated/0/Download/$MODEL_FILE  (Downloads dir unavailable)")
+            sb.appendLine("  1. /storage/emulated/0/Download/${brain.fileName}  (Downloads dir unavailable)")
         }
 
         if (externalFile != null) {
             sb.appendLine("  2. ${externalFile.absolutePath}")
             sb.appendLine("     exists=${externalFile.exists()}, size=${externalFile.length()} bytes")
         } else {
-            sb.appendLine("  2. <app-scoped external dir>/$MODEL_FILE  (dir unavailable)")
+            sb.appendLine("  2. <app-scoped external dir>/${brain.fileName}  (dir unavailable)")
         }
 
         sb.appendLine()
         sb.appendLine("Push via ADB:")
-        sb.appendLine("  adb push $MODEL_FILE /storage/emulated/0/Download/")
+        sb.appendLine("  adb push ${brain.fileName} /storage/emulated/0/Download/")
 
         return sb.toString().trimEnd()
     }
@@ -1024,7 +1668,7 @@ class VlmEngineManager(
             var tLane = 0L
             var tPrefill = 0L
             var firstTokenAt = 0L
-            CrashLogFile.log(TAG, "=== ANALYZE IMAGE [PROFILED] ===")
+            CrashLogFile.log(TAG, "=== ANALYZE IMAGE [PROFILED][brain=${brainForTurn().displayName}] ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
             // 1. Preprocess bitmap — proportional scale to the TIER-ADJUSTED
@@ -1046,12 +1690,14 @@ class VlmEngineManager(
             tJpeg = System.currentTimeMillis() - stageStart
             CrashLogFile.log(TAG, "JPEG: ${imageBytes.size} bytes")
 
-            // 3. Build the user payload + Gemma 4 turn format.
-            //    System directive is folded into the user turn (Gemma has no system role).
+            // 3. Build the user payload in the ACTIVE brain's turn format.
+            //    Gemma: role-tagged single user turn. MiniCPM: plain content
+            //    (the bundle's ChatML template renders the roles itself).
             //    User rules come from DynamicPromptBuilder inside the user payload.
             stageStart = System.currentTimeMillis()
             val userPayload = buildUserPayload(prompt, memoryContext)
-            val formattedPrompt = buildGemmaTurnPrompt(
+            val formattedPrompt = buildTurnPrompt(
+                brainForTurn(),
                 userPayload,
                 SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
             )
@@ -1084,7 +1730,8 @@ class VlmEngineManager(
                     tPrefill = firstTokenAt - (startTime + tPreprocess + tJpeg + tPayload + tLane)
                     CrashLogFile.log(
                         TAG,
-                        "[PIPELINE-BREAKDOWN] preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
+                        "[PIPELINE-BREAKDOWN] threads=${cpuThreadCount()} " +
+                            "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
                             "payload=${tPayload}ms lane-wait=${tLane}ms " +
                             "PREFILL=${tPrefill}ms DECODE=${firstTokenAt - startTime - tPrefill - tLane}ms-so-far"
                     )
@@ -1095,11 +1742,21 @@ class VlmEngineManager(
             tLane = System.currentTimeMillis() - stageStart -
                 (if (firstTokenFlag[0]) (System.currentTimeMillis() - firstTokenAt) else 0)
             val elapsed = System.currentTimeMillis() - startTime
+            // DECODE duration: wall time from the FIRST streamed token to the
+            // completed response. The old template printed a hardcoded
+            // "EOF" placeholder here regardless of outcome — misleading,
+            // because "EOF" reads like a decode-terminated-anomaly instead
+            // of a label. Also: when NO token ever streamed (full response
+            // delivered as one terminal message), the first-token callback
+            // never fired and tPrefill stays 0 — report that honestly.
+            val decodeMs =
+                if (firstTokenFlag[0]) elapsed - (firstTokenAt - startTime) else 0L
+            val decodeNote = if (firstTokenFlag[0]) "" else " (no streamed token — single-message response)"
             CrashLogFile.log(
                 TAG,
                 "[ANALYZE-BREAKDOWN] total=${elapsed}ms preprocess=${tPreprocess}ms " +
                     "jpeg=${tJpeg}ms payload=${tPayload}ms lane-wait=${tLane}ms " +
-                    "prefill(firstToken)=${tPrefill}ms decode-first-token=EOF"
+                    "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${decodeNote}"
             )
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
             response
@@ -1142,8 +1799,9 @@ class VlmEngineManager(
         sessionId: String = "",
         maxTokens: Int = TEXT_ONLY_MAX_TOKENS
     ): String? = withContext(Dispatchers.Default) {
-        CrashLogFile.log(TAG, "=== ANALYZE TEXT (no image) ===")
-        val formattedPrompt = buildGemmaTurnPrompt(
+        CrashLogFile.log(TAG, "=== ANALYZE TEXT (no image) [brain=${brainForTurn().displayName}] ===")
+        val formattedPrompt = buildTurnPrompt(
+            brainForTurn(),
             prompt,
             TEXT_ONLY_SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
         )
@@ -1184,9 +1842,23 @@ class VlmEngineManager(
         sessionId: String = "",
         maxTokens: Int = ASR_MAX_TOKENS
     ): String? = withContext(Dispatchers.Default) {
+        val brain = brainForTurn()
+        if (!brain.supportsAudioInput) {
+            // MiniCPM has NO audio tower in the bundle: the raw-audio rescue
+            // lane is dead (swap plan §4). Degrade EXPLICITLY — the notice is
+            // spoken through the callers' error path; a silent null would be
+            // a dead lane with no feedback. Native ASR (SpeechRecognizer)
+            // remains the voice-input command path either way.
+            CrashLogFile.log(
+                TAG,
+                "TranscribeAudio unavailable on ${brain.displayName} (no audio tower) — degraded-mode notice fired"
+            )
+            onError?.invoke(AUDIO_RESCUE_DEGRADED_MESSAGE, sessionId)
+            return@withContext null
+        }
         val wav = wrapPcmInWav(audioBytes)
         CrashLogFile.log(TAG, "=== TRANSCRIBE AUDIO (${audioBytes.size} PCM bytes -> ${wav.size} WAV bytes) ===")
-        val formattedPrompt = buildGemmaTurnPrompt(prompt, "")
+        val formattedPrompt = buildTurnPrompt(brainForTurn(), prompt, "")
         runConversation(
             contents = Contents.of(
                 Content.AudioBytes(wav),
@@ -1593,8 +2265,20 @@ class VlmEngineManager(
      * This eliminates the first-inference cold-start penalty so the real
      * user query benefits from already-warmed delegates.
      */
-    private suspend fun warmUp() = withContext(Dispatchers.IO) {
-        val eng = engine ?: return@withContext
+    /**
+     * Text-only engine warm-up. Returns the measured latency in ms —
+     * 0 when the engine handle is absent or warm-up failed (non-fatal).
+     *
+     * Calibration contract (checklist item 3): the returned latency + the
+     *   surrounding RAM snapshot feed [VyzeAdaptiveBackend] verdicts.
+     * Deliberately NO fixed image here — see the SIGSEGV warning below.
+     */
+    private suspend fun warmUp(warmEngine: Engine? = null): Long = withContext(Dispatchers.IO) {
+        val startMs = System.currentTimeMillis()
+        // Target defaults to the ACTIVE serving engine; the background GPU
+        // build warms its own engine BEFORE the wiring/swap so the first
+        // query running after the swap doesn't pay the warm-up latency.
+        val eng = warmEngine ?: engine ?: return@withContext 0L
         try {
             // TEXT-ONLY warm-up — do NOT send images here.
             // Sending Content.ImageBytes before the vision encoder is fully
@@ -1626,9 +2310,12 @@ class VlmEngineManager(
                 latch.await(WARMUP_TIMEOUT_SEC, TimeUnit.SECONDS)
             }
 
-            Log.i(TAG, "Engine warm-up completed (text-only) [backend=$activeBackend]")
+            val elapsed = System.currentTimeMillis() - startMs
+            Log.i(TAG, "Engine warm-up completed (text-only) [backend=$activeBackend, ${elapsed}ms]")
+            return@withContext elapsed
         } catch (e: Throwable) {
             Log.w(TAG, "Engine warm-up failed (non-fatal): ${e.javaClass.simpleName}: ${e.message}")
+            return@withContext 0L
         }
     }
 
@@ -1661,10 +2348,18 @@ class VlmEngineManager(
      *   - Tier 3 (lower-end, CPU-direct): 40 s — CPU image prefill dominates.
      *   - Tier 0: irrelevant (no VLM), returns the Tier-3 value harmlessly.
      */
-    fun firstTokenWatchdogBudgetMs(): Long = when (deviceProfile.tier) {
-        DeviceTier.TIER_1 -> 15_000L
-        DeviceTier.TIER_2 -> 25_000L
-        else -> 40_000L
+    fun firstTokenWatchdogBudgetMs(): Long {
+        val tierBudget = when (deviceProfile.tier) {
+            DeviceTier.TIER_1 -> 15_000L
+            DeviceTier.TIER_2 -> 25_000L
+            else -> 40_000L
+        }
+        // CPU-SERVING AWARENESS (2026-10-18): while a remembered-GPU device
+        // rides CPU-before-swap, first-token latency is XNNPack speed, not
+        // GPU speed — the tier figures were tuned ON the GPU path. Take the
+        // Tier-3 figure as the CPU floor so a healthy CPU prefill is never
+        // executed as a hang.
+        return if (servingOnCpu()) maxOf(tierBudget, 40_000L) else tierBudget
     }
 
     /**
@@ -1696,6 +2391,16 @@ class VlmEngineManager(
      */
     fun watchdogBudgetMs(isImageQuery: Boolean): Long {
         if (!isImageQuery) return firstTokenWatchdogBudgetMs()
+        // CPU-SERVING AWARENESS (2026-10-18): every image query on an
+        // actively-serving CPU engine gets the extended CPU budget — on the
+        // 60i-class device CPU image prefill alone measures 14-17 s, which
+        // both the GPU-tuned Tier-1 15 s budget and the one-time grace
+        // (armed but already CONSUMED by earlier CPU-era images) fail to
+        // cover. Watchdog fired mid-prefill twice in one CPU-first session
+        // (VyzeCoreController: "Snapshot trigger FAILED: JobCancellation-
+        // Exception: StandaloneCoroutine was cancelled"). GPU budgets only
+        // apply once GPU actually serves.
+        if (servingOnCpu()) return CPU_VISION_IMAGE_BUDGET_MS
         return if (deviceProfile.tier == DeviceTier.TIER_1) {
             if (firstImageInferencePending) FIRST_IMAGE_INFERENCE_BUDGET_MS else firstTokenWatchdogBudgetMs()
         } else {
@@ -1703,10 +2408,16 @@ class VlmEngineManager(
         }
     }
 
+    /** Whether the ACTIVE engine is the CPU one (never true once a GPU swap lands). */
+    private fun servingOnCpu(): Boolean = activeBackend == "CPU"
+
     /** Consume the one-time first-image grace (call when the image watchdog arms). */
     fun markImageInferenceStarted() {
         firstImageInferencePending = false
     }
+
+    /** Whether the currently loaded brain supports audio input (has audio encoder). */
+    fun brainSupportsAudioInput(): Boolean = (activeBrain ?: BrainModel.PROD_DEFAULT).supportsAudioInput
 
     /** Human-readable device tier (for status lines / telemetry). */
     fun getDeviceTierName(): String = deviceProfile.tier.label
@@ -1721,11 +2432,12 @@ class VlmEngineManager(
     fun getDeviceProfileSummary(): String = profileSummary(deviceProfile)
 
     /**
-     * Check if the model file exists on disk (without initializing the engine).
-     * Used to avoid announcing 'downloading' when the model is already present.
+     * Check if the production brain's model file exists on disk (without
+     * initializing the engine). Used to avoid announcing 'downloading' when
+     * the MiniCPM bundle is already present.
      */
     fun isModelOnDisk(): Boolean {
-        return resolveModelFile() != null
+        return modelFileExistsFor(BrainModel.PROD_DEFAULT)
     }
 
     // ── Native Interruption ──────────────────────────────────────
@@ -1790,7 +2502,18 @@ class VlmEngineManager(
      */
     fun resetSession() {
         if (!isInitialized || engine == null) return
+        if (sessionResetInProgress) {
+            Log.i(TAG, "resetSession: already in progress — ignoring duplicate reset")
+            return
+        }
         Log.i(TAG, "resetSession: clearing Engine KV-cache via reinit")
+        // VISIBILITY (blind-first): while this reinit runs, the engine is DEAD
+        // but callers used to still see "ready" — every tap during the ~20+
+        // second blackout hit a dead engine and failed async with
+        // "AI model not ready" (silent for a blind user). isSessionResetting()
+        // makes VlmEngineManager.isEngineReady() return false so the tap
+        // pipeline speaks the "brain is still waking up" notice instead.
+        sessionResetInProgress = true
         try {
             engine?.close()
         } catch (e: Throwable) {
@@ -1808,31 +2531,55 @@ class VlmEngineManager(
                     Log.i(TAG, "resetSession: Tier 0 device — VLM stays bypassed")
                     return@launch
                 }
-                val modelFile = resolveModelFile()
+                // Keep the SAME brain this session started with — a reset
+                // never hot-swaps brains mid-conversation.
+                val brain = activeBrain ?: BrainModel.PROD_DEFAULT
+                val modelFile = resolveModelFile(brain)
                 if (modelFile == null) {
-                    Log.e(TAG, "resetSession: model file not found — VLM stays offline")
+                    Log.e(TAG, "resetSession: ${brain.fileName} not found — VLM stays offline")
+                    sessionResetInProgress = false
                     return@launch
                 }
 
                 val tier = deviceProfile.tier
-                for (step in backendPlanFor(tier)) {
-                    if (createEngineGuarded(modelFile, step, tier)) {
+                // Same CPU-first contract as the cold path: a remembered-GPU
+                // device re-enters service on CPU immediately; the GPU engine
+                // rebuilds in the background and swaps in when idle.
+                val rememberedGpu = rememberedBackendPrefersGpu()
+                for (step in backendPlanFor(brain, tier)) {
+                    if (rememberedGpu && step.backendName.equals("GPU", true)) {
+                        CrashLogFile.log(TAG, "resetSession: GPU deferred to background build")
+                        continue
+                    }
+                    if (createEngineGuarded(brain, modelFile, step, tier)) {
                         Log.i(TAG, "resetSession: reinitialized on ${step.backendName} [tier=$tier]")
                         warmUp()
+                        if (rememberedGpu && step.backendName.equals("CPU", true)) {
+                            launchBackgroundGpuBuild(brain, modelFile, tier)
+                        }
                         return@launch
                     }
                     Log.e(TAG, "resetSession: ${step.backendName} init failed — trying next backend")
                 }
                 Log.e(TAG, "resetSession: all backends for $tier failed — VLM stays offline (non-VLM features unaffected)")
             } catch (e: kotlinx.coroutines.CancellationException) {
+                sessionResetInProgress = false
                 throw e
             } catch (e: Throwable) {
                 Log.e(TAG, "resetSession reinit failed: ${e.message}", e)
                 engine = null
                 isInitialized = false
+            } finally {
+                sessionResetInProgress = false
             }
         }
     }
+
+    /** True while a [resetSession] teardown+reinit blackout is in flight —
+     *  the engine object exists in code but CANNOT serve inference. */
+    @Volatile
+    private var sessionResetInProgress = false
+    fun isSessionResetting(): Boolean = sessionResetInProgress
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -1865,17 +2612,17 @@ class VlmEngineManager(
     // ── Model Resolution ──────────────────────────────────────────
 
     /**
-     * Resolve model file from the device filesystem.
+     * Resolve the given brain's model file from the device filesystem.
      *
      * Lookup order:
-     *  1. Public Download folder — `/storage/emulated/0/Download/gemma-4-E2B-it.litertlm`
+     *  1. Public Download folder — `/storage/emulated/0/Download/<brain.fileName>`
      *  2. App-scoped external files — `context.getExternalFilesDir(null)`
      */
-    private fun resolveModelFile(): File? {
+    private fun resolveModelFile(brain: BrainModel): File? {
         // Tier 1: Public Download folder (most accessible via ADB push)
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         if (downloadsDir != null && downloadsDir.exists()) {
-            val downloadsFile = File(downloadsDir, MODEL_FILE)
+            val downloadsFile = File(downloadsDir, brain.fileName)
             Log.d(TAG, "Tier 1: Checking ${downloadsFile.absolutePath}")
             if (downloadsFile.exists() && downloadsFile.length() > MIN_MODEL_SIZE) {
                 Log.i(TAG, "Tier 1: Model found at ${downloadsFile.absolutePath} (${downloadsFile.length()} bytes)")
@@ -1889,7 +2636,7 @@ class VlmEngineManager(
         // Tier 2: App-scoped external files — no special permissions required
         val externalDir = context.getExternalFilesDir(null)
         if (externalDir != null) {
-            val externalFile = File(externalDir, MODEL_FILE)
+            val externalFile = File(externalDir, brain.fileName)
             Log.d(TAG, "Tier 2: Checking ${externalFile.absolutePath}")
             if (externalFile.exists() && externalFile.length() > MIN_MODEL_SIZE) {
                 Log.i(TAG, "Tier 2: Model found at ${externalFile.absolutePath} (${externalFile.length()} bytes)")
@@ -1917,12 +2664,48 @@ class VlmEngineManager(
         activeBackend = "NONE"
         initFailureCount = 0
         gracefulFallbackMessage = null
+        // A parked background GPU engine holds its own KV-cache tensors —
+        // never leak it across lifecycle teardown.
+        try {
+            pendingGpuEngine?.close()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error closing parked GPU engine: ${e.message}")
+        }
+        pendingGpuEngine = null
     }
 
     // ── Companion ──────────────────────────────────────────────────
 
     companion object {
         private const val TAG = "VlmEngineManager"
+
+        /**
+         * DEBUG-ONLY brain force (set via BrainToggleReceiver, debug builds
+         * only). Null = production auto-resolution (MiniCPM preferred, Gemma
+         * fallback). A forced brain whose file is missing fails LOUDLY with
+         * the standard not-found error — that is the corridor A/B contract.
+         * Release builds never set it.
+         */
+        @Volatile
+        var brainOverride: BrainModel? = null
+
+        /**
+         * DEBUG-ONLY CPU thread-count override for [Backend.CPU] attempts
+         * (Tier 2 CPU fallback / Tier 3). Null = tier default formula
+         * (min(4, max(2, cores/2))): unchanged behavior. Set/cleared by
+         * [com.vyze.app.debug.CpuThreadsToggleReceiver]; StickyProvider
+         * restores it at process start in debug builds (release never sets
+         * it — release behavior remains formula-driven).
+         *
+         * Exists because CPU prefill dominates wall time (94–99% profiled)
+         * and XNNPack thread scaling on little-core Helio SoCs is un-
+         * verified: the 60i session measures prefill/decode across 2/4/6/8
+         * and this makes each value a cold restart instead of an APK
+         * rebuild. Recomputed per backend construction, so mid-session
+         * changes only take effect at the next engine init.
+         */
+        @Volatile
+        var cpuThreadCountOverride: Int? = null
 
         /**
          * Pure Gemma 4 turn-format builder (companion so JVM unit tests can
@@ -1966,9 +2749,60 @@ class VlmEngineManager(
                 "<start_of_turn>model\n"
         }
 
-        // Model configuration — Gemma 4 E2B (2.59 GB) — generic multimodal with vision encoder
-        const val MODEL_FILE = "gemma-4-E2B-it.litertlm"
-        const val MIN_MODEL_SIZE = 500L * 1024 * 1024  // 500MB minimum sanity check
+        /**
+         * Brain dispatcher for turn formatting (companion: JVM-testable).
+         * Gemma keeps the ADK/LiteRT-LM role-tag contract; MiniCPM bundles
+         * carry their own ChatML template that RENDERS roles itself — we hand
+         * it plain content (the bundle emits <|im_start|> itself, per the HF
+         * card). Both forms keep the SAME anti-echo contract: labeled history
+         * inside ONE user payload, the CURRENT query last.
+         */
+        internal fun buildTurnPrompt(
+            brain: BrainModel,
+            userContent: String,
+            systemPrompt: String = "",
+            conversationTurns: List<Pair<String, String>> = emptyList()
+        ): String = when (brain) {
+            BrainModel.GEMMA_4E2B ->
+                companionBuildGemmaTurnPrompt(userContent, systemPrompt, conversationTurns)
+            BrainModel.MINICPM_V47_1B ->
+                companionBuildChatTurnPrompt(userContent, systemPrompt, conversationTurns)
+        }
+
+        /**
+         * MiniCPM (ChatML-template bundle) turn builder: NO Gemma role tags —
+         * the bundle template supplies the user/model roles around the plain
+         * content we pass. System directive + labeled history + current
+         * query, exactly the anti-echo contract of the Gemma form.
+         */
+        internal fun companionBuildChatTurnPrompt(
+            userContent: String,
+            systemPrompt: String = "",
+            conversationTurns: List<Pair<String, String>> = emptyList()
+        ): String {
+            val body = StringBuilder()
+            if (systemPrompt.isNotBlank()) {
+                body.append(systemPrompt)
+                body.append("\n\n")
+            }
+            if (conversationTurns.isNotEmpty()) {
+                body.append(
+                    "Recent conversation (context only — never repeat, echo, or quote these lines):\n"
+                )
+                conversationTurns.forEach { (q, a) ->
+                    body.append("User: ").append(q).append("\n")
+                    body.append("You answered: ").append(a).append("\n")
+                }
+                body.append("\n")
+            }
+            body.append(userContent.trimEnd())
+            return body.toString()
+        }
+
+        // Model file sanity check (applies to every [BrainModel] bundle — our
+        // production picks are 1.70 GB / 2.59 GB; the smallest usable bundle is
+        // the 1.22 GB text-only MiniCPM variant).
+        const val MIN_MODEL_SIZE = 500L * 1024 * 1024
 
         // Image preprocessing — no center-crop, just proportional downscale
         // Gemma 4 handles dynamic aspect ratios natively
@@ -1979,7 +2813,7 @@ class VlmEngineManager(
         const val TEMPERATURE = 0.1
         const val TOP_K = 1
         const val TOP_P = 1.0
-        const val MAX_TOKENS = 35
+        const val MAX_TOKENS = 32
 
         // Text-only Q&A and audio transcription caps
         const val TEXT_ONLY_MAX_TOKENS = 192
@@ -2263,7 +3097,17 @@ class VlmEngineManager(
         private const val VISUAL_TOKEN_BUDGET_TIER2 = 128
         private const val VISUAL_TOKEN_BUDGET_TIER3 = 160
 
-        /** CPU threads for the CPU-fallback backend (Tier 2 fallback / Tier 3). */
+        /**
+         * CPU threads for the CPU-fallback backend (Tier 2 fallback / Tier 3).
+         *
+         * Thread-scaling VERDICT (2026-10-15, Infinix Hot 60i / mt6768, 8 cores,
+         * same fridge scene ×2 per value, CPU-vision lane, [PIPELINE-BREAKDOWN]):
+         * PREFILL is NOT thread-bound — warmed-run PREFILL is flat across
+         * 2/4/6/8 (38.5 / 38.9 / 39.1 / 38.4 s); first-run variance (42.5–52.5 s)
+         * is cold-start warm-up, uncorrelated with thread count. Default 4 stays.
+         * Re-tested via the debug CpuThreadsToggleReceiver if a future engine
+         * or SoC changes the vision encode path.
+         */
         private const val CPU_FALLBACK_THREADS = 4
 
         /** Consecutive init failures before the engine degrades gracefully. */
@@ -2295,6 +3139,14 @@ class VlmEngineManager(
         private const val VLM_UNAVAILABLE_MESSAGE =
             "Visual AI is unavailable on this device. " +
                 "Text reading, color and light detection still work."
+
+        /**
+         * Spoken notice when the raw-audio rescue lane is unavailable
+         * (MiniCPM has no audio tower). Loud degradation, never silence.
+         */
+        private const val AUDIO_RESCUE_DEGRADED_MESSAGE =
+            "Voice backup is not available on this device setup. " +
+                "Your normal speech input still works — try again in a quieter place."
 
         private var nativeLibLoaded = false
 

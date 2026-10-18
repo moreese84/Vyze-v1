@@ -60,19 +60,21 @@ object VoiceEnginePolicy {
         gemmaAlwaysEnabled: Boolean,
         deviceOffline: Boolean,
         engineReady: Boolean,
-        engineIdle: Boolean
+        engineIdle: Boolean,
+        brainSupportsAudioInput: Boolean = true
     ): Engine {
-        if (engineReady && engineIdle) {
+        if (engineReady && engineIdle && brainSupportsAudioInput) {
             // Design A: the local engine is usable — prefer it whenever the
             // flag says so, ONLINE INCLUDED. The offline-first contract
             // (Gemma primary whenever there is no network) is unchanged.
+            // Only use VLM audio transcription if the brain actually supports audio.
             if (gemmaAlwaysEnabled || deviceOffline) return Engine.GEMMA_PRIMARY
             // Legacy routing: flag off + online → the platform recognizer
             // with all its ladder/rescue layers (unchanged behavior).
             return Engine.SYSTEM_RECOGNIZER
         }
-        // Engine unusable (not ready, busy, or absent): the system
-        // recognizer is the only safe mic. Even with the flag on, a dead
+        // Engine unusable (not ready, busy, or absent) OR brain has no audio encoder:
+        // the system recognizer is the only safe mic. Even with the flag on, a dead
         // local engine must not silence voice input.
         return Engine.SYSTEM_RECOGNIZER
     }

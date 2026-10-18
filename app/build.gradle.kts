@@ -141,7 +141,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("org.jetbrains.kotlin:kotlin-stdlib:${rootProject.extra["kotlin_version"]}")
     // kotlinx-coroutines 1.10.1 — built with Kotlin 2.1.20.
-    // Required: litertlm-android:0.16.1 internally calls SendChannel.close(Throwable?)
+    // Required: litertlm-android (≤0.16.1 era) internally calls SendChannel.close(Throwable?)
     // via a synthetic close$default method. Kotlin 2.3.0 + coroutines 1.9.0 have a
     // binary incompatibility where this synthetic is missing at runtime → NoSuchMethodError.
     // 1.10.1 generates the correct synthetic signature for Kotlin 2.x runtimes.
@@ -171,8 +171,15 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
 
-    // LiteRT-LM runtime for on-device VLM inference (SmolVLM2-500M)
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.1")
+    // LiteRT-LM runtime for on-device VLM inference.
+    // 0.18.0 (brain-swap M0.2, 2026-10-16): MiniCPM-V-4.7-1B bundles carry NO
+    // audio tower. 0.16.1 attaches a TF_LITE_AUDIO_ENCODER_HW subgraph on EVERY
+    // Conversation creation (audioBackend is non-nullable, no opt-out) →
+    // "NOT_FOUND: TF_LITE_AUDIO_ENCODER_HW not found in the model" and every
+    // inference dies. 0.18.0 — the version the litert-community conversion was
+    // tested on — makes the audio tower optional. Gemma E2B regression: must
+    // still load + answer with this runtime (debug selector --es brain gemma).
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.18.0")
 
     // ── Google ADK for Kotlin (ADK migration Phase 0) ─────────────
     // Orchestration layer ONLY. Inert until Phase 3/4: the VyzeAgentModule
