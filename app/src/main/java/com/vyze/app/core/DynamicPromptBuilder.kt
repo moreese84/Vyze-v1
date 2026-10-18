@@ -84,8 +84,21 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 textOnlyMode && dateRulesMode -> sb.appendLine(dateTextOnlyRulesFor(userLocale.language))
                 textOnlyMode -> sb.appendLine(TEXT_ONLY_RULES)
                 continuousMode -> sb.appendLine(CONTINUOUS_MODE_RULES)
-                isDirectQuery -> sb.appendLine(directQueryRulesFor(userLocale.language))
-                else -> sb.appendLine(navigationRulesFor(userLocale.language))
+                isDirectQuery -> sb.appendLine(
+                    // CPU-ERA LEAN (2026-10-18): the few-shot example blocks
+                    // (~0.9-1.1k chars/turn) are demonstration weight; the
+                    // first queries land while the GPU swap is still in
+                    // flight and every prompt token costs ~2.6 ms on the CPU
+                    // decoder (measured: 70-char question 3.0 s vs 5.8k-char
+                    // prompt 7.3 s, same engine). Strip the examples and
+                    // keep the bare rule prose while lean.
+                    if (leanMode) bareRulesFor(userLocale.language, direct = true)
+                    else directQueryRulesFor(userLocale.language)
+                )
+                else -> sb.appendLine(
+                    if (leanMode) bareRulesFor(userLocale.language, direct = false)
+                    else navigationRulesFor(userLocale.language)
+                )
             }
 
             // 2. OCR pre-extracted text (if available — feeds clean text to model)
@@ -536,6 +549,16 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "ms" -> directRulesMs
             "zh" -> directRulesZh
             else -> directRulesEn
+        }
+
+        /** Bare rule prose, no few-shot examples — the CPU-era-lean selector. */
+        private fun bareRulesFor(language: String, direct: Boolean): String {
+            val prose = if (direct) DIRECT_RULES_PROSE else NAV_RULES_PROSE
+            return when (language) {
+                "ms" -> "$prose\n(Contoh dilepaskan ketika menjawab cepat.)"
+                "zh" -> "$prose\n（示例已省略以加快响应。）"
+                else -> "$prose\n(Examples omitted for fast answering.)"
+            }
         }
 
         private const val DEFAULT_NAVIGATION_QUERY =

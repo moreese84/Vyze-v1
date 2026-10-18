@@ -1907,16 +1907,18 @@ class VyzeCoreController(
                 ) {
                     dialogueContextForPrompt()
                 } else null
-                // B (lean): prompts get a shorter memory block on CPU-vision
-                // tiers (Tier 2/3). The session was started before this flag
-                // existed on the downscaled lane, so the lean decision repeats
-                // the same tier check the downscale gate used.
-                val cpuVisionPromptLean = !isTextQuery && runCatching {
-                    vlmEngine.currentTier()
-                }.getOrNull() in listOf(
-                    DeviceTier.TIER_2, DeviceTier.TIER_3
+                // B (lean): prompts get a condensed memory block + no few-shot
+                // examples on CPU-vision tiers (Tier 2/3), and ALSO while the
+                // active engine is the CPU one (CPU-first era before the GPU
+                // swap lands) — boot-to-swap is the period a blind user waits
+                // longest, and every prompt token costs ~2.6 ms on the CPU
+                // decoder (measured 2026-10-18).
+                val cpuVisionPromptLean = !isTextQuery && (
+                    runCatching { vlmEngine.currentTier() }.getOrNull() in
+                        listOf(DeviceTier.TIER_2, DeviceTier.TIER_3) ||
+                    runCatching { vlmEngine.getActiveBackend() }.getOrNull() == "CPU"
                 )
-                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null}, lean=$cpuVisionPromptLean)")
+                CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null}, lean=$cpuVisionPromptLean, backend=${runCatching { vlmEngine.getActiveBackend() }.getOrNull()})")
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = taggedQuery ?: "User triggered a camera snapshot.",
                     queryOverride = taggedQuery,
@@ -1928,9 +1930,13 @@ class VyzeCoreController(
                     sensitiveIdMode = sensitiveIdModeActive,
                     medicineMissMode = medicineMissModeActive,
                     dateRulesMode = dateModeActive,
-                    memoryContext = memoryContext,
+                    // LEAN SUPPRESS (2026-10-18): while lean, keep the prior-
+                    // scene recall injection out of the rendered prompt — the
+                    // builder already skips its block; skipping here avoids
+                    // paying its confirmation prose too.
+                    memoryContext = if (cpuVisionPromptLean) null else memoryContext,
                     brevityLevel = brevityLevel,
-                    dialogueContext = dialogueContext,
+                    dialogueContext = if (cpuVisionPromptLean) null else dialogueContext,
                     leanMode = cpuVisionPromptLean
                 )
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
@@ -2594,7 +2600,14 @@ class VyzeCoreController(
                 // date asks. The date contract below is self-sufficient
                 // (device anchor + computed example); recall adds nothing
                 // but risk there, so date asks never consult it.
-                val recallRecords = if (companionHitsDateQuery(query)) {
+                // CPU-ERA LEAN (2026-10-18): text recall adds ~0.5-1k chars
+                // and its lookup latency; while the active engine is the CPU
+                // one (pre-swap era), skip retrieval — knowledge asks route
+                // mostly through the fast 70-char direct gate then.
+                val cpuEraServing = runCatching {
+                    vlmEngine.getActiveBackend()
+                }.getOrNull() == "CPU"
+                val recallRecords = if (companionHitsDateQuery(query) || cpuEraServing) {
                     emptyList()
                 } else try {
                     memoryRepository.recallByText(query)
