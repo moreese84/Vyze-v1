@@ -1182,7 +1182,20 @@ class VlmEngineManager(
                         // (~68 s) drops to GPU speed. Revert this line to
                         // `Backend.CPU()` unconditionally if the experiment
                         // shows a hang-then-timeout pattern.
-                        visionBackend = step.backend,
+                        // MIXED-BACKEND EXECUTOR (2026-10-18, litert-community
+                        // MiniCPM-V-4.7-1B model card): the card's own per-
+                        // backends table shows the image path is FASTER with
+                        // vision kept on CPU while the decoder rides the GPU
+                        // (iPhone 18 Pro Metal: vision-Metal TTFT 4.641 s vs
+                        // Metal decoder + CPU vision TTFT 2.481 s). On our
+                        // Mali the all-GPU config measures 7.36-7.39 s image
+                        // prefill; the bundle's CPU vision path is the
+                        // canonical fast one (Pixel 8a _int8vis: 2.2-3.0 s
+                        // first token). MiniCPM therefore binds vision=CPU,
+                        // decoder=GPU on the GPU swap. A/B on device:
+                        // target prefill ~4 s; if slower, revert this line to
+                        // `visionBackend = step.backend`.
+                        visionBackend = if (brain == BrainModel.PROD_DEFAULT) Backend.CPU() else step.backend,
                         // EXECUTOR SEPARATION (M0.2, 2026-10-16): only attach
                         // executors the ACTIVE bundle actually contains. The
                         // MiniCPM int8vis bundle has NO audio tower — hardcoding
