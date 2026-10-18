@@ -1702,7 +1702,13 @@ class VlmEngineManager(
                 SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
             )
             tPayload = System.currentTimeMillis() - stageStart
-            CrashLogFile.log(TAG, "Formatted prompt: ${formattedPrompt.take(120)}...")
+            // PROMPT-SIZE INSTRUMENTATION (2026-10-18): prefill is 100% of
+            // user-perceived latency and scales ~linearly with prompt tokens
+            // (~3.5 chars/token on this 2B model). Log the size on every
+            // inference so any prompt change is an A/B measurement, not a
+            // guess. Baseline before prompt slimming: ~3,300 chars on the
+            // continuous image lane (GPU prefill 8.0-8.1 s steady).
+            CrashLogFile.log(TAG, "Formatted prompt (${formattedPrompt.length} chars): ${formattedPrompt.take(120)}...")
 
             // 4. Build multimodal contents — formatted prompt text + clamped bitmap.
             //    The native engine binds image patch tokens from Content.ImageBytes
@@ -1756,7 +1762,8 @@ class VlmEngineManager(
                 TAG,
                 "[ANALYZE-BREAKDOWN] total=${elapsed}ms preprocess=${tPreprocess}ms " +
                     "jpeg=${tJpeg}ms payload=${tPayload}ms lane-wait=${tLane}ms " +
-                    "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${decodeNote}"
+                    "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${decodeNote} " +
+                    "prompt=${formattedPrompt.length}chars"
             )
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
             response
@@ -2836,27 +2843,26 @@ class VlmEngineManager(
          * `[OUTPUT LANGUAGE: …]` (top) + `REMEMBER: Respond only in …`
          * (bottom) wrappers remain the sole language authorities.
          */
+        /*
+         * PROMPT-SLIMMING (2026-10-18, A/B evidence): user-perceived latency
+         * is 100% prefill, which scales with prompt tokens. The directive
+         * layers previously full-duplicated the [OUTPUT LANGUAGE] tag rules
+         * (~630 chars), anti-echo (~160), and the plain-text/TTS contract
+         * (~300) on EVERY turn. Each rule now appears exactly ONCE in the
+         * stack: language authority lives in DynamicPromptBuilder's top tag
+         * + mandate + bottom REMEMBER line; behavior rules live here in one
+         * short line each. Every test-pinned regression-fix phrase (tag
+         * authority, garble clause, anti-echo) is preserved verbatim.
+         */
         private const val TEXT_ONLY_SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
-            "Answer in 1 short spoken sentence. " +
-            "Always address the user directly. " +
+            "Answer the user's question directly in 1 short spoken sentence — " +
+            "never repeat or echo their question, never say you are an AI or offline. " +
             "If past conversation turns are provided, refer to them when relevant. " +
-            "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the start " +
-            "of your response. Begin immediately with the direct answer. " +
-            "LANGUAGE MIRRORING: Respond in the language named in the [OUTPUT LANGUAGE] " +
-            "tag of the user's instructions — the tag is the authority on the answer " +
-            "language. Even when the query text itself reads like English, the tag names " +
-            "the user's actual spoken language — answer in the tag's language. If no tag " +
-            "is present, detect the language of the user's query and respond strictly in " +
-            "that exact same language (Malay query -> Malay response, English query -> " +
-            "English response, Chinese query -> Chinese response); Never revert to default " +
-            "English if the user speaks another language. " +
-            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
-            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
-            "number signs, underscores, or emoji, and never use lists or headings. " +
-            "Write plain flowing sentences only. " +
-            "Use clear punctuation (periods and commas) for spoken delivery. " +
-            "Do not mention that you are an AI or offline."
+            "Reply in the language named in the [OUTPUT LANGUAGE] tag (no tag: " +
+            "mirror the language of the user's query exactly). " +
+            "Pure plain text for text to speech: no markdown symbols, bullets, " +
+            "dashes, asterisks, or emoji, plain flowing sentences with clear punctuation."
 
         // Timeouts
         private const val INFERENCE_TIMEOUT_SEC = 180L  // 3 min for real inference
@@ -2898,38 +2904,18 @@ class VlmEngineManager(
          */
         private const val SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
-            "Answer in 1 short spoken sentence about what you see. " +
-            "Always address the user directly. " +
-            "Refer to past conversation turns when they are provided. " +
-            "CRITICAL: NEVER repeat, echo, or quote the user's query or question at the " +
-            "start of your response. Begin immediately with the direct description or answer. " +
-            "Always lead directly with the answer to the user's question without any " +
-            "introductory location preamble. " +
-            "If asked what color this is, reply directly with the color ('That is a red mug.'). " +
-            "If asked to read text, reply directly with the text ('It says Organic Milk.'). " +
-            "Only mention spatial position ('in front of you', 'to your left') when the user " +
-            "specifically asks WHERE an object is located. " +
-            "NEVER start a sentence with 'You are in front of', 'You are looking at', " +
-            "'You are facing', or 'In front of you is' — vary the opening with the question. " +
-            "IMPORTANT EXCEPTION: when OCR text is provided in the prompt, the one-sentence " +
-            "rule does NOT apply — read the OCR text in full, in reading order, and do not " +
-            "summarize, skip, or stop early. " +
-            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
-            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
-            "number signs, underscores, or emoji, and never use lists or headings. " +
-            "Write plain spoken sentences only. " +
-            "LANGUAGE MIRRORING: Respond in the language named in the [OUTPUT LANGUAGE] " +
-            "tag of the user's instructions — the tag is the authority on the answer " +
-            "language. Even when the query text itself reads like English, the tag names " +
-            "the user's actual spoken language — answer in the tag's language. If no tag " +
-            "is present, detect the language of the user's query and respond strictly in " +
-            "that exact same language (Malay query -> Malay response, English query -> " +
-            "English response, Chinese query -> Chinese response); Never revert to default " +
-            "English if the user speaks another language. " +
-            "On follow-up turns answer only what is new, in the tag's language, and never " +
-            "speak the user's question back to them. " +
-            "Describe what you see directly without cross-translating or outputting " +
-            "internal reasoning chains."
+            "Answer in 1 short spoken sentence about what you see, leading directly with " +
+            "the answer — never repeat, echo, or quote the user's query. If asked what " +
+            "color this is, reply with the color; if asked to read text, reply with the " +
+            "text. Mention spatial position ('your left') ONLY when the user asks WHERE " +
+            "an object is. OCR EXCEPTION: when OCR text is provided, read ALL of it in " +
+            "reading order — the one-sentence cap does not apply. " +
+            "Pure plain text for text to speech: no markdown symbols, bullets, dashes, " +
+            "asterisks, or emoji, plain spoken sentences only. On follow-up turns answer " +
+            "only what is new. Reply in the language named in the [OUTPUT LANGUAGE] tag " +
+            "(the tag is the authority on the answer language; query-detection is only " +
+            "the no-tag fallback — never default to English otherwise). Describe what " +
+            "you see directly, without cross-translating or reasoning-chains."
 
         /**
          * Second-person spatial directive, emitted in the ACTIVE language by
@@ -2939,25 +2925,16 @@ class VlmEngineManager(
          * English persona examples when mirroring ms/zh output.
          */
         private const val PERSPECTIVE_EN =
-            "Always address the user directly in the second person ('you', 'your', 'in front of you'). " +
-            "NEVER say 'in front of me' or 'to my left' — always describe positions relative to the " +
-            "user ('in front of you', 'to your left', 'at 12 o'clock'). " +
-            "Mention spatial position only when the question asks WHERE something is, and then " +
-            "state the object first ('Your cup is directly to your right.'). NEVER begin a sentence " +
-            "with 'You are in front of', 'You are looking at', 'You are facing', or 'In front of you is'."
+            "Describe positions relative to the USER ('in front of you', 'to your left', " +
+            "'at 12 o'clock') — never 'my left'. Spatial wording only when the question " +
+            "asks WHERE; state the object first. Never open every sentence the same way."
         private const val PERSPECTIVE_MS =
-            "Sentiasa rujuk pengguna dalam kata ganti nama kedua ('anda', 'di hadapan anda'). " +
-            "JANGAN sesekali kata 'di hadapan saya' atau 'di sebelah kiri saya' — sentiasa nyatakan " +
-            "kedudukan relatif kepada pengguna ('di hadapan anda', 'di sebelah kiri anda', 'pukul 12'). " +
-            "Sebut kedudukan hanya apabila soalan bertanya DI MANA sesuatu berada, dan nyatakan " +
-            "objek dahulu ('Cawan anda berada di sebelah kanan anda.'). JANGAN mulakan setiap ayat " +
-            "dengan frasa yang sama, seperti 'Di hadapan anda ialah', 'Anda berada di hadapan', " +
-            "atau 'Anda sedang melihat'."
+            "Nyatakan kedudukan relatif kepada PENGGUNA ('di hadapan anda', 'di sebelah kiri " +
+            "anda', 'pukul 12') — jangan sesekali 'saya'. Sebut kedudukan hanya bila soalan " +
+            "bertanya DI MANA; nyatakan objek dahulu. Jangan mulakan setiap ayat sama."
         private const val PERSPECTIVE_ZH =
-            "始终使用第二人称直接称呼用户（'你'、'在你面前'）。" +
-            "绝不要说'在我面前'或'在我左边'——始终以用户为基准描述位置（'在你面前'、'在你的左边'、'12点钟方向'）。" +
-            "只有当问题询问位置时才提到方位，并且先说物体——例如'您的杯子就在您右手边'。" +
-            "绝不要每一句都用同样的开头，如'你面前是'、'你正在看'或'你在……的前面'。"
+            "位置以用户为基准来描述（'在你面前'、'在你的左边'、'12点钟方向'）——绝不要用'我'作基准。 " +
+            "只有当问题询问位置时才提到方位，并且先说物体。每句开头不要一样。"
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */

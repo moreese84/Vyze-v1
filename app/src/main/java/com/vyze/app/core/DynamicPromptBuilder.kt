@@ -671,13 +671,11 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
         private const val LANGUAGE_MIRRORING_MANDATE =
             "LANGUAGE MIRRORING: Respond in the language named in the " +
             "[OUTPUT LANGUAGE] tag — the tag is the authority on the answer " +
+            "language. Even when the query text itself reads like English, the " +
+            "tag names the user's actual spoken language — answer in the tag's " +
             "language. If no tag is present, detect the language of the user's " +
-            "query and respond strictly in that exact same language (e.g., " +
-            "Malay query -> Malay response, English query -> English response, " +
-            "Chinese query -> Chinese response). Never revert to default English " +
-            "if the user speaks another language. Even when the query text " +
-            "itself reads like English, the tag names the user's actual spoken " +
-            "language — answer in the tag's language."
+            "query and respond strictly in that exact same language. Never " +
+            "revert to default English if the user speaks another language."
 
         /**
          * Output contract placed DIRECTLY under the current query — the last
