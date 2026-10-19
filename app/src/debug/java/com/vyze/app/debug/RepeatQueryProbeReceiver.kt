@@ -34,6 +34,15 @@ import kotlinx.coroutines.launch
  *
  * Optional extras: --es text "..." (default: a text-only geography question
  * the card's corpus answers), --ei delayMs 2500 (gap between runs).
+ *
+ * IMAGE MODE (--ez image true): runs the same N-loop through the IMAGE
+ * path ([VlmEngineManager.analyzeImage]) on a SYNTHESIZED 640×640 bitmap
+ * (solid shapes + text — content irrelevant, timing real: the full vision
+ * encode + prompt prefill + decode run on the engine's actual backends).
+ * Used with the vision-GPU corridor receiver this turns the
+ * "GPU vision vs CPU vision" prefill A/B into a scripted, repeatable
+ * measurement (one [VlmEngineManager] engine call per run, same probe
+ * discipline as the text runs).
  */
 class RepeatQueryProbeReceiver : BroadcastReceiver() {
 
@@ -42,6 +51,7 @@ class RepeatQueryProbeReceiver : BroadcastReceiver() {
             ?: "What is the capital of France? Answer in one short sentence."
         val times = intent.getIntExtra("times", 3).coerceIn(1, 8)
         val delayMs = intent.getIntExtra("delayMs", 2500).toLong()
+        val imageMode = intent.getBooleanExtra("image", false)
 
         val controller = (context.applicationContext as VyzeApplication).coreController
         if (controller == null) {
@@ -54,13 +64,28 @@ class RepeatQueryProbeReceiver : BroadcastReceiver() {
             return
         }
 
+        val probeBitmap = if (imageMode) synthesizedProbeBitmap() else null
+
         CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-            CrashLogFile.log(TAG, "=== #3165 REPEAT-QUERY PROBE: $times runs, same question, one engine ===")
+            CrashLogFile.log(
+                TAG,
+                "=== #3165 REPEAT-QUERY PROBE: $times runs, " +
+                    (if (imageMode) "IMAGE" else "text") + ", same question, one engine ==="
+            )
             for (i in 1..times) {
                 delay(delayMs)
                 val start = System.currentTimeMillis()
                 val answer = try {
-                    engine.analyzeText(question, sessionId = "probe3165-$i", maxTokens = 96)
+                    if (imageMode && probeBitmap != null) {
+                        engine.analyzeImage(
+                            probeBitmap,
+                            question,
+                            sessionId = "probe3165-img-$i",
+                            maxTokens = 96
+                        )
+                    } else {
+                        engine.analyzeText(question, sessionId = "probe3165-$i", maxTokens = 96)
+                    }
                 } catch (e: Throwable) {
                     "<THROWN: ${e.javaClass.simpleName}: ${e.message}>"
                 }
@@ -73,6 +98,34 @@ class RepeatQueryProbeReceiver : BroadcastReceiver() {
             }
         }
     }
+
+    /**
+     * Synthetic 640×640 probe image: flat foreground shapes over a
+     * contrasting background plus a text label. Timing-relevant only —
+     * the vision encoder's cost is driven by input pixels, not content —
+     * so the probe stays deterministic and needs no camera surface.
+     */
+    private fun synthesizedProbeBitmap(): android.graphics.Bitmap =
+        android.graphics.Bitmap.createBitmap(640, 640, android.graphics.Bitmap.Config.ARGB_8888)
+            .apply {
+                val canvas = android.graphics.Canvas(this)
+                canvas.drawColor(android.graphics.Color.rgb(190, 214, 230))
+                canvas.drawRect(
+                    80f, 380f, 300f, 560f,
+                    android.graphics.Paint().apply {
+                        color = android.graphics.Color.rgb(30, 90, 170); isAntiAlias = true
+                    }
+                )
+                canvas.drawOval(
+                    360f, 120f, 560f, 320f,
+                    android.graphics.Paint().apply {
+                        color = android.graphics.Color.rgb(200, 50, 50); isAntiAlias = true
+                    }
+                )
+                android.graphics.Paint().apply {
+                    color = android.graphics.Color.BLACK; textSize = 64f; isAntiAlias = true
+                }.let { canvas.drawText("PROBE 112", 150f, 120f, it) }
+            }
 
     private companion object {
         const val TAG = "RepeatQueryProbe"

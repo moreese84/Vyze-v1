@@ -1191,11 +1191,28 @@ class VlmEngineManager(
                         // Mali the all-GPU config measures 7.36-7.39 s image
                         // prefill; the bundle's CPU vision path is the
                         // canonical fast one (Pixel 8a _int8vis: 2.2-3.0 s
-                        // first token). MiniCPM therefore binds vision=CPU,
-                        // decoder=GPU on the GPU swap. A/B on device:
-                        // target prefill ~4 s; if slower, revert this line to
-                        // `visionBackend = step.backend`.
-                        visionBackend = if (brain == BrainModel.PROD_DEFAULT) Backend.CPU() else step.backend,
+                        // first token). RESOLVED 2026-10-18 A/B: mixed
+                        // (vision CPU) prefill 3.7-4.3 s vs all-GPU 7.36-7.39 s
+                        // on the GT 50 Pro — the pin WAS the measured winner.
+                        // VISION-BACKEND POLICY (2026-10-19, tier + GPU-family
+                        // adaptive): the single CPU pin applied to every phone;
+                        // [companionMiniCpmVisionBackendName] now keys the
+                        // choice on the device's own profile — Tier 1 + Adreno
+                        // (the model card's measured-fastest family) attempts
+                        // GPU vision, every Mali / lower tier keeps the
+                        // measured CPU path. DEBUG corridor override via
+                        // [debugGpuVisionOverride] (VisionGpuToggleReceiver).
+                        visionBackend = run {
+                            val (name, why) = companionMiniCpmVisionBackendName(
+                                isMiniCpm = brain == BrainModel.PROD_DEFAULT,
+                                stepIsGpu = step.backend !is Backend.CPU,
+                                tier = tier,
+                                hardware = try { Build.HARDWARE ?: "" } catch (_: Throwable) { "" },
+                                debugOverride = debugGpuVisionOverride
+                            )
+                            CrashLogFile.log(TAG, "Vision backend resolved: $name — $why")
+                            if (name == "GPU") Backend.GPU() else Backend.CPU()
+                        },
                         // EXECUTOR SEPARATION (M0.2, 2026-10-16): only attach
                         // executors the ACTIVE bundle actually contains. The
                         // MiniCPM int8vis bundle has NO audio tower — hardcoding
@@ -2986,6 +3003,109 @@ class VlmEngineManager(
          * Reported 4.0 GB ≈ nominal 4.5 GB+.
          */
         private const val VLM_BYPASS_TOTAL_RAM_MB = 4000L
+
+        /**
+         * DEBUG-ONLY corridor override for the MiniCPM vision backend
+         * (VisionGpuToggleReceiver, src/debug — never compiled into release):
+         *
+         *  - `true`  → force GPU vision for the next engine build.
+         *  - `null`  → policy ([companionMiniCpmVisionBackendName]) decides.
+         *
+         * Takes effect at the NEXT engine build — flip via adb, then
+         * force-stop and relaunch the process. Default `null` in every
+         * release build (the setter does not exist there).
+         */
+        @Volatile
+        var debugGpuVisionOverride: Boolean? = null
+
+        /**
+         * MINICPM VISION-BACKEND POLICY — tier + GPU-family adaptive.
+         * Pure + JVM-testable (VisionBackendPolicyTest pins every branch);
+         * companion so tests never construct the manager.
+         *
+         * History of this seam:
+         *  1. 2026-10-09 v1: global `Backend.CPU()` pin (blind, pre-measure).
+         *  2. 2026-10-18: measured mixed backend (vision CPU + decoder GPU)
+         *     on the GT 50 Pro — 7.36-7.39 s (all-GPU) vs 3.7-4.3 s (mixed)
+         *     image prefill. The pin was the measured Mali winner but did
+         *     NOT adapt: every phone, every tier, got the same choice.
+         *  3. 2026-10-19 (this policy): the choice keys on the device's own
+         *     profile:
+         *     - MiniCPM on Tier 1 + Adreno → GPU vision: the ONE family the
+         *       model card shows vision-on-GPU as the fastest path (Galaxy
+         *       S26: 0.93 s first token vs 2.11 s with CPU vision).
+         *     - MiniCPM everywhere else (Mali / lower tiers / unknown HW)
+         *       → CPU vision: the measured-winner + hang-safe line
+         *       (Mali-G57 vision hang 2026-10-09; GT 50 Pro Mali A/B
+         *       2026-10-18; GPU-swap engine inherits the same thumb).
+         *     - Non-MiniCPM brains → engine plan backend unchanged (Gemma
+         *       dragged vision with the engine and has no measured
+         *       counter-case on file).
+         *
+         * SAFETY: a GPU-vision ATTEMPT that fails at runtime is contained
+         * by the controller's first-image watchdog + grading — attempting
+         * on the one measured-fast family costs nothing when the family is
+         * genuinely capable, and the Adreno-only gate means the known-bad Mali
+         * drivers can never see the path.
+         *
+         * @param isMiniCpm   brain == BrainModel.PROD_DEFAULT.
+         * @param stepIsGpu   the engine plan step runs on GPU — doubles as
+         *   the plan-level GPU allowance: when the adaptive gate drops GPU
+         *   from the plan, GPU vision is dropped with it (a device whose
+         *   decoder GPU failed must not be handed a GPU vision encoder).
+         * @param tier        the classified hardware tier.
+         * @param hardware    Build.HARDWARE (SoC id, e.g. "mt6899" or "sm8550").
+         * @param debugOverride DEBUG corridor override; `true` = forced GPU,
+         *   `null` = policy.
+         * @return ("GPU" | "CPU", human-readable reason for the log).
+         */
+        internal fun companionMiniCpmVisionBackendName(
+            isMiniCpm: Boolean,
+            stepIsGpu: Boolean,
+            tier: DeviceTier,
+            hardware: String,
+            debugOverride: Boolean?,
+        ): Pair<String, String> {
+            if (debugOverride != null) {
+                return if (debugOverride)
+                    "GPU" to "DEBUG FORCE — corridor A/B vision-GPU"
+                else
+                    "CPU" to "DEBUG OFF — corridor A/B policy re-check"
+            }
+            if (!isMiniCpm) {
+                return if (stepIsGpu)
+                    "GPU" to "non-MiniCPM brain: vision rides the engine plan"
+                else
+                    "CPU" to "non-MiniCPM brain: vision rides the engine plan"
+            }
+            return if (stepIsGpu && tier == DeviceTier.TIER_1 && isAdrenoGpu(hardware))
+                "GPU" to "Tier 1 Adreno — model-card vision-GPU fastest (Galaxy S26: 0.93 s first token)"
+            else
+                "CPU" to "measured winner on this class (GT 50 Pro Mali A/B 2026-10-18: " +
+                    "GPU vision 7.36-7.39 s vs mixed 3.7-4.3 s; Mali-G57 vision hang 2026-10-09)"
+        }
+
+        /**
+         * Adreno-GPU heuristic over [Build.HARDWARE] (pure, JVM-testable).
+         *
+         * Qualcomm SoC families carry Adreno GPUs whose OpenCL drivers the
+         * LiteRT-LM GPU delegate handles well on BOTH flagship (8-series)
+         * and mid-range (6/7-series) silicon; MediaTek SoCs carry Mali, the
+         * family with the measured vision-path problems (slow A/B on
+         * Mali-G720, hang on Mali-G57).
+         */
+        internal fun isAdrenoGpu(hardware: String): Boolean {
+            val hw = hardware.lowercase(Locale.US)
+            if (hw.isEmpty()) return false
+            // Codename hardware strings (qcom/msmnile/kona/taro/kalama/...)
+            val qualcommNames = listOf(
+                "qcom", "msmnile", "kona", "lahaina", "taro", "kalama",
+                "pineapple", "atoll", "lito", "bengal", "holi"
+            )
+            if (qualcommNames.any { hw.contains(it) }) return true
+            // SoC-style ids: sm8550, sdm845, msm8998, qcs9075, qcm6490
+            return Regex("\\b(sm|sdm|msm|qcs|qcm)\\d").containsMatchIn(hw)
+        }
 
         /**
          * Tier classification from total RAM + GPU class + the OS low-RAM

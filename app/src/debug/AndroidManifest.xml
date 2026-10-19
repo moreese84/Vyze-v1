@@ -111,6 +111,27 @@
             android:exported="true" />
 
         <!--
+            Vision-GPU corridor toggle (debug only): forces the MiniCPM GPU
+            vision-backend override so the vision encoder can be A/B-measured
+            on-device ("Vision backend resolved:" lines). The override is
+            read at engine build time — flip, then force-stop and relaunch.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.VisionGpuToggleReceiver"
+            android:exported="true" />
+
+        <!--
+            Sticky vision-GPU restore (debug only): same discipline as the
+            pre-gate/brain sticky providers — survives OEM kills during test
+            cycles so the corridor stays armed through a mid-A/B restart.
+            Stub provider; does not exist in release builds.
+        -->
+        <provider
+            android:name="com.vyze.app.debug.VisionGpuStickyProvider"
+            android:authorities="${applicationId}.debug.visiongpusticky"
+            android:exported="false" />
+
+        <!--
             #3165 repeat-query probe (debug only): fires the same question N
             times as separate Conversations on the shared engine to reproduce
             the model card's recurrent-state contamination finding. No
