@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import com.google.ai.edge.litertlm.Backend
@@ -1151,6 +1152,7 @@ class VlmEngineManager(
                 "Trying ${step.backendName} backend [${brain.displayName}] (tier=$tier, contextTokens=${step.contextTokens})..."
             )
             onStepProgress?.invoke(35, "Preparing my vision...")
+            lastEngineBuildTimedOut = false
 
             // Drop whatever we can BEFORE the native side allocates KV-cache
             // tensors — on lower-tier hardware every reclaimed MB counts.
@@ -1230,12 +1232,14 @@ class VlmEngineManager(
                 )
 
                 if (eng == null) {
+                    lastEngineBuildTimedOut = true
                     CrashLogFile.logError(
                         TAG,
                         "${step.backendName} build exceeded ${timeoutMs / 1000}s budget — treating as failure"
                     )
                     return@withLock null
                 }
+                lastEngineBuildTimedOut = false
 
                 // Success — the CALLER decides whether this engine becomes
                 // the active serving engine ([createEngineGuarded]) or stays
@@ -1333,6 +1337,17 @@ class VlmEngineManager(
     /** Serializes background GPU builds — one native GPU build at a time. */
     private val backgroundGpuBuildActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * Set by [buildEngineForBackend] when the JUST-FINISHED attempt ended by
+     * EXCEEDING the build budget (true) vs. by exception/init-throw (false).
+     * Serialized under [engineInitMutex] (both paths hold it), so the
+     * background-build caller can read it right after the attempt returns.
+     * Timeout is a down-clock/suspect-slow signal — never recorded as a GPU
+     * failure (see launchBackgroundGpuBuild).
+     */
+    @Volatile
+    private var lastEngineBuildTimedOut = false
+
     /** Idle-swap polling cadence and overall patience. */
     private val swapPollIntervalMs = 2_000L
     private val swapMaxWaitMs = 180_000L
@@ -1344,7 +1359,22 @@ class VlmEngineManager(
      * declared "failed" 7 min after start because freeze time consumed the
      * deadline) — a background build gets a generous budget instead.
      */
-    private val backgroundEngineCreateTimeoutMs = 300_000L
+    // 600 s (raised from 300 s, 2026-10-19): with the CPU wake lock held the
+    // compile KEEPS RUNNING after screen-off — and the vendor firmware
+    // down-clocks cores when the display is asleep, so the same OpenCL compile
+    // that takes ~1-2 min with the screen on took >5 min under the lock. A
+    // 300 s budget then turned a healthy-but-slow build into a 24 h GPU ban.
+    // 10 min is the largest plausible budget; the wake lock ceiling below
+    // must stay comfortably above it.
+    private val backgroundEngineCreateTimeoutMs = 600_000L
+
+    /**
+     * Highest ceiling the CPU wake lock below is ever held for rearming the
+     * GPU build. The lock protects the ~1-4 min OpenCL compile + warm-up
+     * against suspend/hibernation; the value is a bound, not a target — the
+     * lock is released the moment the build ends either way.
+     */
+    private val backgroundGpuBuildWakeLockMs = 660_000L
 
     /**
      * Build the GPU engine IN THE BACKGROUND for a remembered-GPU device
@@ -1358,6 +1388,26 @@ class VlmEngineManager(
         if (!backgroundGpuBuildActive.compareAndSet(false, true)) {
             CrashLogFile.log(TAG, "Background GPU build already running — not spawning another")
             return
+        }
+        // CPU WAKE LOCK (2026-10-19): the vendor hibernation froze the process
+        // when the screen went off — three sessions in a row the build stalled
+        // mid-OpenCL-compile and the process then died (lmkd, 2.5 GB RSS) or
+        // sat frozen until the next session, so the GPU swap NEVER landed and
+        // the device was stuck serving every query on the CPU engine (the
+        // 12-13 s prefill era, both text and image lanes). A partial wake lock
+        // lets the compile keep the CPU across screen-off for the build
+        // window; released in the finally below on every exit path.
+        val wakeLock = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vyze:engineGpuBuild")
+        }.getOrNull()
+        if (wakeLock != null) {
+            wakeLock.setReferenceCounted(false)
+            wakeLock.acquire(backgroundGpuBuildWakeLockMs)
+            CrashLogFile.log(
+                TAG,
+                "Background GPU build: CPU wake lock held (ceiling ${backgroundGpuBuildWakeLockMs / 1000}s — released on build end)"
+            )
         }
         scope.launch {
             try {
@@ -1377,17 +1427,32 @@ class VlmEngineManager(
                     timeoutOverrideMs = backgroundEngineCreateTimeoutMs
                 )
                 if (gpuEngine == null) {
-                    // Symmetric memory with the blocking path: a GPU build
-                    // failure keeps this device remembering CPU-only for the
-                    // backoff window instead of re-burning ~90 s next launch.
-                    try {
-                        VyzeAdaptiveBackend.recordGpuFailure(context)
+                    // Timeout ≠ fault (2026-10-19): a build that merely ran
+                    // past the budget (slow under down-clocked cores with the
+                    // wake lock holding it) is NOT a broken GPU — recording it
+                    // as one banned GPU attempts for the full backoff window
+                    // and pinned the device onto the slow CPU era. A timed-out
+                    // background build defers instead: no ban, next launch
+                    // re-attempts. Real exceptions (init throw above, recorded
+                    // per step in the blocking path) still earn the ban.
+                    if (lastEngineBuildTimedOut) {
                         CrashLogFile.log(
                             TAG,
-                            "Adaptive policy: background GPU failure recorded — GPU attempts skipped for " +
-                                "${VyzeAdaptiveBackend.GPU_FAIL_BACKOFF_MS / (60 * 60 * 1000)}h"
+                            "Adaptive policy: background GPU build timed out at budget — deferred, NO failure recorded; next launch re-attempts"
                         )
-                    } catch (_: Throwable) { /* failure memory is advisory */ }
+                    } else {
+                        // Symmetric memory with the blocking path: a GPU build
+                        // failure keeps this device remembering CPU-only for the
+                        // backoff window instead of re-burning ~90 s next launch.
+                        try {
+                            VyzeAdaptiveBackend.recordGpuFailure(context)
+                            CrashLogFile.log(
+                                TAG,
+                                "Adaptive policy: background GPU failure recorded — GPU attempts skipped for " +
+                                    "${VyzeAdaptiveBackend.GPU_FAIL_BACKOFF_MS / (60 * 60 * 1000)}h"
+                            )
+                        } catch (_: Throwable) { /* failure memory is advisory */ }
+                    }
                     return@launch
                 }
 
@@ -1453,6 +1518,10 @@ class VlmEngineManager(
                 Log.e(TAG, "Background GPU build error", e)
             } finally {
                 backgroundGpuBuildActive.set(false)
+                if (wakeLock != null) {
+                    runCatching { if (wakeLock.isHeld) wakeLock.release() }
+                        .onFailure { CrashLogFile.log(TAG, "Background GPU build: wake lock release failed: ${it.message}") }
+                }
             }
         }
     }

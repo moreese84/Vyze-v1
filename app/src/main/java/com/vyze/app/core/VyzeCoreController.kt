@@ -1913,10 +1913,11 @@ class VyzeCoreController(
                 // swap lands) — boot-to-swap is the period a blind user waits
                 // longest, and every prompt token costs ~2.6 ms on the CPU
                 // decoder (measured 2026-10-18).
-                val cpuVisionPromptLean = !isTextQuery && (
-                    runCatching { vlmEngine.currentTier() }.getOrNull() in
-                        listOf(DeviceTier.TIER_2, DeviceTier.TIER_3) ||
-                    runCatching { vlmEngine.getActiveBackend() }.getOrNull() == "CPU"
+                val cpuVisionPromptLean = companionCpuEraLeanMode(
+                    isTextQuery = isTextQuery,
+                    tierIsCpuVision = runCatching { vlmEngine.currentTier() }.getOrNull() in
+                        listOf(DeviceTier.TIER_2, DeviceTier.TIER_3),
+                    activeBackend = runCatching { vlmEngine.getActiveBackend() }.getOrNull(),
                 )
                 CrashLogFile.log(TAG, "Building prompt... (brevity=${brevityLevel.label}, dialogue=${dialogueContext != null}, lean=$cpuVisionPromptLean, backend=${runCatching { vlmEngine.getActiveBackend() }.getOrNull()})")
                 val basePrompt = promptBuilder.buildPrompt(
@@ -3318,6 +3319,40 @@ class VyzeCoreController(
          * budget is preserved (thermal policy already handles those separately).
          */
         private const val CPU_VISION_SCENE_DIM = 192
+
+        /**
+         * CPU-ERA LEAN-MODE GATE (pure + JVM-testable, CpuEraLeanPolicyTest).
+         * Decides whether a query's prompt is built in lean form (recall/
+         * dialogue/few-shot blocks dropped). History:
+         *
+         *  2026-10-18 v1: image lanes only, Tier 2/3 (perma-CPU-vision) OR
+         *    active engine = CPU (boot-to-swap).
+         *  2026-10-19 v2 (this gate): the CPU-era branch covers TEXT lanes
+         *    too. A text-lane query built to 5,878 chars at backend=CPU ate
+         *    a 12.7 s prefill (first complaint of this era); the recall/
+         *    dialogue/few-shot blocks lean drops are exactly the blocks a
+         *    text lane renders dynamically, and the OCR/question content
+         *    itself (the one thing a text lane must keep) is passed through
+         *    ocrText/queryOverride — never part of the lean suppression.
+         *
+         * @param isTextQuery    OCR/reading/text-question lane (read
+         *   fidelity is mandatory).
+         * @param tierIsCpuVision the device tier runs vision on CPU
+         *   permanently (Tier 2/3).
+         * @param activeBackend  the serving engine's backend ("CPU" during
+         *   the boot-to-swap era, "GPU" after the swap, null = unknown).
+         */
+        internal fun companionCpuEraLeanMode(
+            isTextQuery: Boolean,
+            tierIsCpuVision: Boolean,
+            activeBackend: String?,
+        ): Boolean =
+            // Tier 2/3: image lanes lean, text lanes keep full fidelity.
+            (tierIsCpuVision && !isTextQuery) ||
+                // CPU era: every lane leans — the boot-to-swap stretch is
+                // the longest wait a blind user experiences, and prompt
+                // tokens cost ~2.6 ms each on this decoder.
+                (activeBackend == "CPU")
         /**
          * If the model emits this many characters without sentence-ending
          * punctuation, flush anyway so speech never stalls mid-generation.

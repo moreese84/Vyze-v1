@@ -27,6 +27,12 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Background GPU-engine build: without a CPU wake lock the OEM
+         hibernation froze the process mid-OpenCL-compile (observed 3×
+         2026-10-19 on the GT 50 Pro) and the build then died with the
+         process — the device never reached the GPU era and served every
+         query on the slow CPU engine. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Read-only network-state check: lets the app detect offline mode and
          strip the cloud-only recognizer extras (language auto-detect) that
          fail without connectivity. No data leaves the device. -->
