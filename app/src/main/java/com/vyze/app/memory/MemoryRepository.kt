@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.InteractionRecord
+import com.vyze.app.data.SuspectMarker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -120,8 +121,27 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
             // 1. Generate query embedding
             val queryEmbedding = EmbeddingEngine.generateEmbedding(bitmap)
 
-            // 2. Load all stored interactions (bounded by MAX_INTERACTIONS)
-            val candidates = interactionDao.getRecent(MAX_INTERACTIONS)
+            // 2. Load all stored interactions (bounded by MAX_INTERACTIONS),
+            //    excluding suspect-marked rows (pre-labeled FAILURE evidence)
+            //    and anchor-era parrot rows (provable template output such as
+            //    the bracket echo records 536/537, which carry EMPTY
+            //    feedback — marks alone cannot catch them until the startup
+            //    purge lands, so the output is checked directly here),
+            //    and canned refusals ("Text is unclear." — zero scene fact;
+            //    injecting one re-anchored the next answer on the refusal,
+            //    device 10:19:45 → 10:19:55).
+            //    None may anchor a future answer via "Prior scene memory"
+            //    injection (memory-poisoning guard, 2026-10-20/21).
+            val allRecent = interactionDao.getRecent(MAX_INTERACTIONS)
+            val candidates = allRecent.filterNot {
+                SuspectMarker.hasSuspectMark(it.feedback) ||
+                    AnchorEraParrot.isAnchorEraParrot(it.output) ||
+                    NonAnswerRefusal.isNonAnswer(it.output)
+            }
+            if (candidates.size < allRecent.size) {
+                Log.d(tag, "Excluded ${allRecent.size - candidates.size} suspect-marked " +
+                    "records from similarity candidates")
+            }
             if (candidates.isEmpty()) {
                 Log.d(tag, "No stored interactions for similarity search")
                 return@withContext emptyList()
@@ -176,11 +196,55 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
             if (terms.isBlank()) {
                 emptyList()
             } else {
+                // Same memory-poisoning guard as findSimilar: suspect rows are
+                // failure evidence, parrot rows are provable template output,
+                // and refusals answer nothing — a recalled non-answer spoken
+                // back as "you asked where your keys are — Text is unclear."
+                // is the same loop one channel over.
                 interactionDao.searchRecentByPromptAndOutput(terms, limit)
+                    .filterNot {
+                        SuspectMarker.hasSuspectMark(it.feedback) ||
+                            AnchorEraParrot.isAnchorEraParrot(it.output) ||
+                            NonAnswerRefusal.isNonAnswer(it.output)
+                    }
             }
         } catch (e: Throwable) {
             Log.e(tag, "Text recall failed: ${e.javaClass.simpleName}: ${e.message}", e)
             emptyList()
+        }
+    }
+
+    /**
+     * One-time purge of ANCHOR-ERA PARROT records (2026-10-20).
+     *
+     * When the prompt still carried concrete example objects, the model
+     * stored parroted completions ("That is a dark blue shirt.") as ordinary
+     * interaction records with EMPTY feedback — so neither the suspect-mark
+     * filter nor age alone ever removes them, yet visual similarity keeps
+     * re-injecting them as "Prior scene memory" (one such row outlived the
+     * prompt fix by a hop through this database and bled "dark-colored" into
+     * a fresh answer on 2026-10-20).
+     *
+     * [AnchorEraParrot] matches the exact phrases the old prompt shipped as
+     * inline examples — provably template output, never scene description —
+     * so deletion loses nothing usable. Idempotent; runs once per process
+     * start from the controller's init block.
+     *
+     * @return number of poisoned records deleted.
+     */
+    suspend fun purgeAnchorEraParrots(): Int = withContext(Dispatchers.IO) {
+        try {
+            val poisoned = interactionDao.getAll()
+                .filter { AnchorEraParrot.isAnchorEraParrot(it.output) }
+            if (poisoned.isNotEmpty()) {
+                interactionDao.deleteByIds(poisoned.map { it.id })
+                Log.d(tag, "Purged ${poisoned.size} anchor-era parrot records " +
+                    "(ids ${poisoned.joinToString(",") { it.id.toString() }.take(120)})")
+            }
+            poisoned.size
+        } catch (e: Throwable) {
+            Log.e(tag, "Anchor-era parrot purge failed: ${e.javaClass.simpleName}: ${e.message}", e)
+            0
         }
     }
 

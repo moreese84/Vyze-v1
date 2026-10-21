@@ -50,4 +50,11 @@ interface InteractionDao {
     /** Delete all interaction records. */
     @Query("DELETE FROM interaction_records")
     suspend fun deleteAll()
+
+    /**
+     * Delete the given records by id — used by the one-time anchor-era
+     * parrot purge ([com.vyze.app.memory.MemoryRepository.purgeAnchorEraParrots]).
+     */
+    @Query("DELETE FROM interaction_records WHERE id IN (:ids)")
+    suspend fun deleteByIds(ids: List<Long>)
 }

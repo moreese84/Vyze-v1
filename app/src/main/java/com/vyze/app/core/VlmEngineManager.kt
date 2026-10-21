@@ -1337,6 +1337,35 @@ class VlmEngineManager(
     /** Serializes background GPU builds — one native GPU build at a time. */
     private val backgroundGpuBuildActive = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // ── FRESH-STATE ROTATION (LiteRT-LM #3165 countermeasure, 2026-10-20) ──
+    // The model card's documented failure is now LIVE-PROVEN on this device:
+    // on one shared Engine, a new Conversation continues from the previous
+    // conversation's recurrent state — the retest converged to a repeated,
+    // scene-wrong sentence ("That is a dark blue shirt." byte-identical for
+    // three different captures). The cure is one Engine per conversation,
+    // but a full engine rebuild costs ~15 s (CPU) — paid WHILE SERVING it
+    // would be another latency wall. So: after each served conversation we
+    // build a CLEAN same-backend engine in the background (queries keep
+    // serving on the current one) and swap them at the first quiet instant,
+    // exactly like the GPU machinery. The dirty engine — and its polluted
+    // recurrent state — is closed on swap. Availability rule unchanged: if
+    // a query arrives before the clean engine is ready, it still runs
+    // (state stays polluted for that turn) rather than ever blocking.
+
+    /** Clean engine built in the background, awaiting the quiet-point swap. */
+    @Volatile
+    private var pendingFreshEngine: Engine? = null
+
+    /**
+     * Serializes fresh-state builds — one at a time, and NEVER concurrent
+     * with a background GPU build or a parked GPU engine (three engines
+     * resident would exceed the device's memory budget).
+     */
+    private val freshnessBuildActive = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** Minimum free RAM (MB) before we allow a second engine to be resident. */
+    private val freshRotationMinFreeRamMb = 3_000L
+
     /**
      * Set by [buildEngineForBackend] when the JUST-FINISHED attempt ended by
      * EXCEEDING the build budget (true) vs. by exception/init-throw (false).
@@ -1583,6 +1612,193 @@ class VlmEngineManager(
             if (leftover != null) {
                 try { leftover.close() } catch (e: Throwable) { Log.w(TAG, "parked GPU engine close error: ${e.message}") }
                 CrashLogFile.log(TAG, "Background GPU swap: no quiet instant in ${swapMaxWaitMs / 1000}s — parked engine discarded")
+            }
+        }
+    }
+
+    /**
+     * Schedule a FRESH-STATE build: a clean same-backend engine built in the
+     * background while the (recurrent-state-polluted) current one keeps
+     * serving. Guards, in order:
+     *  - one fresh build at a time ([freshnessBuildActive]);
+     *  - never concurrent with the background GPU build or a parked GPU
+     *    engine (three engines resident exceed the memory budget);
+     *  - never while a session reset owns the lifecycle;
+     *  - only on devices with enough free RAM for a second engine.
+     *
+     * All failures are advisory and contained: the current engine keeps
+     * serving, and the next cleanly answered conversation re-arms this.
+     */
+    private fun scheduleFreshStateRebuild() {
+        // Fast-path guards first — the CAS keeps a single thread entering.
+        // EVERY silent guard logs: the first deployment ran completely dark
+        // (no "Fresh-state" line ever appeared) and the vanishing build was
+        // impossible to distinguish from a crash/freezer kill. Visibility
+        // beats a quiet no-op.
+        if (sessionResetInProgress) {
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: session reset in progress")
+            return
+        }
+        if (pendingGpuEngine != null || backgroundGpuBuildActive.get()) {
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: GPU build/swap owns the engine budget")
+            return
+        }
+        if (pendingFreshEngine != null) {
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: a clean engine is already armed")
+            return
+        }
+        if (!freshnessBuildActive.compareAndSet(false, true)) {
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: build already running")
+            return
+        }
+        val eng = engine
+        if (eng == null || !isInitialized) {
+            freshnessBuildActive.set(false)
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: engine not ready")
+            return
+        }
+        val backendName = activeBackend
+        if (!backendName.equals("CPU", true) && !backendName.equals("GPU", true)) {
+            freshnessBuildActive.set(false)
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: backend '$backendName' not rotatable")
+            return
+        }
+        val freeRam = availableHeapMB()
+        if (freeRam < freshRotationMinFreeRamMb) {
+            freshnessBuildActive.set(false)
+            CrashLogFile.log(TAG, "Fresh-state rotation skipped: free RAM ${freeRam}MB < ${freshRotationMinFreeRamMb}MB (dirty state persists until RAM frees)")
+            return
+        }
+        // Wake lock (same lesson as the background GPU build): the vendor
+        // freezer froze the first deployment's build coroutine between
+        // schedule and its first log line — the rotation never ran while
+        // the screen was off. A partial wake lock for the build window
+        // keeps the native init on CPU; released on every exit path.
+        val freshWakeLock = runCatching {
+            (context.getSystemService(Context.POWER_SERVICE) as? PowerManager)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "vyze:freshStateBuild")
+        }.getOrNull()
+        if (freshWakeLock != null) {
+            freshWakeLock.setReferenceCounted(false)
+            freshWakeLock.acquire(120_000L)
+            CrashLogFile.log(TAG, "Fresh-state rotation: scheduled (free RAM ${freeRam}MB, backend $backendName, wake lock 120s)")
+        } else {
+            CrashLogFile.log(TAG, "Fresh-state rotation: scheduled (free RAM ${freeRam}MB, backend $backendName, wake lock unavailable)")
+        }
+        scope.launch {
+            try {
+                val brain = activeBrain ?: BrainModel.PROD_DEFAULT
+                val modelFile = resolveModelFile(brain)
+                if (modelFile == null) { CrashLogFile.log(TAG, "Fresh-state rotation skipped: model file unresolved"); return@launch }
+                val step = if (backendName.equals("GPU", true)) {
+                    TierBackendPlan("GPU", Backend.GPU(), contextTokensFor(brain, deviceProfile.tier))
+                } else {
+                    TierBackendPlan("CPU", cpuBackendForDevice(), contextTokensFor(brain, deviceProfile.tier))
+                }
+                CrashLogFile.log(TAG, "Fresh-state rotation: building a clean $backendName engine (serving continues meanwhile)...")
+                val fresh = buildEngineForBackend(
+                    brain,
+                    modelFile,
+                    step,
+                    deviceProfile.tier,
+                    timeoutOverrideMs = if (backendName.equals("GPU", true)) backgroundEngineCreateTimeoutMs else null
+                ) ?: run {
+                    CrashLogFile.log(TAG, "Fresh-state rotation: clean $backendName build failed — keeping current (dirty) engine, next answer re-arms")
+                    return@launch
+                }
+                if (servingEngineTornDown()) {
+                    // Torn down mid-build (close/reset) — release the fresh one.
+                    try { fresh.close() } catch (e: Throwable) { Log.w(TAG, "fresh engine close error (torn down): ${e.message}") }
+                    return@launch
+                }
+                val warm = warmUp(fresh)
+                if (warm <= 0L) {
+                    try { fresh.close() } catch (e: Throwable) { Log.w(TAG, "fresh engine close error (sick warm-up): ${e.message}") }
+                    CrashLogFile.log(TAG, "Fresh-state rotation: clean engine warm-up failed — discarded, next answer re-arms")
+                    return@launch
+                }
+                if (servingEngineTornDown()) {
+                    try { fresh.close() } catch (e: Throwable) { Log.w(TAG, "fresh engine close error (torn down): ${e.message}") }
+                    return@launch
+                }
+                pendingFreshEngine = fresh
+                CrashLogFile.log(TAG, "Fresh-state rotation: clean $backendName engine ready (${warm}ms warm-up) — idle swap armed")
+                swapFreshEngineWhenIdle()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                CrashLogFile.log(TAG, "Fresh-state rotation error (advisory): ${e.javaClass.simpleName}: ${e.message}")
+            } finally {
+                freshnessBuildActive.set(false)
+                runCatching {
+                    if (freshWakeLock?.isHeld == true) freshWakeLock.release()
+                }.onFailure {
+                    CrashLogFile.log(TAG, "Fresh-state rotation: wake lock release failed: ${it.message}")
+                }
+            }
+        }
+    }
+
+    /** True when the serving engine was torn down while a fresh build ran. */
+    private fun servingEngineTornDown(): Boolean = engine == null || !isInitialized || sessionResetInProgress
+
+    /**
+     * Swap [pendingFreshEngine] in at the first QUIET instant — the same
+     * discipline as [swapGpuEngineWhenIdle]: acquire [generationMutex] so no
+     * generation is running or starting, re-point the engine fields, and
+     * close the DIRTY engine (its recurrent state dies with it). The swap is
+     * invisible to the user: the dirty engine has already produced its last
+     * answer, and the clean engine is fully warmed before it serves.
+     */
+    private fun swapFreshEngineWhenIdle() {
+        scope.launch(engineInitDispatcher) {
+            val deadline = System.currentTimeMillis() + swapMaxWaitMs
+            while (pendingFreshEngine != null &&
+                engine != null && isInitialized && !sessionResetInProgress &&
+                System.currentTimeMillis() < deadline
+            ) {
+                if (generationMutex.tryLock()) {
+                    try {
+                        val freshEngine = pendingFreshEngine
+                        if (freshEngine == null) return@launch  // swapped elsewhere
+                        if (engine == null || !isInitialized) return@launch  // torn down mid-wait
+
+                        // Conversations belong to their engine — the dirty one
+                        // dies with its engine. Drop the reference BEFORE the
+                        // close so an interrupt() can never cancelProcess() a
+                        // dead engine's conversation.
+                        activeConversation = null
+                        val dirtyEngine = engine
+                        val backend = activeBackend
+                        engine = freshEngine
+                        pendingFreshEngine = null
+
+                        // GPU vision kernels compile lazily on the first real
+                        // image — re-arm the one-time grace budget the fresh
+                        // engine needs (CPU engines don't pay this).
+                        if (backend.equals("GPU", true)) firstImageInferencePending = true
+
+                        try { dirtyEngine?.close() } catch (e: Throwable) { Log.w(TAG, "dirty engine close error: ${e.message}") }
+
+                        CrashLogFile.log(
+                            TAG,
+                            "=== FRESH-STATE SWAP: serving now on a clean $backend engine (recurrent state zeroed) ==="
+                        )
+                    } finally {
+                        generationMutex.unlock()
+                    }
+                    CrashLogFile.log(TAG, "Fresh-state swap complete — next conversations start from a clean recurrent state")
+                    return@launch
+                }
+                delay(swapPollIntervalMs)
+            }
+
+            // Give-up path: engine torn down (close/reset) or no quiet instant.
+            val leftoverFresh = pendingFreshEngine
+            pendingFreshEngine = null
+            if (leftoverFresh != null) {
+                try { leftoverFresh.close() } catch (e: Throwable) { Log.w(TAG, "parked fresh engine close error: ${e.message}") }
+                CrashLogFile.log(TAG, "Fresh-state swap: no quiet instant in ${swapMaxWaitMs / 1000}s — parked clean engine discarded (rotation re-arms on next answer)")
             }
         }
     }
@@ -2064,7 +2280,7 @@ class VlmEngineManager(
         // generation that interrupt() abandoned — its native thread keeps
         // generating until cancelProcess() stops it, and the engine stays busy
         // until that finishes.
-        return generationMutex.withLock {
+        val result = generationMutex.withLock {
             withTimeoutOrNull(GENERATION_DRAIN_TIMEOUT_MS) { generationFinished.await() }
 
             // ── Memory Safety (lower tiers) ─────────────────────────
@@ -2099,6 +2315,18 @@ class VlmEngineManager(
                 null
             }
         }
+        // Every CLEANLY answered conversation dirties the engine's recurrent
+        // state — schedule the clean replacement (no-op when one is already
+        // armed/building, or when memory/other builds say no).
+        if (result != null) {
+            // MIRROR (12:56 diagnosis): Log.d lines are suppressed on this
+            // device's log level, and most rotation guards logged ONLY via
+            // Log.d — so a skipped rotation was invisible even with
+            // instrumentation. Every guard now mirrors to the crash log.
+            CrashLogFile.log(TAG, "Fresh-state rotation: re-arm requested (answer served, " + result.length + " chars)")
+            scheduleFreshStateRebuild()
+        }
+        return result
     }
 
     /**

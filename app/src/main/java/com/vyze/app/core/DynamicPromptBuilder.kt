@@ -408,10 +408,9 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Skip phrases like 'in the image' or 'it appears', but natural speech like " +
             "'there is' or 'a person is standing' is exactly right. " +
             "LEAD WITH THE ANSWER: no introductory location preamble. If asked what color " +
-            "something is, reply with the color ('That is a dark blue shirt.'); if asked what " +
-            "something is, reply with the object ('That is a bottle of olive oil.'); only mention " +
-            "spatial position when the question asks WHERE ('Your cup is directly to your right " +
-            "on the desk.'). NEVER begin every sentence with the same template phrase such as " +
+            "something is, lead with the color itself; if asked what something is, lead with the object " +
+            "itself; only mention spatial position when the question asks WHERE. " +
+            "NEVER begin every sentence with the same template phrase such as " +
             "'In front of you is', 'You are in front of', 'You are looking at', or 'You are facing'. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
             "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
@@ -433,8 +432,8 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Keep the whole answer to 1-3 short spoken sentences. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
-            "LEAD WITH THE ANSWER: reply with what was asked, with no location preamble — say " +
-            "'That is a bottle of olive oil' or 'It says Organic Milk', and only give spatial " +
+            "LEAD WITH THE ANSWER: reply with what was asked, with no location preamble — the " +
+            "object itself (its color and name) or the printed text itself — and only give spatial " +
             "position when the question asks WHERE. NEVER begin every sentence with the same " +
             "template phrase such as 'In front of you is'. " +
             "Your reply is read aloud by text to speech, so it must be pure plain text: " +
@@ -456,68 +455,59 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Examples:\n" +
             "Input: what do you see? Output: A closed brown wooden door is straight ahead, about two steps away.\n" +
             "Input: is someone near me? Output: A person is standing to your left, about one step away.\n" +
-            "Input: describe the room. Output: A grey fabric sofa with soft cushions sits about three steps ahead, with a low wooden table in front of it.\n" +
-            "Input: what is on the table? Output: A clear glass water bottle, half full, sits on the table about one step ahead.\n" +
+
             "Input: what is around me? Output: The room is dark, and no obstacles are visible within three steps.\n" +
             "Input: red packet on table. Output: A small red packet of Maggi instant noodles sits on the table about one step ahead, and the label reads Maggi Kari.\n" +
             "Input: car plate ahead. Output: The vehicle plate ahead reads Q L B, three four six nine.\n" +
-            "Input: what color is this shirt? Output: That is a dark blue shirt.\n" +
-            "Input: what is this? Output: That is a bottle of olive oil.\n" +
+            "Input: what is this? Output: That is a small dark object with a metal edge; its exact name is not clearly visible.\n" +
             "Input: where is my cup? Output: Your cup is directly to your right on the desk."
 
         private const val NAV_EXAMPLES_MS =
             "Examples:\n" +
             "Input: apa yang anda nampak? Output: Sebuah pintu kayu perang yang tertutup berada terus di hadapan, kira-kira dua langkah jauhnya.\n" +
             "Input: ada orang dekat dengan saya? Output: Seseorang sedang berdiri di sebelah kiri anda, kira-kira satu langkah jauhnya.\n" +
-            "Input: terangkan bilik ini. Output: Sebuah sofa kain kelabu dengan cushion lembut berada kira-kira tiga langkah di hadapan, dengan meja kayu rendah di hadapannya.\n" +
-            "Input: apa di atas meja? Output: Sebuah botol air kaca lutsinar yang separuh penuh berada di atas meja, kira-kira satu langkah di hadapan.\n" +
+
             "Input: apa ada sekeliling saya? Output: Bilik ini gelap, dan tiada halangan yang kelihatan dalam tiga langkah.\n" +
             "Input: paket merah di atas meja. Output: Satu paket kecil mi Maggi berwarna merah berada di atas meja kira-kira satu langkah, dan label tertulis Maggi Kari.\n" +
             "Input: plat kereta di hadapan. Output: Plat kenderaan di hadapan tertulis Q L B, tiga empat enam sembilan.\n" +
-            "Input: baju ini warna apa? Output: Itu ialah baju biru gelap.\n" +
-            "Input: apa ini? Output: Itu ialah sebotol minyak zaitun.\n" +
+            "Input: apa ini? Output: Itu ialah objek kecil gelap dengan tepi logam; nama sebenarnya tidak jelas kelihatan.\n" +
             "Input: cawan saya di mana? Output: Cawan anda berada terus di sebelah kanan anda di atas meja."
 
         private const val NAV_EXAMPLES_ZH =
             "Examples:\n" +
             "Input: 你看到了什么？Output: 正前方大约两步远，有一扇关着的棕色木门。\n" +
             "Input: 我附近有人吗？Output: 您的左边大约一步远站着一个人。\n" +
-            "Input: 描述一下这个房间。Output: 大约三步远处有一张带软垫的灰色布沙发，沙发前面还有一张矮木桌。\n" +
-            "Input: 桌上有什么？Output: 桌上大约一步远有一个透明的玻璃水瓶，半满。\n" +
+
             "Input: 我周围有什么？Output: 房间很暗，三步之内看不到任何障碍物。\n" +
             "Input: 桌上有红色包装。Output: 桌上大约一步远有一包红色的小包装Maggi快熟面，标签写着Maggi Kari。\n" +
             "Input: 前面有车牌。Output: 前方的车牌是Q L B，三、四、六、九。\n" +
-            "Input: 这件衬衫是什么颜色？Output: 那是一件深蓝色衬衫。\n" +
-            "Input: 这是什么？Output: 那是一瓶橄榄油。\n" +
+            "Input: 这是什么？Output: 那是一个带金属边缘的小型深色物品；具体名称不太清晰。\n" +
             "Input: 我的杯子在哪里？Output: 您的杯子就在您右手边的桌上。"
 
         private const val DIRECT_EXAMPLES_EN =
             "Examples:\n" +
-            "Input: what is this? Image shows a red packet. Output: That is a small red packet of Maggi instant noodles, and the label reads Maggi Kari — noodles and seasoning sachets are inside.\n" +
+
             "Input: what medicine is this? Image shows Diclac Retard box. Output: That is Diclac Retard, diclofenac sodium 100 milligram — take one tablet daily after meals.\n" +
             "Input: read this label. Image shows price tag RM12.90. Output: It says 12 Ringgit and 90 sen.\n" +
-            "Input: what color is this shirt? Output: That is a dark blue shirt.\n" +
-            "Input: what is this? Output: That is a bottle of olive oil.\n" +
+            "Input: what is this? Output: That is a small dark object with a metal edge; its exact name is not clearly visible.\n" +
             "Input: where is my cup? Output: Your cup is directly to your right on the desk.\n" +
             "Input: what does this sign say? Image blurry. Output: The text is unclear."
 
         private const val DIRECT_EXAMPLES_MS =
             "Examples:\n" +
-            "Input: apa ini? Imej menunjukkan paket mi merah. Output: Itu ialah satu paket kecil mi Maggi berwarna merah, dan label tertulis Maggi Kari — mi dan sachet perencah berada di dalamnya.\n" +
+
             "Input: ubat apa ini? Imej menunjukkan kotak Diclac Retard. Output: Itu ialah Diclac Retard, diklofenak natrium 100 miligram — ambil satu tablet sehari selepas makan.\n" +
             "Input: baca label ini. Imej menunjukkan tag harga RM12.90. Output: Tertulis 12 Ringgit dan 90 sen.\n" +
-            "Input: baju ini warna apa? Output: Itu ialah baju biru gelap.\n" +
-            "Input: apa ini? Output: Itu ialah sebotol minyak zaitun.\n" +
+            "Input: apa ini? Output: Itu ialah objek kecil gelap dengan tepi logam; nama sebenarnya tidak jelas kelihatan.\n" +
             "Input: cawan saya di mana? Output: Cawan anda berada terus di sebelah kanan anda di atas meja.\n" +
             "Input: apa yang tertulis di papan tanda ini? Imej kabur. Output: Teksnya tidak jelas."
 
         private const val DIRECT_EXAMPLES_ZH =
             "Examples:\n" +
-            "Input: 这是什么？图像显示一个红色包装。Output: 那是一包红色的小包装Maggi快熟面，标签写着Maggi Kari——里面是面条和调味包。\n" +
+
             "Input: 这是什么药？图像显示Diclac Retard药盒。Output: 那是Diclac Retard，双氯芬酸钠100毫克——每天饭后服用一片。\n" +
             "Input: 读一下这个标签。图像显示价格标签RM12.90。Output: 上面写着12令吉90仙。\n" +
-            "Input: 这件衬衫是什么颜色？Output: 那是一件深蓝色衬衫。\n" +
-            "Input: 这是什么？Output: 那是一瓶橄榄油。\n" +
+            "Input: 这是什么？Output: 那是一个带金属边缘的小型深色物品；具体名称不太清晰。\n" +
             "Input: 我的杯子在哪里？Output: 您的杯子就在您右手边的桌上。\n" +
             "Input: 这个牌子上写什么？图像模糊。Output: 文字不清楚。"
 

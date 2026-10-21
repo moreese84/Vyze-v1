@@ -43,6 +43,18 @@ object SuspectMarker {
     const val TAG_LANG_MISMATCH = "suspect_lang_mismatch"
     const val TAG_REPEAT_60S = "suspect_repeat_60s"
     const val TAG_TEXT_GROUNDING = "suspect_text_grounding"
+    const val TAG_TEMPLATE_ECHO = "suspect_template_echo"
+
+    /**
+     * The literal bracket placeholders the prompt carried during the
+     * 2026-10-20 placeholder era. Matched case-sensitively on purpose:
+     * the model echoes them verbatim, and exact matching keeps the false
+     * positive rate at zero (ordinary prose says "object", never
+     * "[object]").
+     */
+    private val TEMPLATE_PLACEHOLDERS: List<String> = listOf(
+        "[color]", "[object]", "[printed text]",
+    )
 
     /** Answer-didn't-satisfy window for repeat detection (plan: ~60s). */
     const val REPEAT_WINDOW_MS = 60_000L
@@ -169,6 +181,44 @@ object SuspectMarker {
         return qLang != aLang
     }
 
+    /**
+     * True when [feedback] carries ANY suspect mark (any tag starting with
+     * "suspect_").
+     *
+     * MEMORY-POISONING GUARD (2026-10-20, dark-shirt era): a suspect row is
+     * PRE-LABELED FAILURE EVIDENCE — re-injecting its output as "Prior scene
+     * memory" teaches the model its own past failure as ground truth (the
+     * stored "That is a dark blue shirt." row matched the next frame at
+     * similarity ≥ 0.6 and bled "dark-colored" into the fresh answer).
+     * Memory retrieval (visual similarity + text recall) excludes any row
+     * this returns true for. Prefix-match keeps future tags covered without
+     * touching this function.
+     */
+    fun hasSuspectMark(feedback: String?): Boolean {
+        if (feedback.isNullOrBlank()) return false
+        return feedback.split(' ').any { it.startsWith("suspect_") }
+    }
+
+    /**
+     * TEMPLATE-ECHO mark (fix #5, 2026-10-21): the response contains a
+     * LITERAL prompt placeholder — "[color]", "[object]" or "[printed
+     * text]". Removing the concrete anchor objects (olive oil, dark blue
+     * shirt) from the prose rules made the model complete the QUOTED
+     * placeholder template verbatim instead — "That is a [color] [object]
+     * you actually see." spoken twice on device (records 536/537) and
+     * already re-injected into the next prompt as prior-scene memory.
+     * The templates are now unquoted prose so there is no completion
+     * target left; this detector stays as the OUTPUT-SIDE BACKSTOP: such
+     * a row is provable parroting — tagged at store time (excluded from
+     * memory injection via [hasSuspectMark]) and matched by the startup
+     * purge ([com.vyze.app.memory.AnchorEraParrot]) so it can never
+     * poison the corpus even if the model echoes once more.
+     */
+    fun isTemplateEcho(output: String?): Boolean {
+        if (output.isNullOrBlank()) return false
+        return TEMPLATE_PLACEHOLDERS.any { output.contains(it) }
+    }
+
     // ── Pending-flag → tag plumbing (the caller's flags, applied later) ──
 
     /**
@@ -183,12 +233,14 @@ object SuspectMarker {
         langMismatch: Boolean,
         repeatWithinWindow: Boolean,
         textGrounding: Boolean = false,
+        templateEcho: Boolean = false,
     ): String = buildList {
         if (priorBargeIn) add(TAG_BARGE_IN_PRIOR)
         if (priorAsrFailure) add(TAG_PRIOR_ASR_FAILURE)
         if (langMismatch) add(TAG_LANG_MISMATCH)
         if (repeatWithinWindow) add(TAG_REPEAT_60S)
         if (textGrounding) add(TAG_TEXT_GROUNDING)
+        if (templateEcho) add(TAG_TEMPLATE_ECHO)
     }.joinToString(" ")
 
     /**

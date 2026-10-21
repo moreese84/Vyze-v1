@@ -1230,6 +1230,18 @@ class VyzeCoreController(
         ttsManager.onUtteranceCompleted = { _ ->
             scope.launch { preferenceLearner.recordAnswerCompleted() }
         }
+
+        // MEMORY-POISONING PURGE (2026-10-20): parroted anchor-era answers
+        // ("That is a dark blue shirt.") were stored with empty feedback and
+        // kept getting re-injected as "Prior scene memory" — the anchor
+        // outliving its removal from the prompt by one hop through Room.
+        // Deletes them at startup so no fresh frame can match them again.
+        scope.launch {
+            val purged = memoryRepository.purgeAnchorEraParrots()
+            if (purged > 0) {
+                CrashLogFile.log(TAG, "Memory poisoning purge: removed $purged anchor-era parrot records")
+            }
+        }
     }
 
     fun resetForNewCapture() {
@@ -2076,12 +2088,19 @@ class VyzeCoreController(
                     // model legitimately saw at full resolution).
                     val textGroundingSuspect = SuspectMarker
                         .findsTextNotInOcr(response, ocrText)
+                    // TEMPLATE-ECHO mark (fix #5): the answer contains a
+                    // literal prompt placeholder ("[color] [object]") —
+                    // provable parroting, device records 536/537. Tagged
+                    // so it can never be re-injected as prior-scene memory
+                    // and is purged from the DB at the next startup.
+                    val templateEchoSuspect = SuspectMarker.isTemplateEcho(response)
                     val suspectTags = SuspectMarker.tagsForStoredRecord(
                         priorBargeIn = suspectPriorBargeIn,
                         priorAsrFailure = suspectPriorAsrFailure,
                         langMismatch = langMismatch,
                         repeatWithinWindow = repeatWithinWindow,
                         textGrounding = textGroundingSuspect,
+                        templateEcho = templateEchoSuspect,
                     )
                     if (suspectTags.isNotEmpty()) {
                         CrashLogFile.log(TAG, "Suspect marks: $suspectTags")
@@ -3667,12 +3686,28 @@ class VyzeCoreController(
             "in front", "in front of me", "around me", "in the room",
             "what is this", "what's this", "this thing", "this object",
             "near me", "see", "look", "point", "show me",
+            // Visual action predicates (2026-10-21): "what is the bird doing"
+            // carries knowledge marker "what is" and no pointing word, yet the
+            // answer exists only in a frame.
+            "doing", "wearing", "holding", "carrying",
             // Malay / Bahasa Melayu
             "ini", "itu", "di hadapan", "sekitar", "sini", "sana",
             "benda ini", "objek ini", "lihat", "nampak",
             // Chinese
             "这个", "那个", "这里", "那里", "前面", "这个东西"
         )
+
+        /**
+         * SCENE-REFERENT PRONOUNS (2026-10-21, device-evidenced): third-person
+         * pronouns can only refer back to something the lens just saw. en/ms
+         * forms match on WORD BOUNDARIES — plain contains would trip on "he"
+         * inside "the"/"weather"/"sherbet" and drag every knowledge ask to the
+         * camera. CJK has no boundaries; substring match is intentional (even
+         * 他们/其他 keep pointing at a group the user can see).
+         */
+        private val SCENE_REFERENT_PRONOUN_REGEX =
+            Regex("\\b(?:he|she|him|her|they|dia|mereka)\\b")
+        private val SCENE_REFERENT_PRONOUN_CJK = listOf("他", "她")
 
         /**
          * Visual anchors that mean the user is asking about a date IN THE
@@ -3754,6 +3789,22 @@ class VyzeCoreController(
             // ── DATE BRANCH: relative/calendar asks without a visual anchor.
             if (companionHitsDateQuery(query) && !companionDateAnchorHit(lower)) {
                 return true
+            }
+
+            // ── SCENE-REFERENT GUARD (2026-10-21, device-evidenced): a
+            // third-person pronoun refers back to something VISIBLE, so the
+            // question needs a frame even when it wears a knowledge costume.
+            // Both "what is he doing" queries in the 10:21 session matched
+            // marker "what is" with no scene word (this/here/see), slipped to
+            // the text-only lane, and were answered from stale dialogue
+            // history alone — the same verbatim "That is a guy." twice, no
+            // fresh frame. Per this function's own contract the wrongly-
+            // routed-visual direction is the unsafe one: a missed text-only
+            // route just costs a slightly slower camera answer.
+            if (SCENE_REFERENT_PRONOUN_REGEX.containsMatchIn(lower) ||
+                SCENE_REFERENT_PRONOUN_CJK.any { lower.contains(it) }
+            ) {
+                return false
             }
 
             // ── Malay knowledge form — "apa itu <noun>?" (what is <noun>?)

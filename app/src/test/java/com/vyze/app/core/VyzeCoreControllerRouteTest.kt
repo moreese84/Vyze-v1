@@ -103,6 +103,35 @@ class VyzeCoreControllerRouteTest {
         assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what do you see in front of me"))
     }
 
+    // ── Scene-referent guard (2026-10-21, device-evidenced) ───────────
+
+    @Test
+    fun `pronoun follow-ups about visible referents route camera`() {
+        // DEVICE EVIDENCE (10:21 session): both "what is he doing" queries
+        // matched knowledge marker "what is" with no scene word, went down
+        // the text-only lane, and answered from stale dialogue history — the
+        // same verbatim "That is a guy." twice, no fresh frame. An action
+        // question about people/animals can only be answered from a frame.
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what is he doing"))
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what is she wearing"))
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what does he want"))
+        // zh: carries marker 是什么 + the scene pronoun 他.
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("他是什么意思"))
+        // Action predicate with NO pronoun — the exclude-list half of the fix.
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what is the bird doing"))
+        assertFalse(VyzeCoreController.companionIsTextOnlyQuery("what is the man holding"))
+    }
+
+    @Test
+    fun `pronoun guard word boundaries never trip ordinary knowledge asks`() {
+        // Plain contains would match "he" in "the"/"sherbet" and drag every
+        // everyday knowledge ask to the camera — boundaries prevent it, and
+        // these pins keep the text-only lane working for real knowledge asks.
+        assertTrue(VyzeCoreController.companionIsTextOnlyQuery("what is the weather tomorrow"))
+        assertTrue(VyzeCoreController.companionIsTextOnlyQuery("what is sherbet made of"))
+        assertTrue(VyzeCoreController.companionIsTextOnlyQuery("why is the sky blue"))
+    }
+
     @Test
     fun `non-date pointing questions stay camera`() {
         // The fix must not widen the route: pure pointing asks were and

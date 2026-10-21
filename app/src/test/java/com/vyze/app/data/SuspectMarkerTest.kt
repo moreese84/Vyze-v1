@@ -182,6 +182,33 @@ class SuspectMarkerTest {
         )
     }
 
+    // ── Memory-poisoning guard (2026-10-20) ────────────────────
+
+    @Test
+    fun `any suspect tag makes the row ineligible for memory injection`() {
+        // The dark-shirt loop: a pre-labeled failure row re-injected as
+        // "Prior scene memory" teaches the model its own past failure.
+        assertTrue(SuspectMarker.hasSuspectMark(SuspectMarker.TAG_BARGE_IN_PRIOR))
+        assertTrue(SuspectMarker.hasSuspectMark("suspect_lang_mismatch"))
+        assertTrue(
+            SuspectMarker.hasSuspectMark(
+                "${SuspectMarker.TAG_BARGE_IN_PRIOR} ${SuspectMarker.TAG_LANG_MISMATCH}"
+            )
+        )
+        // Prefix match also covers tags added later without touching this code.
+        assertTrue(SuspectMarker.hasSuspectMark("suspect_future_signal"))
+    }
+
+    @Test
+    fun `clean or absent feedback stays memory-eligible`() {
+        assertFalse(SuspectMarker.hasSuspectMark(null))
+        assertFalse(SuspectMarker.hasSuspectMark(""))
+        assertFalse(SuspectMarker.hasSuspectMark("   "))
+        // Real user feedback (preference tags, edited text) must not be
+        // mistaken for a suspect mark.
+        assertFalse(SuspectMarker.hasSuspectMark("user_edited concise"))
+    }
+
     // ── Text-grounding mark (fix #4, 2026-10-01) ────────────────
 
     @Test
@@ -300,6 +327,62 @@ class SuspectMarkerTest {
                 priorBargeIn = true, priorAsrFailure = true, langMismatch = true,
                 repeatWithinWindow = true, textGrounding = true,
             ),
+        )
+    }
+
+    // ── Template-echo mark (fix #5, 2026-10-21) ─────────────────
+
+    @Test
+    fun `bracket placeholder echo is detected - device records 536-537 shape`() {
+        // The exact strings the user's retest recorded on device: the model
+        // completed the quoted placeholder template verbatim, brackets and
+        // all, twice in a row.
+        assertTrue(SuspectMarker.isTemplateEcho("That is a [color] [object] you actually see."))
+        assertTrue(SuspectMarker.isTemplateEcho("It says [printed text]"))
+    }
+
+    @Test
+    fun `ordinary answers containing the bare words are never echoes`() {
+        // Matching is on the bracketed placeholder, case-sensitively — a
+        // real scene answer that says "object" without brackets is never
+        // flagged.
+        assertFalse(SuspectMarker.isTemplateEcho("That is a red and blue object on the table."))
+        assertFalse(SuspectMarker.isTemplateEcho("That is a pink basket you actually see."))
+        assertFalse(SuspectMarker.isTemplateEcho(null))
+        assertFalse(SuspectMarker.isTemplateEcho(""))
+        assertFalse(SuspectMarker.isTemplateEcho("   "))
+    }
+
+    @Test
+    fun `template-echo tag composes last in stable order`() {
+        assertEquals(
+            "${SuspectMarker.TAG_TEXT_GROUNDING} ${SuspectMarker.TAG_TEMPLATE_ECHO}",
+            SuspectMarker.tagsForStoredRecord(
+                priorBargeIn = false, priorAsrFailure = false, langMismatch = false,
+                repeatWithinWindow = false, textGrounding = true, templateEcho = true,
+            ),
+        )
+        assertEquals(
+            SuspectMarker.TAG_TEMPLATE_ECHO,
+            SuspectMarker.tagsForStoredRecord(
+                priorBargeIn = false, priorAsrFailure = false, langMismatch = false,
+                repeatWithinWindow = false, templateEcho = true,
+            ),
+        )
+    }
+
+    @Test
+    fun `template-echo marks are suspect for memory filtering`() {
+        // Prefix coverage: the memory-injection filter keys on hasSuspectMark,
+        // so the new tag must be caught by it with no filter changes.
+        assertTrue(SuspectMarker.hasSuspectMark(SuspectMarker.TAG_TEMPLATE_ECHO))
+        assertTrue(
+            SuspectMarker.hasSuspectMark(
+                SuspectMarker.tagsForStoredRecord(
+                    priorBargeIn = false, priorAsrFailure = false, langMismatch = false,
+                    repeatWithinWindow = false, templateEcho = true,
+                )
+            )
         )
     }
 }
