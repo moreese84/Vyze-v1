@@ -104,3 +104,8 @@ tools/*
 /PRODUCT.md
 /pitch/
 /.impeccable/
+
+# Root-level device-pull artifacts (logs/apk covered by *.log/*.apk above;
+# these are the xml/txt dumps from adb sessions) — never commit
+/vyze_*.xml
+/vyze_*.txt
