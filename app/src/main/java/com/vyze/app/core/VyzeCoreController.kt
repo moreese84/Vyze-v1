@@ -2464,6 +2464,15 @@ class VyzeCoreController(
                     "Do NOT repeat the previous answer. Do NOT invent objects that are not visible. " +
                     "Reply as pure plain spoken text: never markdown symbols, bullets, " +
                     "dashes, asterisks, or emoji."
+                // E1 lean parity with the primary image lane — the gate is
+                // the same pure function; a "MORE detail" follow-up still
+                // pays prefill per char like every other image query.
+                val promptLean = companionCpuEraLeanMode(
+                    isTextQuery = false,
+                    tierIsCpuVision = runCatching { vlmEngine.currentTier() }.getOrNull() in
+                        listOf(DeviceTier.TIER_2, DeviceTier.TIER_3),
+                    activeBackend = runCatching { vlmEngine.getActiveBackend() }.getOrNull(),
+                )
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = expansionDirective,
                     queryOverride = expansionDirective,
@@ -2474,7 +2483,8 @@ class VyzeCoreController(
                     bankCardMode = false,
                     memoryContext = null,
                     brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
-                    dialogueContext = dialogueContextForPrompt()
+                    dialogueContext = dialogueContextForPrompt(),
+                    leanMode = promptLean
                 )
                 if (!isActive) return@launch
                 CrashLogFile.log(TAG, "Expansion prompt built: ${basePrompt.length} chars")
@@ -2620,14 +2630,22 @@ class VyzeCoreController(
                 // date asks. The date contract below is self-sufficient
                 // (device anchor + computed example); recall adds nothing
                 // but risk there, so date asks never consult it.
-                // CPU-ERA LEAN (2026-10-18): text recall adds ~0.5-1k chars
-                // and its lookup latency; while the active engine is the CPU
-                // one (pre-swap era), skip retrieval — knowledge asks route
-                // mostly through the fast 70-char direct gate then.
-                val cpuEraServing = runCatching {
-                    vlmEngine.getActiveBackend()
-                }.getOrNull() == "CPU"
-                val recallRecords = if (companionHitsDateQuery(query) || cpuEraServing) {
+                // LEAN GATE (v3, 2026-10-21): the same pure gate the image
+                // lane uses. v2 documented "CPU era: every lane leans" —
+                // but THIS call site never passed leanMode, so text-lane
+                // prompts kept the full few-shot + dialogue form all through
+                // the CPU era (the 5,878-char / 12.7 s prefill complaint in
+                // the gate's own doc). Recall adds ~0.5-1k chars AND a
+                // lookup; while lean the builder drops the memory block
+                // anyway, so the lookup is skipped instead of rendered-and-
+                // discarded. Knowledge asks route mostly through the fast
+                // 70-char direct gate then.
+                val promptLean = companionCpuEraLeanMode(
+                    isTextQuery = true,
+                    tierIsCpuVision = false,
+                    activeBackend = runCatching { vlmEngine.getActiveBackend() }.getOrNull(),
+                )
+                val recallRecords = if (companionHitsDateQuery(query) || promptLean) {
                     emptyList()
                 } else try {
                     memoryRepository.recallByText(query)
@@ -2665,7 +2683,11 @@ class VyzeCoreController(
                     // PERSONA SPEC — "refer to past conversation turns": the
                     // text-only path now carries the sliding history too, so
                     // follow-ups like "why?" after a knowledge answer resolve.
-                    dialogueContext = dialogueContextForPrompt()
+                    // Lean condenses that history to the NEWEST turns in the
+                    // builder instead of dropping it — follow-up resolution
+                    // is exactly what the history exists for.
+                    dialogueContext = dialogueContextForPrompt(),
+                    leanMode = promptLean
                 )
                 CrashLogFile.log(TAG, "Text prompt built: ${basePrompt.length} chars")
 
@@ -3354,6 +3376,21 @@ class VyzeCoreController(
          *    itself (the one thing a text lane must keep) is passed through
          *    ocrText/queryOverride — never part of the lean suppression.
          *
+         *  2026-10-21 v3 (this edit): the GPU era leans too. The v2 contract
+         *    kept GPU prompts rich ("the rich prompt is the point of the
+         *    GPU") on the assumption that GPU prefill was affordable —
+         *    measured on device (session 314f7542, Infinix MT6899): after
+         *    the swap, a 5,323-char prompt still ate 9,769 ms of prefill.
+         *    Prefill scales with prompt chars on the GPU exactly as on the
+         *    CPU, and the GPU is where the app spends MOST of its steady-
+         *    state session — so rich-on-GPU preserved the cost on the very
+         *    backend meant to be fast. Lean keeps every safety/read/OCR
+         *    contract (they ride ocrText/queryOverride and the always-on
+         *    blocks); it only drops few-shot examples, condenses dialogue,
+         *    and skips recall — the blocks a lean call site suppresses
+         *    anyway. The function name keeps "CpuEra" for call-site and
+         *    test stability; the verdict is now backend-known.
+         *
          * @param isTextQuery    OCR/reading/text-question lane (read
          *   fidelity is mandatory).
          * @param tierIsCpuVision the device tier runs vision on CPU
@@ -3368,10 +3405,12 @@ class VyzeCoreController(
         ): Boolean =
             // Tier 2/3: image lanes lean, text lanes keep full fidelity.
             (tierIsCpuVision && !isTextQuery) ||
-                // CPU era: every lane leans — the boot-to-swap stretch is
-                // the longest wait a blind user experiences, and prompt
-                // tokens cost ~2.6 ms each on this decoder.
-                (activeBackend == "CPU")
+                // Backend-known eras (v2 CPU + v3 GPU): every lane leans.
+                // CPU: the boot-to-swap stretch is the longest wait a blind
+                // user experiences, and prompt tokens cost ~2.6 ms each on
+                // this decoder. GPU (v3): see the header — 9,769 ms prefill
+                // at 5,323 chars was measured with the rich form.
+                (activeBackend == "CPU" || activeBackend == "GPU")
         /**
          * If the model emits this many characters without sentence-ending
          * punctuation, flush anyway so speech never stalls mid-generation.

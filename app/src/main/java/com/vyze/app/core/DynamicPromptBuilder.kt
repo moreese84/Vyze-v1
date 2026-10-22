@@ -161,15 +161,23 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 // anti-echo, safety/refusal contracts, OCR ground-truth) is
                 // load-bearing and stays byte-identical.
                 if (!dialogueContext.isNullOrBlank()) {
-                    val head = dialogueContext.lines().take(6).joinToString("\n")
+                    // NEWEST-6 WINDOW (E1 fix, 2026-10-21): history joins
+                    // oldest→newest, so the old take(6) kept the OLDEST
+                    // turns and dropped the exchange the follow-up is
+                    // actually about ("and this?" resolved against turn 1).
+                    // takeLast keeps the window on the current question;
+                    // turn pairs stay aligned (2 lines per turn at the
+                    // source), so the window never starts mid-answer.
+                    val recent = dialogueContext.lines().takeLast(6).joinToString("\n")
                     sb.appendLine("Recent conversation (context only — never repeat, echo, or quote these lines):")
-                    sb.appendLine(head)
+                    sb.appendLine(recent)
                     sb.appendLine("Resolve 'it', 'that', 'the one' from the conversation above; answer the follow-up directly in the [OUTPUT LANGUAGE] tag's language. NEVER echo the user's question.")
                     sb.appendLine()
-                } else {
-                    sb.appendLine("MEMORY: None. Answer from the fresh frame only.")
-                    sb.appendLine()
                 }
+                // NO "MEMORY: None" marker in the else branch (E1): the non-
+                // lean path renders nothing when no memory block exists, the
+                // old "fresh frame" wording was wrong on frameless text-lane
+                // prompts, and every char here is re-prefilled every turn.
             } else {
             // 2c-pre. DIALOGUE MEMORY — recent voice exchanges for follow-ups.
             //     Enables pronoun resolution across turns ("what about the one

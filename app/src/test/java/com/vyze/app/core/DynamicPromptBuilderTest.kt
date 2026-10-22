@@ -622,6 +622,89 @@ class DynamicPromptBuilderTest {
         assertTrue(DynamicPromptBuilder.companionShouldGroundOcr("x".repeat(59)))
     }
 
+    // ── 9. E1 lean prompt class (two-budget contract) ─────────────
+
+    @Test
+    fun `lean prompt drops few-shot examples but keeps every pinned contract`() = runBlocking {
+        val p = builder().buildPrompt(
+            queryOverride = "what is this?",
+            ocrText = "PARACETAMOL 500mg TABLETS",
+            dialogueContext = "User: What is in front of me?\nVyze: A coffee mug on the desk.",
+            leanMode = true,
+        )
+        // Examples are the lean class's whole point — out.
+        assertFalse(p.contains("Examples:"))
+        assertTrue(p.contains("Examples omitted for fast answering."))
+        // Every load-bearing contract stays byte-identical (the lean
+        // branch's own doc: mirror, anti-echo, OCR ground-truth, task).
+        assertTrue(p.contains("LANGUAGE MIRRORING: Respond in the language named in the"))
+        assertTrue(p.contains("NEVER repeat, echo, or quote the user's query or question"))
+        assertTrue(p.contains("Begin immediately with the direct description or answer"))
+        assertTrue(p.contains("Respond with the answer only"))
+        assertTrue(p.contains("REMEMBER: Respond only in"))
+        // Read fidelity under lean: the OCR ground-truth directive survives.
+        assertTrue(p.contains("The OCR text above is the ground truth"))
+        // Dialogue survives lean too — condensed, not dropped.
+        assertTrue(p.contains("A coffee mug on the desk."))
+    }
+
+    @Test
+    fun `lean dialogue window keeps the newest turns - not the oldest`() = runBlocking {
+        // 4 turns × 2 lines = 8 lines; the lean window takes the LAST 6
+        // (turns 2-4), cutting only the turn furthest from the question.
+        // The old take(6) cut the other end — it kept turn 1 and dropped
+        // the exchange the follow-up was about.
+        val history =
+            "User: turn one?\nVyze: turn one answer.\n" +
+                "User: turn two?\nVyze: turn two answer.\n" +
+                "User: turn three?\nVyze: turn three answer.\n" +
+                "User: turn four?\nVyze: turn four answer."
+        val lean = builder().buildPrompt(
+            queryOverride = "and that one?",
+            dialogueContext = history,
+            leanMode = true,
+        )
+        assertTrue(lean.contains("turn four answer."))
+        assertTrue(lean.contains("turn two answer."))
+        assertFalse(lean.contains("turn one answer."))
+        // The window is LEAN-ONLY: the rich form still renders full history.
+        val rich = builder().buildPrompt(
+            queryOverride = "and that one?",
+            dialogueContext = history,
+            leanMode = false,
+        )
+        assertTrue(rich.contains("turn one answer."))
+    }
+
+    @Test
+    fun `lean prompt carries no memory-none marker and matches non-lean absence`() = runBlocking {
+        // E1 removal: the old "MEMORY: None. Answer from the fresh frame
+        // only." line was lean-only, wrong on frameless prompts, and re-
+        // prefilled every turn — both classes now render nothing when no
+        // memory block exists.
+        val lean = builder().buildPrompt(queryOverride = "what is this?", leanMode = true)
+        val rich = builder().buildPrompt(queryOverride = "what is this?", leanMode = false)
+        assertFalse(lean.contains("MEMORY: None"))
+        assertFalse(rich.contains("MEMORY: None"))
+    }
+
+    @Test
+    fun `lean prompt is materially smaller than the rich form - budget pin`() = runBlocking {
+        val rich = builder().buildPrompt(queryOverride = "what is this?", leanMode = false)
+        val lean = builder().buildPrompt(queryOverride = "what is this?", leanMode = true)
+        // The example/follow-up blocks are the gap; it must stay wide or
+        // the lean class has quietly regressed. MEASURED at calibration
+        // (2026-10-21): rich=3431 lean=2638 → gap 793. Pin at 700 so any
+        // block re-entering lean (~100+ chars) trips it.
+        assertTrue(
+            "rich=${rich.length} lean=${lean.length} — gap collapsed",
+            rich.length - lean.length >= 700,
+        )
+        // Class ceiling: an accidental block re-entering lean pushes past
+        // this; calibrated against measured builds on first run.
+        assertTrue("lean=${lean.length} exceeds class budget", lean.length <= 3_100)
+    }
+
     fun `non-date queries never carry the date rules`() = runBlocking {
         val p = builder().buildPrompt(queryOverride = "describe this room", userLocale = Locale.US)
         assertFalse(p.contains("DATE ARITHMETIC RULE"))

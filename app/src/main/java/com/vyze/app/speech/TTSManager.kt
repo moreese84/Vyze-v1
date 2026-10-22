@@ -312,7 +312,15 @@ class TTSManager private constructor(context: Context) {
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 lastSpeakStartedAtMs = System.currentTimeMillis()
-                if (utteranceId != null) onUtteranceStart(utteranceId)
+                // E0 FIRST-AUDIO PIN: the crash-log timestamp for the moment
+                // audio actually STARTS (speak() was queued earlier — the gap
+                // is TTS synthesis). Correlate "TTS onStart (id=…_chunk_N)"
+                // with "Sentence flush (id=…)" and "TRIGGER SNAPSHOT" for the
+                // frame → prefill → decode → first-audio chain per turn.
+                if (utteranceId != null) {
+                    CrashLogFile.log(TAG, "TTS onStart (id=$utteranceId)")
+                    onUtteranceStart(utteranceId)
+                }
             }
 
             override fun onDone(utteranceId: String?) {

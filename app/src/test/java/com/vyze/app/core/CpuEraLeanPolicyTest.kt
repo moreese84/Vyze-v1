@@ -1,5 +1,6 @@
 package com.vyze.app.core
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -35,16 +36,21 @@ class CpuEraLeanPolicyTest {
         )
     }
 
-    // ── 2. GPU era: nobody leans (the rich prompt is the point of the GPU) ──
+    // ── 2. GPU era leans too (v3, 2026-10-21) ──────────────────────────
+    // v2 kept GPU prompts rich ("the rich prompt is the point of the GPU");
+    // v3 flipped it on MEASURED evidence: session 314f7542 on the Infinix
+    // MT6899 — a 5,323-char prompt ate 9,769 ms of prefill on the GPU
+    // backend. Prefill scales with prompt chars on every backend, so rich-
+    // on-GPU preserved the cost on the one backend meant to be fast.
 
     @Test
-    fun `gpu era never leans`() {
-        assertFalse(
+    fun `gpu era leans too - v3 evidence pin`() {
+        assertTrue(
             VyzeCoreController.companionCpuEraLeanMode(
                 isTextQuery = false, tierIsCpuVision = false, activeBackend = "GPU",
             )
         )
-        assertFalse(
+        assertTrue(
             VyzeCoreController.companionCpuEraLeanMode(
                 isTextQuery = true, tierIsCpuVision = false, activeBackend = "GPU",
             )
@@ -63,8 +69,11 @@ class CpuEraLeanPolicyTest {
     }
 
     @Test
-    fun `cpu vision tier text lane never leans`() {
-        assertFalse(
+    fun `cpu vision tier cannot veto the gpu lean verdict on text lanes - v3`() {
+        // v2 pinned FALSE here (tier text lanes kept the rich form at GPU);
+        // v3 says the BACKEND decides — the tier flag may only ADD lean
+        // (image lanes at Tier 2/3), never remove it.
+        assertTrue(
             VyzeCoreController.companionCpuEraLeanMode(
                 isTextQuery = true, tierIsCpuVision = true, activeBackend = "GPU",
             )
@@ -90,14 +99,19 @@ class CpuEraLeanPolicyTest {
     // ── 5. Defensive comment hygiene pin (the v1 regression) ──
 
     @Test
-    fun `tier 2 input alone does not lean a text lane at gpu backend`() {
-        // Regression target for the v1→v2 edit: text lanes at Tier 2/3 only
-        // lean if the ACTIVE backend is CPU; the GPU-era text lane renders
-        // its rich form (mirrors case 3's second assertion at the other tier flag).
-        assertFalse(
+    fun `tier flag is verdict-neutral for gpu text lanes - v3`() {
+        // v1→v2 regression target, re-pinned under v3: the tier flag must
+        // produce the SAME verdict with and without it — it only ever added
+        // lean for image lanes at unknown/absent backend evidence, and must
+        // never grow a veto over the backend verdict (that veto was the v2
+        // form this test used to pin).
+        assertEquals(
+            VyzeCoreController.companionCpuEraLeanMode(
+                isTextQuery = true, tierIsCpuVision = false, activeBackend = "GPU",
+            ),
             VyzeCoreController.companionCpuEraLeanMode(
                 isTextQuery = true, tierIsCpuVision = true, activeBackend = "GPU",
-            )
+            ),
         )
     }
 }
