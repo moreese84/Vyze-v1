@@ -256,6 +256,11 @@ dependencies {
 
     // Unit testing
     testImplementation("junit:junit:4.13.2")
+    // Real SQLite engine for JVM migration tests (Migration5To6Test).
+    // Room migrations are raw SQL strings — only executing them on a real
+    // engine catches syntax errors like the G2 `TEXT NOT` bug that crashed
+    // every DB≤5 upgrade at open. Test-scope only; never ships.
+    testImplementation("org.xerial:sqlite-jdbc:3.46.1.0")
 
     // Instrumented testing
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

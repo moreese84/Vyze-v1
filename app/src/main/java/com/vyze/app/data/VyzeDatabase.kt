@@ -131,6 +131,14 @@ abstract class VyzeDatabase : RoomDatabase() {
         /**
          * Migration 5 → 6: Added `medicines` table for local drug knowledge base.
          * Pre-populated via MedicineDatabaseCallback.onCreate().
+         *
+         * G2 NOTE: this CREATE TABLE once ended `searchName` TEXT NOT —
+         * missing NULL, a SQLite syntax error that crashed any DB ≤5
+         * upgrade at first open (fresh installs took onCreate and never
+         * saw it, hence no dev repro). Introduced in 11d13b5, fixed in
+         * 7b99995 (2026-10-10). NOW PINNED: Migration5To6Test executes
+         * every statement in migrate() on a real SQLite engine — the bug
+         * cannot return silently.
          */
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
