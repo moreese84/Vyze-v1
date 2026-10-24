@@ -21,6 +21,23 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
 
     // ── Public API ─────────────────────────────────────────────────
 
+    /**
+     * Builds one turn's prompt in one of the TWO E1 budget classes
+     * (asymmetric prompt budgets — plan §E1):
+     *
+     *  - **Deliberate** (any user ask — direct query, text-only, or the
+     *    default navigation ask): the full contract — rules, OCR ground
+     *    truth, dialogue recall, scene memory, learned brevity, anti-echo.
+     *    [leanMode] sub-budgets THIS class only (few-shots out); it never
+     *    changes class.
+     *  - **Narration** ([continuousMode] with no query — ambient work):
+     *    near-empty. Language header + mirroring mandate, the narration
+     *    contract ([CONTINUOUS_MODE_RULES]), the task line, bottom
+     *    REMEMBER — plus any ARMED safety clause (safety is never budget-
+     *    trimmed). Query-shaped weight (anti-echo block, learned-brevity
+     *    LENGTH, dialogue recall, scene memory) is not rendered even when
+     *    passed: the class owns its budget, not the call site.
+     */
     suspend fun buildPrompt(
         snapshotDescription: String = "",
         queryOverride: String? = null,
@@ -41,6 +58,13 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         return try {
             val sb = StringBuilder()
             val isDirectQuery = !queryOverride.isNullOrBlank()
+            // E1 TWO-CLASS BUDGET: the NARRATION class is ambient work with
+            // no user query — continuous auto-captures pass queryOverride=
+            // null. It renders only language authority + the narration
+            // contract + task + armed safety; query-shaped weight is
+            // stripped at the class level. Every other turn is the
+            // DELIBERATE class, unchanged.
+            val narrationClass = continuousMode && !isDirectQuery
 
             // 0. LANGUAGE MIRROR — TOP OF PROMPT (before any English rules)
             //    This is the strongest lever for non-English output.
@@ -63,7 +87,13 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             // STRICT ANTI-ECHO DIRECTIVE — kills the follow-up bug where the
             // model began its spoken answer by playing the user's question
             // back ("what about this.. this is ...").
-            sb.appendLine(ANTI_ECHO_DIRECTIVE)
+            //
+            // NARRATION CLASS (E1): with no user query in the prompt there
+            // is nothing for the model to play back, so the block is
+            // deliberate-class weight — stripped here, NOT from the echo
+            // contract: the bottom REMEMBER line and the engine-layer
+            // SYSTEM_DIRECTIVE still carry the ban (two live layers).
+            if (!narrationClass) sb.appendLine(ANTI_ECHO_DIRECTIVE)
             sb.appendLine()
 
             // 1. Inject appropriate rules based on query intent
@@ -140,7 +170,14 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     (Placed after OCR so the reading directive above always wins
             //     for text reads: OCR reading is ground-truth playback and
             //     must never be cut short, regardless of brevity.)
-            when (brevityLevel) {
+            //     NARRATION CLASS (E1): the LENGTH line answers "the user's
+            //     question" — no question exists on the ambient lane, and
+            //     CONTINUOUS_MODE_RULES already owns the length cap (15
+            //     words), so it is deliberate-class weight: force NORMAL.
+            val effectiveBrevity = if (narrationClass) {
+                com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL
+            } else brevityLevel
+            when (effectiveBrevity) {
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.BRIEF -> {
                     // PERSPECTIVE FIX: the global persona now caps answers at ONE
                     // short spoken sentence (VlmEngineManager.SYSTEM_DIRECTIVE) —
@@ -155,7 +192,14 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL -> { /* no adaptation */ }
             }
 
-            if (leanMode) {
+            if (narrationClass) {
+                // NARRATION CLASS (E1): dialogue recall and prior-scene
+                // memory are deliberate-class context. This branch renders
+                // neither even when a caller passes them — the budget is
+                // owned by the class, not by call-site discipline (the
+                // controller already nulls both for continuous captures;
+                // the class now enforces it too).
+            } else if (leanMode) {
                 // B (lean): condense the memory dialogue block. NO other
                 // section is trimmed — every directive above (language mirror,
                 // anti-echo, safety/refusal contracts, OCR ground-truth) is
@@ -258,7 +302,19 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     ms/zh the exact spoken form of each canned phrase is pinned
             //     here, after every rule block that names an English phrase.
             //     English needs no override (the constants already speak it).
-            failurePhraseClauseFor(userLocale.language)?.let { sb.appendLine(it) }
+            //     NARRATION CLASS (E1): CONTINUOUS_MODE_RULES names no
+            //     English failure phrase, so on a plain ambient turn this
+            //     override explains rules that are not in the prompt (~450
+            //     chars of dead weight on ms/zh every 4 s tick). It stays
+            //     whenever an armed block DOES quote English — currency /
+            //     bank card constants are English-only, and the text-only
+            //     rule quotes the unknown-phrase (mirroring parity on the
+            //     never-guess paths is not negotiable). textOnlyMode is
+            //     unreachable under narration in production (the text lane
+            //     never sets continuousMode) — guarded anyway.
+            if (!narrationClass || currencyMode || bankCardMode || textOnlyMode) {
+                failurePhraseClauseFor(userLocale.language)?.let { sb.appendLine(it) }
+            }
 
             // 3f. MEDICINE DB-MISS CONTRACT (P1b, 2026-09-28): a medicine ask
             //     whose DB lookup found NO record must produce the pinned

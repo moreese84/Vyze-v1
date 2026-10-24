@@ -705,10 +705,87 @@ class DynamicPromptBuilderTest {
         assertTrue("lean=${lean.length} exceeds class budget", lean.length <= 3_100)
     }
 
+    // (Was missing its @Test — never ran. Activated as part of the E1
+    // narration-class work: it pins the continuous path directly.)
+    @Test
     fun `non-date queries never carry the date rules`() = runBlocking {
         val p = builder().buildPrompt(queryOverride = "describe this room", userLocale = Locale.US)
         assertFalse(p.contains("DATE ARITHMETIC RULE"))
         val scene = builder().buildPrompt(userLocale = Locale.US, continuousMode = true)
         assertFalse(scene.contains("DATE ARITHMETIC RULE"))
+    }
+
+    // ── 10. E1 narration class (asymmetric two-budget contract) ───
+
+    @Test
+    fun `narration class strips query-shaped weight but keeps every load-bearing contract`() = runBlocking {
+        // The class owns its budget (E1): query-shaped context passed by a
+        // caller is IGNORED on the narration lane, while the load-bearing
+        // layers — language authority, narration contract, task line, the
+        // bottom mirror — stay byte-identical to the deliberate class.
+        val p = builder().buildPrompt(
+            userLocale = Locale.US,
+            continuousMode = true,
+            // Deliberate-class context passed ON PURPOSE — must not render:
+            dialogueContext = "User: What is in front of me?\nVyze: A coffee mug on the desk.",
+            memoryContext = "Prior shelf with blue bins",
+            brevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.TERSE,
+        )
+        // Load-bearing layers present.
+        assertTrue(p.contains("[OUTPUT LANGUAGE: English]"))
+        assertTrue(p.contains("LANGUAGE MIRRORING: Respond in the language named in the"))
+        assertTrue(p.contains("Instant assistant."))
+        assertTrue(p.contains("Describe environment: obstacles, doors, people, text."))
+        assertTrue(p.contains("REMEMBER: Respond only in"))
+        // Query-shaped weight absent — each string is unique to its block.
+        assertFalse("anti-echo block re-entered narration",
+            p.contains("CRITICAL: NEVER repeat, echo, or quote"))
+        assertFalse("learned-brevity line re-entered narration", p.contains("LENGTH:"))
+        assertFalse("dialogue recall re-entered narration", p.contains("Recent conversation"))
+        assertFalse("scene memory re-entered narration", p.contains("Prior scene memory"))
+    }
+
+    @Test
+    fun `ms narration drops the failure-phrase override until a safety block quotes English`() = runBlocking {
+        // Plain ambient turn: CONTINUOUS_MODE_RULES names no English
+        // failure phrase → the override would explain rules that are not
+        // in the prompt (~450 chars of dead weight every 4 s tick).
+        val plain = builder().buildPrompt(userLocale = Locale("ms"), continuousMode = true)
+        assertFalse(plain.contains("FAILURE-PHRASE OVERRIDE"))
+        // Armed safety keeps mirroring parity — currency quotes English.
+        val armed = builder().buildPrompt(
+            userLocale = Locale("ms"),
+            continuousMode = true,
+            currencyMode = true,
+        )
+        assertTrue(armed.contains("FAILURE-PHRASE OVERRIDE"))
+        assertTrue(armed.contains("Saya tidak dapat membaca nilai ini dengan jelas"))
+        // The deliberate class is unchanged: the override always ships on ms.
+        val deliberate = builder().buildPrompt(userLocale = Locale("ms"), queryOverride = "apa ini?")
+        assertTrue(deliberate.contains("FAILURE-PHRASE OVERRIDE"))
+    }
+
+    @Test
+    fun `narration class is the smallest budget - three-class pin`() = runBlocking {
+        val rich = builder().buildPrompt(queryOverride = "what is this?", leanMode = false)
+        val lean = builder().buildPrompt(queryOverride = "what is this?", leanMode = true)
+        val narration = builder().buildPrompt(userLocale = Locale.US, continuousMode = true)
+        // Narration is strictly the smallest of the three budgets...
+        assertTrue(
+            "narration=${narration.length} not below lean=${lean.length}",
+            narration.length < lean.length,
+        )
+        // ...by a wide margin against the deliberate rich form. Any block
+        // re-entering narration (~200-700 chars) must trip this: the exact
+        // blocks are pinned by name in the strip test above; this catches
+        // anything new. MEASURED at calibration (2026-10-24):
+        // rich=3431 lean=2638 narration=1069 → gap 2362. Pin at 1,700 so
+        // a full re-entry of any stripped block (~450 worst case) trips it.
+        assertTrue(
+            "rich=${rich.length} narration=${narration.length} — gap collapsed",
+            rich.length - narration.length >= 1_700,
+        )
+        // Class ceiling: hard cap for the ambient budget in EN.
+        assertTrue("narration=${narration.length} exceeds class budget", narration.length <= 1_500)
     }
 }
