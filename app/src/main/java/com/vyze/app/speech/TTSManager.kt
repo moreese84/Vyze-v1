@@ -2,6 +2,7 @@ package com.vyze.app.speech
 import com.vyze.app.VyzeApplication
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
+import com.vyze.app.performance.FrameBudgetProbe
 import com.vyze.app.ui.TtsViewModel
 
 import android.content.Context
@@ -158,6 +159,20 @@ class TTSManager private constructor(context: Context) {
 
     /** Monotonically increasing counter for unique utterance IDs. */
     private val utteranceCounter = AtomicLong(0)
+
+    /**
+     * Utterance IDs submitted as DEAD-AIR FILLER (the capture-time
+     * "Let me look." acknowledgement). The E0 FRAME-BUDGET window must
+     * measure frame → the ANSWER's first audio; the filler always wins
+     * that race at ~90 ms and would fake an E2_VIABLE verdict (live
+     * evidence 2026-10-25: all 7 answered frames closed 72–110 ms on the
+     * filler). IDs are consumed on first onStart. (Flag is lost when the
+     * utterance is buffered pre-init — fillers only run while the engine
+     * answers, i.e. long after TTS init, so that path is unreachable in
+     * practice.)
+     */
+    private val deadAirUtteranceIds: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
 
     /**
      * Generate a unique utterance ID for a speak() call.
@@ -320,6 +335,20 @@ class TTSManager private constructor(context: Context) {
                 if (utteranceId != null) {
                     CrashLogFile.log(TAG, "TTS onStart (id=$utteranceId)")
                     onUtteranceStart(utteranceId)
+                }
+                // E0 FRAME BUDGET (plan §E0): close an OPEN continuous-frame
+                // window at the ANSWER's first audio → the frame→first-audio
+                // sample the E2-vs-E3 verdict reads. Dead-air-filler
+                // utterances (marked at submission) never close: the
+                // capture-time "Let me look." always fires ~90 ms in and
+                // would fake the verdict. Returns null with no open window
+                // (tap/voice/tutorial speech) — other lanes never pollute
+                // the continuous budget. Content-free: duration only.
+                val isDeadAir = utteranceId != null && deadAirUtteranceIds.remove(utteranceId)
+                if (!isDeadAir) {
+                    FrameBudgetProbe.shared.onFirstAudio()?.let { s ->
+                        CrashLogFile.log(TAG, "FRAME-BUDGET close frameToAudio=${s.frameToAudioMs}ms (thermal=${s.thermalTier})")
+                    }
                 }
             }
 
@@ -537,7 +566,8 @@ class TTSManager private constructor(context: Context) {
         text: String,
         onStart: (() -> Unit)? = null,
         onDone: (() -> Unit)? = null,
-        onError: (() -> Unit)? = null
+        onError: (() -> Unit)? = null,
+        deadAirFiller: Boolean = false
     ): Boolean {
         Log.i(TAG, "speakImmediate() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}, pendingIds=${pendingUtteranceIds.size}")
 
@@ -569,6 +599,7 @@ class TTSManager private constructor(context: Context) {
         // errors so waiting listeners can resume.
         notifyFlushed()
         val id = nextUtteranceId()
+        if (deadAirFiller) deadAirUtteranceIds.add(id)
         pendingUtteranceIds.add(id)
         val accepted = speakWithEngine(
             enhancedText, id,
@@ -585,7 +616,7 @@ class TTSManager private constructor(context: Context) {
         return accepted
     }
 
-    fun speakQueued(text: String) {
+    fun speakQueued(text: String, deadAirFiller: Boolean = false) {
         Log.i(TAG, "speakQueued() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}")
 
         if (text.isBlank()) {
@@ -594,7 +625,7 @@ class TTSManager private constructor(context: Context) {
         }
 
         if (isInitialized) {
-            speakImmediate(text)
+            speakImmediate(text, deadAirFiller = deadAirFiller)
         } else {
             Log.d(TAG, "speakQueued: TTS not ready — buffering: \"${text.take(60)}\"")
             speechBuffer.add(text)

@@ -3253,15 +3253,15 @@ class VlmEngineManager(
          */
         private const val PERSPECTIVE_EN =
             "Describe positions relative to the USER ('in front of you', 'to your left', " +
-            "'at 12 o'clock') — never 'my left'. Spatial wording only when the question " +
-            "asks WHERE; state the object first. Never open every sentence the same way."
+            "'at 12 o'clock') — never 'my left'. Spatial wording only when the question " +                "asks WHERE; state the object first. Never open every sentence the same way. " +
+                "Never say 'the user' in the spoken answer — address the listener as 'you'."
         private const val PERSPECTIVE_MS =
             "Nyatakan kedudukan relatif kepada PENGGUNA ('di hadapan anda', 'di sebelah kiri " +
-            "anda', 'pukul 12') — jangan sesekali 'saya'. Sebut kedudukan hanya bila soalan " +
-            "bertanya DI MANA; nyatakan objek dahulu. Jangan mulakan setiap ayat sama."
+            "anda', 'pukul 12') — jangan sesekali 'saya'. Sebut kedudukan hanya bila soalan " +                "bertanya DI MANA; nyatakan objek dahulu. Jangan mulakan setiap ayat sama. " +
+                "Jangan sebut 'pengguna' dalam jawapan — rujuk pendengar sebagai 'anda'."
         private const val PERSPECTIVE_ZH =
-            "位置以用户为基准来描述（'在你面前'、'在你的左边'、'12点钟方向'）——绝不要用'我'作基准。 " +
-            "只有当问题询问位置时才提到方位，并且先说物体。每句开头不要一样。"
+            "位置以用户为基准来描述（'在你面前'、'在你的左边'、'12点钟方向'）——绝不要用'我'作基准。 " +                "只有当问题询问位置时才提到方位，并且先说物体。每句开头不要一样。" +
+                "回答中不要出现'用户'——只用'你'称呼听者。"
 
         // ── Mid-Tier / Low-RAM Thresholds ───────────────────────
         /** Minimum free device RAM (MB) required to attempt model init on standard devices. */

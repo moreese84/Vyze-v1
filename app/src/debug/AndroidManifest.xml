@@ -142,6 +142,17 @@
             android:exported="true" />
 
         <!--
+            Continuous-mode toggle (debug only): supplies the trigger that
+            does not exist anywhere in the app for toggleContinuousMode(),
+            so scripted §E0 FRAME-BUDGET device sessions can drive the
+            continuous auto-snapshot lane. Process-local — every app
+            restart restores OFF.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.ContinuousToggleReceiver"
+            android:exported="true" />
+
+        <!--
             Sticky brain override restore (debug only): same discipline as
             the pre-gate/gemma-always sticky providers — survives OEM kills
             during test cycles. Stub provider; does not exist in release

@@ -535,6 +535,18 @@ class VyzeCoreController(
             } else {
                 CrashLogFile.log(TAG, "onComplete fired: session=$sessionId, ${fullResponse.length} chars")
                 recordTelemetry(success = true)
+                // POST-GENERATION CLEANUP: echoed prompt tags and a trailing
+                // canned-refusal tail are removed once, here, so storage,
+                // scan history and the UI callback all see the delivered
+                // text. (Streamed TTS chunks are already stripped in
+                // sanitizeForTts; opener dedupe is stream-side.)
+                val cleanedResponse = ResponseCleanup.clean(fullResponse)
+                if (cleanedResponse != fullResponse) {
+                    CrashLogFile.log(TAG, "Response cleaned: ${fullResponse.length} -> ${cleanedResponse.length} chars")
+                }
+                // Remember THIS answer's opener for the next answer's
+                // first-flush dedupe (single writer — onComplete only).
+                lastAnswerOpener = ResponseCleanup.openerOf(fullResponse)
                 try {
                     // ── REPETITION-LOOP GUARD (net at onComplete) ────
                     // Tokens may have arrived faster than the streaming
@@ -559,12 +571,12 @@ class VyzeCoreController(
                             "看不清楚。"
                         )
                     } else {
-                        fullResponse
+                        cleanedResponse
                     }
                     flushRemainingSentenceBuffer()
                     scope.launch {
                         try {
-                            promptBuilder.storeEnvironmentObservation(fullResponse)
+                            promptBuilder.storeEnvironmentObservation(cleanedResponse)
                             CrashLogFile.log(TAG, "Memory store OK")
                         } catch (e: Throwable) {
                             CrashLogFile.logError(TAG, "Memory store failed: ${e.javaClass.simpleName}: ${e.message}", e)
@@ -576,8 +588,8 @@ class VyzeCoreController(
                         if (currencyModeActive && fullResponse.isNotBlank()) {
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
-                                    .saveCurrencyScan(fullResponse.take(120))
-                                CrashLogFile.log(TAG, "Currency scan saved: ${fullResponse.take(60)}")
+                                    .saveCurrencyScan(cleanedResponse.take(120))
+                                CrashLogFile.log(TAG, "Currency scan saved: ${cleanedResponse.take(60)}")
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Currency scan save failed: ${e.message}", e)
                             }
@@ -590,7 +602,7 @@ class VyzeCoreController(
                         if (bankCardModeActive && fullResponse.isNotBlank()) {
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
-                                    .saveBankCardScan(fullResponse.take(120))
+                                    .saveBankCardScan(cleanedResponse.take(120))
                                 CrashLogFile.log(TAG, "Bank card scan saved: ${fullResponse.take(60)}")
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Bank card scan save failed: ${e.message}", e)
@@ -883,6 +895,7 @@ class VyzeCoreController(
             .replace(Regex("(?s)```.*?```"), " ")   // complete fenced code blocks
             .replace(Regex("(?s)```.*\\z"), " ")     // unterminated trailing fence
             .replace(Regex("`+"), "")               // inline backticks
+            .replace(Regex("\\[[^\\[\\]]{0,120}]"), " ")  // prompt directives echoed back by the model ([OUTPUT LANGUAGE: …], [color] …) — must never be spoken
             .replace(Regex("(?m)^#{1,6}\\s+"), "")  // ATX headings
             .replace(Regex("(?m)^>\\s?"), "")        // blockquotes
             .replace("**", "")
@@ -1087,7 +1100,7 @@ class VyzeCoreController(
             // the backstop's clause cut ends AT the delimiter (cut) so the
             // delimiter itself stays with the spoken prefix.
             val cutEnd = if (pendingClauseCut) cut else cut + 1
-            chunk = sanitizeForTts(text.substring(0, cutEnd))
+            chunk = maybeDedupeOpener(sanitizeForTts(text.substring(0, cutEnd)))
 
             sentenceBuffer.delete(0, cut + 1)
             // Whitespace FIX: strip ALL leading whitespace artifacts (spaces,
@@ -1150,7 +1163,7 @@ class VyzeCoreController(
         val remaining: String
         synchronized(bufferLock) {
             if (sentenceBuffer.isNotEmpty()) {
-                remaining = sanitizeForTts(sentenceBuffer.toString().trim())
+                remaining = maybeDedupeOpener(sanitizeForTts(sentenceBuffer.toString().trim()))
                 sentenceBuffer.setLength(0)  // force-clear, not just clear()
             } else {
                 remaining = ""
@@ -1174,6 +1187,39 @@ class VyzeCoreController(
         }
     }
 
+    /**
+     * E0/BUG-5: the first sentence of the PREVIOUS delivered answer,
+     * normalized ([ResponseCleanup.openerOf]) — compared at every
+     * first-chunk flush so a template opener repeated verbatim across
+     * answers ("A circular object sits on a white surface." ×2, live
+     * 2026-10-25) is dropped from the STREAM once. Single writer:
+     * vlmEngine.onComplete.
+     */
+    @Volatile
+    private var lastAnswerOpener: String? = null
+
+    /** First flush of the current response not yet checked for a repeated opener. */
+    @Volatile
+    private var openerDedupeChecked = false
+
+    /**
+     * Drop the first sentence of this flushed chunk when it repeats the
+     * previous answer's opener verbatim. Checked exactly once per response
+     * (first flush wins); never empties the chunk — a response that IS one
+     * repeated sentence stays fully spoken.
+     */
+    private fun maybeDedupeOpener(text: String): String {
+        if (openerDedupeChecked || text.isEmpty()) return text
+        openerDedupeChecked = true
+        val previous = lastAnswerOpener ?: return text
+        val current = ResponseCleanup.openerOf(text)
+        if (current.isEmpty() || current != previous) return text
+        val rest = ResponseCleanup.removeFirstSentence(text)
+        if (rest.isBlank() || rest == text) return text
+        CrashLogFile.log(TAG, "Opener dedupe: repeated first sentence dropped from streamed answer")
+        return rest
+    }
+
     private fun resetSentenceBuffer() {
         synchronized(bufferLock) {
             sentenceBuffer.clear()
@@ -1184,6 +1230,7 @@ class VyzeCoreController(
         confidenceCheckPassed = false
         repetitionWindow.setLength(0)
         repetitionGuardTripped = false
+        openerDedupeChecked = false
     }
 
     // ── Tap Grid Tagging (structured spatial prompting) ───────────
@@ -1559,7 +1606,8 @@ class VyzeCoreController(
                             "Let me look.",
                             "Sekejap, saya tengok.",
                             "我看一下。"
-                        )
+                        ),
+                        deadAirFiller = true
                     )
                     CrashLogFile.log(TAG, "Dead-air filler spoken at capture")
                 }
@@ -2070,6 +2118,16 @@ class VyzeCoreController(
                 } else {
                     CrashLogFile.log(TAG, "Storing interaction for adaptive intelligence...")
 
+                    // STORAGE-SIDE CLEANUP: echoed prompt tags and a
+                    // trailing canned-refusal tail never reach memory,
+                    // dialogue history or lastDescribedObject. Suspect marks
+                    // above stay computed on the RAW response so the audit
+                    // trail keeps seeing template echoes verbatim.
+                    val delivered = ResponseCleanup.clean(response)
+                    if (delivered != response) {
+                        CrashLogFile.log(TAG, "Stored response cleaned: ${response.length} -> ${delivered.length} chars")
+                    }
+
                     // ── SUSPECT MARKS (implicit failure detection) ──
                     // Computed at store time; pure decisions, tiny state.
                     val repeatWithinWindow = SuspectMarker.isRepeatWithinWindow(
@@ -2112,20 +2170,20 @@ class VyzeCoreController(
                     memoryRepository.storeInteraction(
                         bitmap = bitmap,
                         prompt = basePrompt,
-                        output = response,
+                        output = delivered,
                         feedback = suspectTags,
                         tags = ""
                     )
 
                     if (currentSessionId == activeSessionId) {
-                        val normalized = response.trim().lowercase()
+                        val normalized = delivered.trim().lowercase()
                         if (normalized.isNotBlank()) {
                             lastDescribedObject = normalized
                             lastDescribedTime = System.currentTimeMillis()
                         }
                         // Record the exchange for conversational follow-ups.
                         if (isVoiceFollowUpCandidate && !isPreciseRead) {
-                            recordDialogueTurn(query ?: "", response)
+                            recordDialogueTurn(query ?: "", delivered)
                         }
                         // Recent-query ring for repeat detection (voice lane
                         // only — taps carry no query worth repeating).

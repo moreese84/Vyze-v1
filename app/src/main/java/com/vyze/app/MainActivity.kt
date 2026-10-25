@@ -191,6 +191,14 @@ class MainActivity : AppCompatActivity() {
     /** Callback invoked with partial (live) transcription text for UI feedback. */
     var onPartialSpeechResult: ((String) -> Unit)? = null
 
+    /**
+     * Invoked the instant the recognizer detects END of speech — before
+     * final results are computed. The camera screen uses it to pin the
+     * scene frame while the user is still pointing (bug 2026-10-25: frames
+     * captured after ASR finalization landed after the phone was lowered).
+     */
+    var onEndOfSpeechResult: (() -> Unit)? = null
+
     /** Callback for speech recognition errors (non-fatal). */
     var onSpeechError: ((String) -> Unit)? = null
 
@@ -1706,6 +1714,7 @@ class MainActivity : AppCompatActivity() {
             override fun onEndOfSpeech() {
                 Log.d(TAG, "onEndOfSpeech — waiting for final results")
                 isListening = false
+                onEndOfSpeechResult?.invoke()
             }
 
             override fun onError(error: Int) {

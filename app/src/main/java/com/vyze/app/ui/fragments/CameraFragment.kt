@@ -22,6 +22,7 @@ import com.vyze.app.ui.TtsViewModel
 import com.vyze.app.ui.SplashViewModel
 import com.vyze.app.speech.ReportManager
 import com.vyze.app.vision.ColorAnalyzer
+import com.vyze.app.performance.FrameBudgetProbe
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -440,6 +441,19 @@ class CameraFragment : Fragment() {
      */
     private val isCapturing = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // ── END-OF-SPEECH FRAME PIN (bug 2026-10-25: "the engine did not
+    // capture the frame right after i ask … i move the phone away") ──
+    // The voice lane takes its frame only AFTER ASR finalizes — 0.5–2+s
+    // after the user stops speaking, by which point the phone is usually
+    // already lowered and the frame is off-target (it surfaces as
+    // "Text is unclear." or a hallucinated scene). [pinFrameAtEndOfSpeech]
+    // grabs the frame the instant the recognizer hears end-of-speech;
+    // [captureFrameForQuery] consumes it when fresh (< 3 s old) and
+    // otherwise falls back to the fresh capture (pre-fix behaviour).
+    @Volatile private var pinnedVoiceFrame: Bitmap? = null
+    @Volatile private var pinnedVoiceFrameAtMs = 0L
+    @Volatile private var pinCaptureInFlight = false
+
     // ── Continuous Auto-Snapshot Mode ────────────────────────────
     // When enabled, automatically captures and describes the scene
     // every AUTO_SNAPSHOT_INTERVAL_MS — similar to Gemini Live.
@@ -774,6 +788,7 @@ class CameraFragment : Fragment() {
 
     override fun onResume() {
         super.onResume()
+        instance = this
 
         if (::coreController.isInitialized) {
             coreController.resetSessionState()
@@ -813,6 +828,10 @@ class CameraFragment : Fragment() {
 
     override fun onPause() {
         super.onPause()
+        // Guard: during activity recreation a stale instance's late onPause
+        // must not null the handle a newer instance already set.
+        if (instance === this) instance = null
+        clearPinnedVoiceFrame()
         isCameraActive = false
         stopContinuousLoop()
         endFollowUpWindow()
@@ -1235,6 +1254,52 @@ class CameraFragment : Fragment() {
      * degrade to the analyzer snapshot instead of failing the query — one
      * lower-quality OCR read beats no answer.
      */
+    private fun clearPinnedVoiceFrame() {
+        val old = pinnedVoiceFrame
+        pinnedVoiceFrame = null
+        pinnedVoiceFrameAtMs = 0L
+        if (old != null && !old.isRecycled) {
+            try { old.recycle() } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Capture the scene the moment the recognizer reports end-of-speech —
+     * the last instant the user is still pointing at what they asked about.
+     * Main-thread (recognizer callbacks and takeSnapshot delivery both run
+     * on main), so the LISTENING guard is race-free: once the speech result
+     * is processed the state leaves LISTENING and a late-arriving frame is
+     * recycled instead of stored.
+     */
+    private fun pinFrameAtEndOfSpeech() {
+        if (!isAdded || !isCameraActive) return
+        if (voiceAuditionActive || awaitingInstallVoiceAnswer) return
+        if (appState != AppState.LISTENING) return
+        if (pinCaptureInFlight) return
+        pinCaptureInFlight = true
+        cameraSetup.takeSnapshot(
+            onBitmap = { bitmap ->
+                pinCaptureInFlight = false
+                if (!isAdded || appState != AppState.LISTENING || bitmap.isRecycled) {
+                    if (!bitmap.isRecycled) bitmap.recycle()
+                    return@takeSnapshot
+                }
+                val old = pinnedVoiceFrame
+                pinnedVoiceFrame = bitmap
+                pinnedVoiceFrameAtMs = System.currentTimeMillis()
+                CrashLogFile.log(
+                    TAG,
+                    "Voice frame pinned at end-of-speech (${bitmap.width}x${bitmap.height})"
+                )
+                if (old != null && old !== bitmap && !old.isRecycled) old.recycle()
+            },
+            onError = { error ->
+                pinCaptureInFlight = false
+                CrashLogFile.log(TAG, "Voice frame pin failed: $error")
+            }
+        )
+    }
+
     private fun captureFrameForQuery(
         query: String,
         onBitmap: (Bitmap) -> Unit,
@@ -1250,7 +1315,18 @@ class CameraFragment : Fragment() {
                 }
             )
         } else {
-            cameraSetup.takeSnapshot(onBitmap = onBitmap, onError = onError)
+            val pinned = pinnedVoiceFrame
+            val ageMs =
+                if (pinned != null) System.currentTimeMillis() - pinnedVoiceFrameAtMs
+                else Long.MAX_VALUE
+            if (pinned != null && !pinned.isRecycled && ageMs <= 3_000L) {
+                pinnedVoiceFrame = null
+                CrashLogFile.log(TAG, "Using end-of-speech pinned frame (age=${ageMs}ms)")
+                onBitmap(pinned)
+            } else {
+                if (pinned != null) clearPinnedVoiceFrame()
+                cameraSetup.takeSnapshot(onBitmap = onBitmap, onError = onError)
+            }
         }
     }
 
@@ -1596,6 +1672,9 @@ class CameraFragment : Fragment() {
         }
 
         activity.onPartialSpeechResult = { partial ->
+            // A new utterance is being recognized — any pin left from the
+            // previous turn is no longer the frame THIS question is about.
+            clearPinnedVoiceFrame()
             if (isAdded && _fragmentCameraBinding != null) {
                 if (partial.isNullOrBlank()) {
                     appState = AppState.LISTENING
@@ -1604,6 +1683,13 @@ class CameraFragment : Fragment() {
                     updateStatus("Listening: \"$partial\"")
                 }
             }
+        }
+
+        activity.onEndOfSpeechResult = {
+            // The user just stopped speaking while (typically) still
+            // pointing — pin the frame NOW, before ASR finalization and
+            // the phone-lowering race that follows it.
+            pinFrameAtEndOfSpeech()
         }
 
         activity.onSpeechError = { errorMsg ->
@@ -1861,7 +1947,17 @@ class CameraFragment : Fragment() {
         updateStatus("Scanning...")
 
         cameraSetup.takeSnapshot(
-            onCaptureStart = { captureStartAtMs = System.currentTimeMillis() },
+            onCaptureStart = {
+                captureStartAtMs = System.currentTimeMillis()
+                // E0 FRAME BUDGET (plan §E0): T0 = frame-capture start on
+                // the continuous lane. Paired with first-audio in
+                // TTSManager.onStart; the scene gate closes it as a skip.
+                // Content-free: timestamp + thermal tier label only.
+                val frameT0 = FrameBudgetProbe.shared.beginFrame(
+                    thermalController().policy.label,
+                )
+                CrashLogFile.log(TAG, "FRAME-BUDGET open t0=$frameT0 (thermal=${thermalController().policy.label})")
+            },
             onBitmap = { bitmap ->
                 try {
                     if (bitmap.isRecycled) {
@@ -1881,6 +1977,12 @@ class CameraFragment : Fragment() {
                     // Return the state machine to IDLE so the auto-capture
                     // loop keeps running without a spoken response.
                     coreController.onContinuousSkip = {
+                        // E0: the gate refused inference — close the open
+                        // window as a SKIP so it is counted but never
+                        // averaged into the frame→first-audio latency.
+                        FrameBudgetProbe.shared.onSceneSkip()?.let { s ->
+                            CrashLogFile.log(TAG, "FRAME-BUDGET scene-skip (t0=${s.t0Ms})")
+                        }
                         activity?.runOnUiThread {
                             if (appState == AppState.ANALYZING) {
                                 appState = AppState.IDLE
@@ -2936,6 +3038,15 @@ class CameraFragment : Fragment() {
          * After continuous mode runs for this long, throttle the capture interval
          * to prevent SoC thermal throttling on mid-tier chipsets.
          */
+        /**
+         * Debug/automation handle: set while resumed so scripted device
+         * sessions (debug ContinuousToggleReceiver — E0 FRAME-BUDGET runs)
+         * can drive toggleContinuousMode, which has no in-app caller.
+         * Null whenever the fragment is paused; release code never reads it.
+         */
+        @Volatile
+        var instance: CameraFragment? = null
+
         private const val CONTINUOUS_MODE_THROTTLE_AFTER_MS = 180_000L  // 3 minutes
 
         /**
