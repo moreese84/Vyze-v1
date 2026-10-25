@@ -483,6 +483,15 @@ class MainActivity : AppCompatActivity() {
      * visually, and the real answer follows moments later. The source fix
      * for the capture path itself is the session-close at every rescue/
      * replay delivery site (see SELF-TALK FIX notes).
+     *
+     * E0 PROBE FIX (2026-10-25, run 2): a status cue is NON-ANSWER audio,
+     * so it is submitted with deadAirFiller=true — the FRAME-BUDGET probe
+     * may only close a continuous window on the ANSWER's first audio. A
+     * barge-in tap's "Analyzing scene..." reached TTSManager.onStart and
+     * closed an open window 3.9–6.2 s in, marking a frame the tap had
+     * already cancelled as ANSWERED (run-2 frames 1–2). This is the only
+     * status-cue delivery site (sole caller:
+     * CameraFragment.triggerVlmSnapshot).
      */
     fun announceStatus(text: String) {
         if (!ttsReady || text.isBlank()) return
@@ -491,7 +500,7 @@ class MainActivity : AppCompatActivity() {
             CrashLogFile.log(TAG, "SELF-TALK GUARD: status cue suppressed while listening")
             return
         }
-        ttsManager.speakImmediate(text)
+        ttsManager.speakImmediate(text, deadAirFiller = true)
     }
 
     /**

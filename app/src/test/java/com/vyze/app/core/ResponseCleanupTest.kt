@@ -97,6 +97,76 @@ class ResponseCleanupTest {
 
     // ── clean ──────────────────────────────────────────────────────
 
+    // ── stripInstructionEcho (prompt-echo fix, run 2 live evidence) ──
+
+    @Test
+    fun `stripInstructionEcho drops the echoed language anchor line`() {
+        assertEquals(
+            "A red car is parked beside the wall.",
+            ResponseCleanup.stripInstructionEcho(
+                "Write every word of your response in English. " +
+                    "Do not continue in any other language. " +
+                    "A red car is parked beside the wall."
+            )
+        )
+    }
+
+    @Test
+    fun `stripInstructionEcho drops the Malay anchor tail sentences`() {
+        assertEquals(
+            "Kotak itu di atas meja.",
+            ResponseCleanup.stripInstructionEcho(
+                "Do NOT use English. Do NOT translate. This is mandatory. " +
+                    "Kotak itu di atas meja."
+            )
+        )
+    }
+
+    @Test
+    fun `stripInstructionEcho drops a verbatim language-mirror and anti-echo recital`() {
+        // The 301-char run-2 response, bracket tag included.
+        val recital =
+            "[OUTPUT LANGUAGE: English] Write every word of your response in English. " +
+                "Do not continue in any other language. " +
+                "LANGUAGE MIRRORING: Respond in the language named in the " +
+                "[OUTPUT LANGUAGE] tag — the tag is the authority on the answer " +
+                "language. Even when the query text itself reads like English, the " +
+                "tag names the user's actual spoken language — answer in the tag's " +
+                "language. If no tag is present, detect the language of the user's " +
+                "query and respond strictly in that exact same language. Never " +
+                "revert to default English if the user speaks another language. " +
+                "CRITICAL: NEVER repeat, echo, or quote the user's query or question " +
+                "at the start of your response. Begin immediately with the direct " +
+                "description or answer. REMEMBER: Respond only in English. " +
+                "Begin immediately with the answer itself — never repeat or echo the " +
+                "user's question. You are Vyze, a fast, friendly visual assistant " +
+                "speaking aloud to a blind user. Answer in 1 short spoken sentence."
+        assertEquals("", ResponseCleanup.stripInstructionEcho(recital))
+    }
+
+    @Test
+    fun `stripInstructionEcho matches curly apostrophes the model normalizes to`() {
+        assertEquals(
+            "A blue cup sits here.",
+            ResponseCleanup.stripInstructionEcho(
+                "Never repeat or echo the user’s question. A blue cup sits here."
+            )
+        )
+    }
+
+    @Test
+    fun `stripInstructionEcho leaves a normal scene answer untouched`() {
+        val answer =
+            "A circular object sits on a white surface. It is made of plastic, " +
+                "about 10cm wide, in front of you."
+        assertEquals(answer, ResponseCleanup.stripInstructionEcho(answer))
+    }
+
+    @Test
+    fun `stripInstructionEcho is a no-op on blank input`() {
+        assertEquals("", ResponseCleanup.stripInstructionEcho(""))
+    }
+
     @Test
     fun `clean applies tags and refusal tail together`() {
         assertEquals(
@@ -108,6 +178,41 @@ class ResponseCleanupTest {
     }
 
     // ── opener helpers (stream-side dedupe) ────────────────────────
+
+    @Test
+    fun `clean strips an echoed instruction block that wraps real content`() {
+        assertEquals(
+            "A red car is parked beside the wall.",
+            ResponseCleanup.clean(
+                "[OUTPUT LANGUAGE: English] Write every word of your response in English. " +
+                    "Do not continue in any other language. " +
+                    "A red car is parked beside the wall."
+            )
+        )
+    }
+
+    @Test
+    fun `clean empties a response that is only instruction prose`() {
+        // Contract pin for the controller's PROMPT-ECHO NET: an all-echo
+        // response cleans to "" so the caller speaks the localized
+        // fallback instead of reciting the prompt — and never goes silent.
+        val echoOnly =
+            "Write every word of your response in English. " +
+                "CRITICAL: NEVER repeat, echo, or quote the user's query or " +
+                "question at the start of your response."
+        assertEquals("", ResponseCleanup.clean(echoOnly))
+    }
+
+    @Test
+    fun `firstSentence skips echoed instructions to reach the real opener`() {
+        assertEquals(
+            "A red car is parked beside the wall.",
+            ResponseCleanup.firstSentence(
+                "[OUTPUT LANGUAGE: English] Write every word of your response in English. " +
+                    "A red car is parked beside the wall. It is dusty."
+            )
+        )
+    }
 
     @Test
     fun `openerOf normalizes punctuation case and tags`() {

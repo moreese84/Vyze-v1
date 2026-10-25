@@ -535,11 +535,12 @@ class VyzeCoreController(
             } else {
                 CrashLogFile.log(TAG, "onComplete fired: session=$sessionId, ${fullResponse.length} chars")
                 recordTelemetry(success = true)
-                // POST-GENERATION CLEANUP: echoed prompt tags and a trailing
-                // canned-refusal tail are removed once, here, so storage,
-                // scan history and the UI callback all see the delivered
-                // text. (Streamed TTS chunks are already stripped in
-                // sanitizeForTts; opener dedupe is stream-side.)
+                // POST-GENERATION CLEANUP: echoed prompt tags, echoed
+                // instruction-block prose and a trailing canned-refusal tail
+                // are removed once, here, so storage, scan history and the
+                // UI callback all see the delivered text. (Streamed TTS
+                // chunks are already stripped in sanitizeForTts; opener
+                // dedupe is stream-side.)
                 val cleanedResponse = ResponseCleanup.clean(fullResponse)
                 if (cleanedResponse != fullResponse) {
                     CrashLogFile.log(TAG, "Response cleaned: ${fullResponse.length} -> ${cleanedResponse.length} chars")
@@ -573,11 +574,40 @@ class VyzeCoreController(
                     } else {
                         cleanedResponse
                     }
+                    // ── PROMPT-ECHO NET (mirrors the repetition net) ────
+                    // When EVERY sentence was echoed instruction prose the
+                    // cleanup above empties the response: clear the buffer
+                    // so no fragment of the block can leak to TTS, and hand
+                    // the localized safe fallback to onInferenceComplete —
+                    // no chunk was ever flushed (nothing real streamed), so
+                    // isStreamingActive() is false and the fragment SPEAKS
+                    // the fallback. A turn must never end in silence for a
+                    // blind user; it must also never recite the prompt.
+                    val echoOnly = cleanedResponse.isBlank() && fullResponse.isNotBlank()
+                    if (echoOnly) {
+                        synchronized(bufferLock) {
+                            sentenceBuffer.setLength(0)
+                        }
+                        CrashLogFile.log(TAG, "PROMPT-ECHO NET: entire response (${fullResponse.length} chars) was instruction block — fallback spoken")
+                    }
+                    val deliveredResponse = if (echoOnly) {
+                        ttsManager.localized(
+                            "Not clearly visible.",
+                            "Ia tidak jelas kelihatan.",
+                            "看不清楚。"
+                        )
+                    } else {
+                        safeResponse
+                    }
                     flushRemainingSentenceBuffer()
                     scope.launch {
                         try {
-                            promptBuilder.storeEnvironmentObservation(cleanedResponse)
-                            CrashLogFile.log(TAG, "Memory store OK")
+                            if (cleanedResponse.isNotBlank()) {
+                                promptBuilder.storeEnvironmentObservation(cleanedResponse)
+                                CrashLogFile.log(TAG, "Memory store OK")
+                            } else {
+                                CrashLogFile.log(TAG, "Memory store skipped — cleanup removed every sentence")
+                            }
                         } catch (e: Throwable) {
                             CrashLogFile.logError(TAG, "Memory store failed: ${e.javaClass.simpleName}: ${e.message}", e)
                         }
@@ -585,7 +615,9 @@ class VyzeCoreController(
                         // ── CURRENCY SCAN HISTORY ─────────────────────
                         // Persist a confident money read (banknote or coin)
                         // into scan history via the existing CURRENCY type.
-                        if (currencyModeActive && fullResponse.isNotBlank()) {
+                        // Guarded on the DELIVERED text: an instruction-echo
+                        // response cleans to "" and must not save an empty row.
+                        if (currencyModeActive && cleanedResponse.isNotBlank()) {
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
                                     .saveCurrencyScan(cleanedResponse.take(120))
@@ -599,7 +631,7 @@ class VyzeCoreController(
                         // ── BANK CARD SCAN HISTORY ───────────────────
                         // Persist a confident bank card identification
                         // (bank name, card type) into scan history.
-                        if (bankCardModeActive && fullResponse.isNotBlank()) {
+                        if (bankCardModeActive && cleanedResponse.isNotBlank()) {
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
                                     .saveBankCardScan(cleanedResponse.take(120))
@@ -617,7 +649,7 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "isInferring set to false")
                     mainHandler.post {
                         try {
-                            onInferenceComplete?.invoke(safeResponse)
+                            onInferenceComplete?.invoke(deliveredResponse)
                             onStatusUpdate?.invoke("Ready")
                             CrashLogFile.log(TAG, "onComplete UI callbacks done (session=$sessionId)")
                         } catch (e: Throwable) {
@@ -891,7 +923,17 @@ class VyzeCoreController(
         // below: explicit "word word" repetitions separated by PLAIN
         // WHITESPACE at word boundaries — punctuation and non-Latin text are
         // untouchable by construction.
-        var cleaned = text
+        // INSTRUCTION-ECHO STRIP (live evidence 2026-10-25, run 2): the
+        // model recited the prompt's instruction block verbatim (language
+        // anchor + LANGUAGE_MIRRORING_MANDATE + ANTI_ECHO_DIRECTIVE). The
+        // bracket-tag replace below only catches the `[OUTPUT LANGUAGE: …]`
+        // tag itself — the instruction PROSE around it is not a bracket and
+        // passed straight to TTS. Dropped here, before any other edit, so
+        // no streamed chunk of instruction prose can ever be spoken; a
+        // response that is ONLY instruction prose empties to "" and the
+        // caller skips the utterance entirely.
+        var cleaned = ResponseCleanup.stripInstructionEcho(text)
+        cleaned = cleaned
             .replace(Regex("(?s)```.*?```"), " ")   // complete fenced code blocks
             .replace(Regex("(?s)```.*\\z"), " ")     // unterminated trailing fence
             .replace(Regex("`+"), "")               // inline backticks
@@ -2118,9 +2160,10 @@ class VyzeCoreController(
                 } else {
                     CrashLogFile.log(TAG, "Storing interaction for adaptive intelligence...")
 
-                    // STORAGE-SIDE CLEANUP: echoed prompt tags and a
-                    // trailing canned-refusal tail never reach memory,
-                    // dialogue history or lastDescribedObject. Suspect marks
+                    // STORAGE-SIDE CLEANUP: echoed prompt tags, echoed
+                    // instruction-block prose and a trailing canned-refusal
+                    // tail never reach memory, dialogue history or
+                    // lastDescribedObject. Suspect marks
                     // above stay computed on the RAW response so the audit
                     // trail keeps seeing template echoes verbatim.
                     val delivered = ResponseCleanup.clean(response)

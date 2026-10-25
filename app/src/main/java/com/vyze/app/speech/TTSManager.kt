@@ -161,15 +161,17 @@ class TTSManager private constructor(context: Context) {
     private val utteranceCounter = AtomicLong(0)
 
     /**
-     * Utterance IDs submitted as DEAD-AIR FILLER (the capture-time
-     * "Let me look." acknowledgement). The E0 FRAME-BUDGET window must
-     * measure frame → the ANSWER's first audio; the filler always wins
-     * that race at ~90 ms and would fake an E2_VIABLE verdict (live
-     * evidence 2026-10-25: all 7 answered frames closed 72–110 ms on the
-     * filler). IDs are consumed on first onStart. (Flag is lost when the
-     * utterance is buffered pre-init — fillers only run while the engine
-     * answers, i.e. long after TTS init, so that path is unreachable in
-     * practice.)
+     * Utterance IDs submitted as NON-ANSWER audio: the capture-time
+     * dead-air filler ("Let me look.") and status cues ("Analyzing
+     * scene..." via MainActivity.announceStatus). The E0 FRAME-BUDGET
+     * window must measure frame → the ANSWER's first audio; such cues
+     * always win that race — the filler ~90 ms in, a barge-in status
+     * cue 3.9–6.2 s in (live evidence 2026-10-25: the filler faked an
+     * E2 verdict at ~90 ms, the status cue then marked cancelled tap
+     * frames ANSWERED in run 2). IDs are consumed on first onStart.
+     * (Flag is lost when the utterance is buffered pre-init — these
+     * lanes only run while the engine answers, i.e. long after TTS
+     * init, so that path is unreachable in practice.)
      */
     private val deadAirUtteranceIds: MutableSet<String> =
         java.util.concurrent.ConcurrentHashMap.newKeySet()
@@ -338,10 +340,11 @@ class TTSManager private constructor(context: Context) {
                 }
                 // E0 FRAME BUDGET (plan §E0): close an OPEN continuous-frame
                 // window at the ANSWER's first audio → the frame→first-audio
-                // sample the E2-vs-E3 verdict reads. Dead-air-filler
-                // utterances (marked at submission) never close: the
-                // capture-time "Let me look." always fires ~90 ms in and
-                // would fake the verdict. Returns null with no open window
+                // sample the E2-vs-E3 verdict reads. Non-answer utterances
+                // (marked at submission: capture filler + status cues) never
+                // close: the capture-time "Let me look." fires ~90 ms in and
+                // a barge-in "Analyzing scene..." 3.9–6.2 s in — either would
+                // fake the verdict. Returns null with no open window
                 // (tap/voice/tutorial speech) — other lanes never pollute
                 // the continuous budget. Content-free: duration only.
                 val isDeadAir = utteranceId != null && deadAirUtteranceIds.remove(utteranceId)
