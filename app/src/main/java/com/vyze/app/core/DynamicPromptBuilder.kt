@@ -264,9 +264,14 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             if (isDirectQuery) {
                 sb.appendLine("Task: The user asked: $queryOverride")
                 sb.appendLine(TASK_OUTPUT_CONTRACT)
-            } else {
+            } else if (!narrationClass) {
                 sb.appendLine(DEFAULT_NAVIGATION_QUERY)
             }
+            // NARRATION DEFERRAL (echo fix 2026-10-26): on the ambient lane
+            // the task line is NOT rendered here — it moves to the very
+            // bottom (4b), after the REMEMBER directive, so the last bytes of
+            // the user turn are the user-shaped request rather than
+            // instruction prose.
 
             // 3b. Currency reading rules (banknotes + coins)
             if (currencyMode) {
@@ -346,6 +351,23 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             // 4. Language mirror — reinforce at bottom (ALL languages now:
             //    symmetric anchor, English included — see the top mirror note)
             sb.appendLine("REMEMBER: Respond only in $langName. Begin immediately with the answer itself — never repeat or echo the user's question.")
+
+            // 4b. NARRATION TASK LINE — LAST bytes of the user turn.
+            //     ECHO FIX (live evidence 2026-10-25, run 2): the ambient lane
+            //     has no query, so with the REMEMBER directive as the final
+            //     line, generation began by CONTINUING instruction prose and
+            //     the model recited its instruction block verbatim (the 301 /
+            //     944-char echoes). The deliberate-class contract (see
+            //     VlmEngineManager.buildGemmaTurnPrompt) keeps the user's
+            //     request as the last line before <end_of_turn> so generation
+            //     starts on the answer — the narration lane now gets the same
+            //     treatment: the user-shaped task line follows the directive,
+            //     making a scene description the most probable continuation.
+            //     Byte content is unchanged — only the order — so the E1
+            //     three-class budget pins (narration ≤ 1,500, gap ≥ 1,700) hold.
+            if (narrationClass) {
+                sb.appendLine(DEFAULT_NAVIGATION_QUERY)
+            }
 
             val prompt = sb.toString()
             // DIAGNOSTIC (INFO, content-free) — the single-funnel line proving

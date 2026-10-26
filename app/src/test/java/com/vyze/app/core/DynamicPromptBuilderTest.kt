@@ -743,6 +743,18 @@ class DynamicPromptBuilderTest {
         assertFalse("learned-brevity line re-entered narration", p.contains("LENGTH:"))
         assertFalse("dialogue recall re-entered narration", p.contains("Recent conversation"))
         assertFalse("scene memory re-entered narration", p.contains("Prior scene memory"))
+        // TAIL ORDER (echo fix 2026-10-26): the user-shaped task line must be
+        // the LAST line of the turn — generation continues it, never the
+        // REMEMBER instruction prose above it.
+        assertTrue(
+            "task line must follow the bottom mirror",
+            p.indexOf("REMEMBER: Respond only in") <
+                p.indexOf("Describe environment: obstacles, doors, people, text."),
+        )
+        assertTrue(
+            "narration turn must end on the task line",
+            p.trim().endsWith("Describe environment: obstacles, doors, people, text."),
+        )
     }
 
     @Test
