@@ -244,4 +244,107 @@ class ResponseCleanupTest {
         val one = "A circular object sits on a white surface."
         assertEquals(one, ResponseCleanup.removeFirstSentence(one))
     }
+
+    // ── verbatim block match (live leak 2026-10-26 08:30:24) ────
+
+    /**
+     * The three DIRECT_RULES_PROSE sentences that REACHED TTS verbatim on
+     * the new build this morning: 941-char response, markers/tags stripped
+     * 720 chars, the remaining 221 chars of rule prose were spoken (user
+     * report: "it still speak the prompt"). No fingerprint matched them —
+     * the block match exists because of exactly this.
+     */
+    private val liveLeakTriple =
+        "Answer directly in the first sentence. " +
+            "Write in complete, natural spoken sentences with a subject and a verb — NEVER a " +
+            "list of attributes separated by commas. " +
+            "Name the object and give compact, useful details — size, color."
+
+    @Test
+    fun `the three rule-prose sentences that leaked to TTS are dropped`() {
+        assertEquals("", ResponseCleanup.stripInstructionEcho(liveLeakTriple))
+        assertEquals("", ResponseCleanup.clean(liveLeakTriple))
+    }
+
+    @Test
+    fun `a rule sentence truncated at a clause still matches its block`() {
+        // The live third sentence stopped at "— size, color." while the
+        // block continues "…, material, state …" — equals/contains on the
+        // full string would miss it; symmetric substring must not.
+        assertEquals(
+            "",
+            ResponseCleanup.stripInstructionEcho(
+                "Name the object and give compact, useful details — size, color."
+            )
+        )
+    }
+
+    @Test
+    fun `a tag-wrapped rule recital is dropped on the pre-tag-strip TTS path`() {
+        // sanitizeForTts runs the echo strip BEFORE tag stripping (streamed
+        // chunks); clean() runs it after — both must see the same match, so
+        // the block side strips tags inside its normalization too.
+        assertEquals(
+            "",
+            ResponseCleanup.stripInstructionEcho(
+                "[OUTPUT LANGUAGE: English] Respond with the answer only: never repeat, " +
+                    "echo, or quote the question, never restate the task, and write every " +
+                    "word in the language named in the [OUTPUT LANGUAGE] tag."
+            )
+        )
+    }
+
+    @Test
+    fun `every static prompt rule sentence is dropped by the verbatim block match`() {
+        // Coverage pin: any rule sentence ≥ the match floor must be
+        // silenceable on its own — if a block grows a sentence the net
+        // cannot catch, this fails instead of a device run discovering it.
+        // Mirrors ResponseCleanup's split + normalization with public API.
+        val split = Regex("(?<=[.!?。！？；;])\\s+")
+        val kept = mutableListOf<String>()
+        var dropped = 0
+        DynamicPromptBuilder.STATIC_INSTRUCTION_BLOCKS
+            .flatMap { it.split(split) }
+            .map {
+                ResponseCleanup.stripPromptTags(it).lowercase()
+                    .replace('\u2019', '\'')
+                    .replace(Regex("\\s+"), " ")
+                    .trim { c -> c.isWhitespace() || c in ".,!?;:„\"'“”‘’…。！？；：、" }
+            }
+            .filter { it.length >= 30 }
+            .forEach { sentence ->
+                if (ResponseCleanup.stripInstructionEcho(sentence).isEmpty()) {
+                    dropped++
+                } else {
+                    kept += sentence
+                }
+            }
+        assertTrue("rule sentences still reaching TTS: $kept", kept.isEmpty())
+        assertTrue("coverage too thin: only $dropped rule sentences checked", dropped >= 40)
+    }
+
+    @Test
+    fun `a wholesale canned refusal inside the rules is never echo-dropped`() {
+        // "I cannot identify this card clearly." is a substring of
+        // BANK_CARD_RULES — the block match must not eat an honest refusal
+        // that IS the whole answer (NonAnswerRefusal's contract).
+        val refusal = "I cannot identify this card clearly."
+        assertEquals(refusal, ResponseCleanup.stripInstructionEcho(refusal))
+        assertEquals(refusal, ResponseCleanup.clean(refusal))
+    }
+
+    @Test
+    fun `the reconstructed live response cleans to empty so the fallback speaks`() {
+        // Run-3 reconstruction of the 08:30:24 response: real opener glued
+        // to the anchor, the mirror block, and the rule-prose triple.
+        // Contract: cleans to "" → controller's PROMPT-ECHO NET speaks the
+        // localized fallback — never a line of the prompt.
+        val response =
+            "White[OUTPUT LANGUAGE: English] Write every word of your response in English. " +
+                "Do not continue in any other language. " +
+                "LANGUAGE MIRRORING: Respond in the language named in the " +
+                "[OUTPUT LANGUAGE] tag — the tag is the authority on the answer language. " +
+                liveLeakTriple
+        assertEquals("", ResponseCleanup.clean(response))
+    }
 }

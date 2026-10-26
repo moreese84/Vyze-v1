@@ -792,6 +792,43 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
             "the [OUTPUT LANGUAGE] tag."
 
         /**
+         * STATIC INSTRUCTION BLOCKS — the rule prose every prompt renders,
+         * exposed for [ResponseCleanup]'s verbatim echo detection.
+         *
+         * WHY (live leak 2026-10-26 08:30:24): a hand-written fingerprint
+         * list only catches instruction sentences we anticipated — the model
+         * recited three [DIRECT_RULES_PROSE] sentences verbatim and all 221
+         * chars reached TTS because no marker matched. Matching response
+         * sentences against THESE actual prompt bytes covers every rule
+         * sentence, present and future, with no list to maintain.
+         *
+         * Scope: the EN rule layer — ms/zh prompts render these same EN
+         * consts as their rule prose (only examples and canned phrases are
+         * localized, and those keep EN block prefixes that
+         * [ResponseCleanup] fingerprints). Few-shot EXAMPLE blocks are
+         * deliberately EXCLUDED: demonstrated answers are good answer
+         * shapes, and dropping a scene sentence because it matches a
+         * demonstration would silence honest narration. Dynamic blocks
+         * (date/medicine/failure-phrase/privacy) are prefixed-pinned in
+         * [ResponseCleanup]'s markers instead — their bodies embed
+         * device-computed dates.
+         */
+        internal val STATIC_INSTRUCTION_BLOCKS: List<String> = listOf(
+            NAV_RULES_PROSE,
+            DIRECT_RULES_PROSE,
+            CONTINUOUS_MODE_RULES,
+            TEXT_ONLY_RULES,
+            OUTPUT_CONSTRAINTS,
+            CURRENCY_RULES,
+            BANK_CARD_RULES,
+            ANTI_ECHO_DIRECTIVE,
+            LANGUAGE_MIRRORING_MANDATE,
+            TASK_OUTPUT_CONTRACT,
+            DEFAULT_NAVIGATION_QUERY,
+            FALLBACK_PROMPT,
+        )
+
+        /**
          * CANNED-PHRASE OVERRIDE (mirroring parity, 2026-09-26 audit finding #2):
          * CURRENCY_RULES, BANK_CARD_RULES, DIRECT_RULES_PROSE, NAV_RULES_PROSE and
          * TEXT_ONLY_RULES quote their failure fallbacks in English ("say exactly:

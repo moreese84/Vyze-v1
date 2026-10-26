@@ -73,6 +73,7 @@ object ResponseCleanup {
         "begin immediately with the direct description",
         "begin immediately with the answer itself",
         "never repeat or echo the user's question",
+        "never echo the user's question",
         "respond with the answer only",
         "never restate the task",
         "remember: respond only in",
@@ -81,7 +82,88 @@ object ResponseCleanup {
         "speaking aloud to a blind user",
         "answer in 1 short spoken sentence",
         "answer the user's question directly in 1 short spoken sentence",
+        // CONTINUOUS_MODE_RULES opener (its first fragment is under the
+        // block-match floor: "Instant assistant." is 17 chars).
+        "instant assistant",
+        // DYNAMIC BLOCK PREFIXES — date/medicine/failure-phrase/privacy and
+        // the inline OCR/dialogue-context clauses embed device-computed
+        // values or caller state, so they are pinned by their EN block
+        // prefixes (stable across all three locales) instead of by body
+        // match. Evidence class: same recital risk, no stable bytes.
+        "date arithmetic rule",
+        "medicine record rule",
+        "failure-phrase override",
+        "privacy — highest priority rule",
+        "today's date (from the device)",
+        "the ocr text above is the ground truth",
+        "printed text may be too small or blurred",
+        "recent conversation (context only",
+        "this is a follow-up in an ongoing conversation",
+        "prior scene memory:",
     )
+
+    /**
+     * Minimum normalized length for the verbatim BLOCK match (both
+     * directions). Below this, ordinary answers could collide with rule
+     * fragments — and the canned-refusal class (all ≤ 46 chars) has its own
+     * whole-output contract in [NonAnswerRefusal], which must win.
+     */
+    private const val MIN_BLOCK_FRAGMENT = 30
+
+    /**
+     * VERBATIM BLOCK SENTENCES — every static prompt rule sentence,
+     * tag-stripped, normalized (lowercased, curly apostrophes folded,
+     * outer punctuation trimmed) and floor-filtered, from
+     * [DynamicPromptBuilder.STATIC_INSTRUCTION_BLOCKS].
+     *
+     * WHY (live leak 2026-10-26 08:30:24): the fingerprint list above only
+     * catches instruction sentences we anticipated. The model recited three
+     * DIRECT_RULES_PROSE sentences ("Answer directly in the first sentence."
+     * …) — 941-char response, 720 chars stripped by markers/tags, and the
+     * remaining 221 chars of rule prose still SPOKEN. Matching against the
+     * prompt's own bytes closes the whole class: any rule sentence the model
+     * recites — full, embedded, or truncated at a clause — is dropped before
+     * TTS, memory or storage see it.
+     *
+     * Tags are stripped HERE (not only by the caller) because the two call
+     * sites differ in order: clean() tag-strips first, sanitizeForTts runs
+     * this strip first — both must compare against the same tag-free bytes.
+     */
+    private val BLOCK_SENTENCES: List<String> by lazy {
+        DynamicPromptBuilder.STATIC_INSTRUCTION_BLOCKS
+            .flatMap { it.split(SENTENCE_BOUNDARY) }
+            .map { normalizeEcho(it) }
+            .filter { it.length >= MIN_BLOCK_FRAGMENT }
+            .distinct()
+    }
+
+    /** Normalization shared by marker and block matching. */
+    private fun normalizeEcho(text: String): String =
+        stripPromptTags(text).lowercase()
+            // Curly apostrophes: the model normalizes ' to ’ on some tokens,
+            // which would otherwise defeat every marker carrying an apostrophe.
+            .replace('\u2019', '\'')
+            .replace(Regex("\\s+"), " ")
+            .trim { it.isWhitespace() || it in ".,!?;:„\"'“”‘’…。！？；：、" }
+
+    /**
+     * Symmetric containment at sentence granularity: the SHORTER of the
+     * response sentence and a block sentence (≥ [MIN_BLOCK_FRAGMENT]) must
+     * be a substring of the longer. This catches a full recital (equal), an
+     * embedded recital (block inside response), and a TRUNCATED recital —
+     * the live case stopped the block sentence at "— size, color." where a
+     * plain equals/contains check would have missed it.
+     */
+    private fun isBlockEcho(normalized: String): Boolean {
+        if (normalized.length < MIN_BLOCK_FRAGMENT) return false
+        return BLOCK_SENTENCES.any { block ->
+            if (block.length <= normalized.length) {
+                normalized.contains(block)
+            } else {
+                block.contains(normalized)
+            }
+        }
+    }
 
     /** Remove echoed `[...]` prompt tags; collapse the gaps they leave. */
     fun stripPromptTags(text: String): String =
@@ -91,13 +173,16 @@ object ResponseCleanup {
 
     /** True when this sentence is prompt-instruction prose, not an answer. */
     private fun isInstructionEcho(sentence: String): Boolean {
-        // Curly apostrophes: the model normalizes ' to ’ on some tokens,
-        // which would otherwise defeat every marker carrying an apostrophe.
-        val normalized = sentence.lowercase()
-            .replace('\u2019', '\'')
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        return INSTRUCTION_ECHO_MARKERS.any { normalized.contains(it) }
+        // Whole-output canned refusals are honest utterances that may sit
+        // verbatim inside the rules that pin them ("I cannot identify this
+        // card clearly." is a substring of BANK_CARD_RULES) — their contract
+        // says a wholesale refusal is an answer, so echo detection must
+        // never claim them. Whole-output match only (never substring), so
+        // an instruction sentence merely QUOTING a refusal still drops.
+        if (NonAnswerRefusal.isNonAnswer(sentence)) return false
+        val normalized = normalizeEcho(sentence)
+        return INSTRUCTION_ECHO_MARKERS.any { normalized.contains(it) } ||
+            isBlockEcho(normalized)
     }
 
     /**
