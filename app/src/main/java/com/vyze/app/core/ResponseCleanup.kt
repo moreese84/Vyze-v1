@@ -38,8 +38,15 @@ object ResponseCleanup {
      */
     private val PROMPT_TAG_REGEX = Regex("\\[[^\\[\\]]{0,120}]")
 
-    /** Sentence boundary: Latin + CJK terminators followed by whitespace. */
-    private val SENTENCE_BOUNDARY = Regex("(?<=[.!?。！？；;])\\s+")
+    /**
+     * Sentence boundary: Latin terminators followed by whitespace, plus
+     * CJK sentence terminators with OR without following space — Chinese
+     * sentences need no separating space ("椅子。文字" is two sentences),
+     * and without this branch a coalesced zh chunk never splits (the
+     * refusal half then rides along: whole-output matching cannot see
+     * it). Latin keeps the whitespace requirement ("A.B" stays whole).
+     */
+    private val SENTENCE_BOUNDARY = Regex("(?<=[.!?。！？；;])\\s+|(?<=[。！？])")
 
     /**
      * INSTRUCTION-ECHO FINGERPRINTS — verbatim fragments of the PROMPT's
@@ -197,6 +204,27 @@ object ResponseCleanup {
         text.split(SENTENCE_BOUNDARY)
             .map { it.trim() }
             .filter { it.isNotEmpty() && !isInstructionEcho(it) }
+            .joinToString(" ")
+            .trim()
+
+    /**
+     * Drop EVERY sentence that IS a canned refusal ("Text is unclear.").
+     * STREAMING counterpart to [stripRefusalTail]: the caller runs it on
+     * each flushed TTS chunk, where "trailing" is unknowable mid-stream —
+     * a refusal that already streamed can never be unspoken, so refusal
+     * sentences are dropped from speech eagerly, wherever they sit.
+     *
+     * Silence contract: a chunk that is NOTHING but refusals strips to "".
+     * The caller speaks nothing for it; the wholesale case still reaches
+     * the ear because onComplete hands the un-stripped delivered text to
+     * the fragment, which speaks it when no chunk ever streamed
+     * (!isStreamingActive). Whole-output [NonAnswerRefusal] match only —
+     * a real sentence merely ENDING in refusal-adjacent words is kept.
+     */
+    fun stripRefusalSentences(text: String): String =
+        text.split(SENTENCE_BOUNDARY)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && !NonAnswerRefusal.isNonAnswer(it) }
             .joinToString(" ")
             .trim()
 

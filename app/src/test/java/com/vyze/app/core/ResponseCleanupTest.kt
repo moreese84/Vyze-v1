@@ -95,6 +95,73 @@ class ResponseCleanupTest {
         assertEquals("", ResponseCleanup.stripRefusalTail(""))
     }
 
+    // ── stripRefusalSentences (streaming TTS quarantine) ────────────
+
+    @Test
+    fun `streaming strip drops a trailing refusal but keeps the answer`() {
+        // Live 2026-11-07: follow-up streamed chunk_2 "Text is unclear."
+        // AFTER the answer chunk — heard aloud, though storage stripped it.
+        assertEquals(
+            "A black chair sits in front of a window.",
+            ResponseCleanup.stripRefusalSentences(
+                "A black chair sits in front of a window. Text is unclear."
+            )
+        )
+    }
+
+    @Test
+    fun `streaming strip drops a leading refusal when an answer follows`() {
+        assertEquals(
+            "A black chair sits in front of a window.",
+            ResponseCleanup.stripRefusalSentences(
+                "Text is unclear. A black chair sits in front of a window."
+            )
+        )
+    }
+
+    @Test
+    fun `streaming strip empties a wholesale refusal chunk`() {
+        // Silence contract: the completion path speaks the delivered text
+        // when no chunk ever streamed, so the wholesale refusal still
+        // reaches the ear — just once, at the end, never mid-stream.
+        assertEquals("", ResponseCleanup.stripRefusalSentences("Text is unclear."))
+        assertEquals("", ResponseCleanup.stripRefusalSentences("Text is unclear. No text visible."))
+    }
+
+    @Test
+    fun `streaming strip keeps near-miss tails carrying scene facts`() {
+        val text = "That is a small dark object; its exact name is not clearly visible."
+        assertEquals(text, ResponseCleanup.stripRefusalSentences(text))
+    }
+
+    @Test
+    fun `streaming strip drops an ms trailing refusal`() {
+        assertEquals(
+            "Kerusi hitam di sini.",
+            ResponseCleanup.stripRefusalSentences("Kerusi hitam di sini. Teksnya tidak jelas.")
+        )
+    }
+
+    @Test
+    fun `streaming strip drops a zh trailing refusal without spaces`() {
+        // CJK sentences need no separating space — the splitter cuts after
+        // 。/！/？ regardless, or coalesced zh chunks leak the refusal.
+        assertEquals(
+            "黑色的椅子在这里。",
+            ResponseCleanup.stripRefusalSentences("黑色的椅子在这里。文字不清楚。")
+        )
+    }
+
+    @Test
+    fun `latin splitter still requires whitespace after the terminator`() {
+        // Documents the boundary rule: "A.B" is one token stream, not two
+        // sentences — only the CJK branch splits without whitespace.
+        assertEquals(
+            "Text is unclear.No text visible.",
+            ResponseCleanup.stripRefusalSentences("Text is unclear.No text visible.")
+        )
+    }
+
     // ── clean ──────────────────────────────────────────────────────
 
     // ── stripInstructionEcho (prompt-echo fix, run 2 live evidence) ──

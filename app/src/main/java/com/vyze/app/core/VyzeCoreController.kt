@@ -540,7 +540,7 @@ class VyzeCoreController(
                 // are removed once, here, so storage, scan history and the
                 // UI callback all see the delivered text. (Streamed TTS
                 // chunks are already stripped in sanitizeForTts; opener
-                // dedupe is stream-side.)
+                // dedupe and refusal-sentence quarantine are stream-side.)
                 val cleanedResponse = ResponseCleanup.clean(fullResponse)
                 if (cleanedResponse != fullResponse) {
                     CrashLogFile.log(TAG, "Response cleaned: ${fullResponse.length} -> ${cleanedResponse.length} chars")
@@ -1143,7 +1143,18 @@ class VyzeCoreController(
             // the backstop's clause cut ends AT the delimiter (cut) so the
             // delimiter itself stays with the spoken prefix.
             val cutEnd = if (pendingClauseCut) cut else cut + 1
-            chunk = maybeDedupeOpener(sanitizeForTts(text.substring(0, cutEnd)))
+            // STREAM REFUSAL QUARANTINE (live 2026-11-07): a trailing
+            // canned refusal ("Text is unclear.") appended after a real
+            // answer would otherwise speak here — post-generation
+            // cleanup runs too late to un-speak it. Refusal sentences
+            // drop from the chunk; a chunk left empty speaks nothing,
+            // and the wholesale case still reaches the ear via
+            // deliveredResponse (!isStreamingActive → fragment speaks).
+            val rawChunk = maybeDedupeOpener(sanitizeForTts(text.substring(0, cutEnd)))
+            chunk = ResponseCleanup.stripRefusalSentences(rawChunk)
+            if (chunk.length != rawChunk.length) {
+                CrashLogFile.log(TAG, "Stream refusal stripped from TTS chunk (${rawChunk.length} -> ${chunk.length} chars)")
+            }
 
             sentenceBuffer.delete(0, cut + 1)
             // Whitespace FIX: strip ALL leading whitespace artifacts (spaces,
@@ -1206,7 +1217,13 @@ class VyzeCoreController(
         val remaining: String
         synchronized(bufferLock) {
             if (sentenceBuffer.isNotEmpty()) {
-                remaining = maybeDedupeOpener(sanitizeForTts(sentenceBuffer.toString().trim()))
+                // Same stream refusal quarantine as the mid-stream flush:
+                // a lone short refusal held by minFlushChars lands here.
+                val rawRemaining = maybeDedupeOpener(sanitizeForTts(sentenceBuffer.toString().trim()))
+                remaining = ResponseCleanup.stripRefusalSentences(rawRemaining)
+                if (remaining.length != rawRemaining.length) {
+                    CrashLogFile.log(TAG, "Stream refusal stripped from final TTS flush (${rawRemaining.length} -> ${remaining.length} chars)")
+                }
                 sentenceBuffer.setLength(0)  // force-clear, not just clear()
             } else {
                 remaining = ""
