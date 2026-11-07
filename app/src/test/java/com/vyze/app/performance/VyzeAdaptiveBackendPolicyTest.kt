@@ -202,6 +202,32 @@ class VyzeAdaptiveBackendPolicyTest {
     }
 
     @Test
+    fun `ultra-budget SoCs read as CPU-only`() {
+        // Unisoc Tiger / ums / Spreadtrum SC — no usable LiteRT-LM GPU path.
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("ums512"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("UMS9230"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("tiger_t606"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("sc9863a"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("unisoc"))
+        // Low Helio — MT67xx below the G90-class mt6785 floor.
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6768"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6765"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6762"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6739"))
+    }
+
+    @Test
+    fun `capable SoCs keep the GPU attempt path`() {
+        // G90-class and up keep attempt-with-fallback; per-device
+        // calibration learns their verdict instead of a static veto.
+        assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6785"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6833"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6899"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("kona"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("sm8550"))
+    }
+
+    @Test
     fun `recognized backend names`() {
         assertTrue(VyzeAdaptiveBackend.isValidBackendName("cpu"))
         assertTrue(VyzeAdaptiveBackend.isValidBackendName("GPU"))

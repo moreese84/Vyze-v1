@@ -2051,10 +2051,22 @@ class VlmEngineManager(
                     tPrefill = firstTokenAt - (startTime + tPreprocess + tJpeg + tPayload + tLane)
                     CrashLogFile.log(
                         TAG,
-                        "[PIPELINE-BREAKDOWN] threads=${cpuThreadCount()} " +
-                            "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
-                            "payload=${tPayload}ms lane-wait=${tLane}ms " +
-                            "PREFILL=${tPrefill}ms DECODE=${firstTokenAt - startTime - tPrefill - tLane}ms-so-far"
+                        InferenceBreakdown(
+                            backend = activeBackend,
+                            tier = deviceProfile.tier.name,
+                            threads = cpuThreadCount(),
+                            totalMs = 0L,
+                            tPreprocess = tPreprocess,
+                            tJpeg = tJpeg,
+                            tPayload = tPayload,
+                            tLane = tLane,
+                            tPrefill = tPrefill,
+                            decodeSoFarMs = firstTokenAt - startTime - tPrefill - tLane,
+                            decodeMs = 0L,
+                            streamedFirstToken = true,
+                            promptChars = 0,
+                            outChars = 0,
+                        ).formatPipeline()
                     )
                 }
                 outerCallback?.invoke(token, sid)
@@ -2072,13 +2084,24 @@ class VlmEngineManager(
             // never fired and tPrefill stays 0 — report that honestly.
             val decodeMs =
                 if (firstTokenFlag[0]) elapsed - (firstTokenAt - startTime) else 0L
-            val decodeNote = if (firstTokenFlag[0]) "" else " (no streamed token — single-message response)"
             CrashLogFile.log(
                 TAG,
-                "[ANALYZE-BREAKDOWN] total=${elapsed}ms preprocess=${tPreprocess}ms " +
-                    "jpeg=${tJpeg}ms payload=${tPayload}ms lane-wait=${tLane}ms " +
-                    "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${decodeNote} " +
-                    "prompt=${formattedPrompt.length}chars"
+                InferenceBreakdown(
+                    backend = activeBackend,
+                    tier = deviceProfile.tier.name,
+                    threads = cpuThreadCount(),
+                    totalMs = elapsed,
+                    tPreprocess = tPreprocess,
+                    tJpeg = tJpeg,
+                    tPayload = tPayload,
+                    tLane = tLane,
+                    tPrefill = tPrefill,
+                    decodeSoFarMs = 0L,
+                    decodeMs = decodeMs,
+                    streamedFirstToken = firstTokenFlag[0],
+                    promptChars = formattedPrompt.length,
+                    outChars = response?.length ?: 0,
+                ).formatAnalyze()
             )
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
             response
@@ -2127,11 +2150,49 @@ class VlmEngineManager(
             prompt,
             TEXT_ONLY_SYSTEM_DIRECTIVE + perspectiveClauseFor(activeUserLocale)
         )
-        runConversation(
+        // TEXT-LANE TIMING (same first-token boundary as analyzeImage): the
+        // text prefill is the no-vision baseline every image prefill is
+        // judged against, so it gets the same split, not just a total.
+        val textStartMs = System.currentTimeMillis()
+        val textFirstTokenFlag = booleanArrayOf(false)
+        var textFirstTokenAt = 0L
+        val textOuterCallback = onTokenGenerated
+        onTokenGenerated = { token, sid ->
+            if (!textFirstTokenFlag[0] && sid == sessionId) {
+                textFirstTokenFlag[0] = true
+                textFirstTokenAt = System.currentTimeMillis()
+            }
+            textOuterCallback?.invoke(token, sid)
+        }
+        val textResponse = runConversation(
             contents = Contents.of(Content.Text(formattedPrompt)),
             maxTokens = maxTokens,
             sessionId = sessionId
         )
+        val textElapsed = System.currentTimeMillis() - textStartMs
+        val textPrefill = if (textFirstTokenFlag[0]) textFirstTokenAt - textStartMs else 0L
+        val textDecode =
+            if (textFirstTokenFlag[0]) textElapsed - (textFirstTokenAt - textStartMs) else 0L
+        CrashLogFile.log(
+            TAG,
+            InferenceBreakdown(
+                backend = activeBackend,
+                tier = deviceProfile.tier.name,
+                threads = cpuThreadCount(),
+                totalMs = textElapsed,
+                tPreprocess = 0L,
+                tJpeg = 0L,
+                tPayload = 0L,
+                tLane = 0L,
+                tPrefill = textPrefill,
+                decodeSoFarMs = 0L,
+                decodeMs = textDecode,
+                streamedFirstToken = textFirstTokenFlag[0],
+                promptChars = formattedPrompt.length,
+                outChars = textResponse?.length ?: 0,
+            ).formatText()
+        )
+        textResponse
     }
 
     /**
@@ -3229,20 +3290,28 @@ class VlmEngineManager(
          * VlmEngineManager only ever receives DynamicPromptBuilder output,
          * which opens with it.
          */
-        private const val SYSTEM_DIRECTIVE =
+        /**
+         * PREFILL BUDGET (Tier-3 latency cut, 2026-11-07): this directive
+         * rides EVERY image inference (~2.6-6 ms per prompt token on weak
+         * CPUs), so every rule here is one terse clause — duplicates of
+         * prompt-level blocks stay compressed, never expanded. All nine
+         * rules are still present; the prompt layer carries the full forms.
+         * Marker anchors ("You are Vyze", "speaking aloud to a blind
+         * user", "Answer in 1 short spoken sentence") are VERBATIM —
+         * [ResponseCleanup]'s echo fingerprints match them. Pinned by
+         * SystemDirectiveBudgetTest: budget ceiling + anchor phrases.
+         */
+        internal const val SYSTEM_DIRECTIVE =
             "You are Vyze, a fast, friendly visual assistant speaking aloud to a blind user. " +
-            "Answer in 1 short spoken sentence about what you see, leading directly with " +
-            "the answer — never repeat, echo, or quote the user's query. If asked what " +
-            "color this is, reply with the color; if asked to read text, reply with the " +
-            "text. Mention spatial position ('your left') ONLY when the user asks WHERE " +
-            "an object is. OCR EXCEPTION: when OCR text is provided, read ALL of it in " +
-            "reading order — the one-sentence cap does not apply. " +
-            "Pure plain text for text to speech: no markdown symbols, bullets, dashes, " +
-            "asterisks, or emoji, plain spoken sentences only. On follow-up turns answer " +
-            "only what is new. Reply in the language named in the [OUTPUT LANGUAGE] tag " +
-            "(the tag is the authority on the answer language; query-detection is only " +
-            "the no-tag fallback — never default to English otherwise). Describe what " +
-            "you see directly, without cross-translating or reasoning-chains."
+            "Answer in 1 short spoken sentence about what you see, leading with what was " +
+            "asked — never repeat, echo, or quote the user's query. " +
+            "Name spatial position only when asked WHERE. " +
+            "OCR EXCEPTION: when OCR text is provided, read ALL of it in order; " +
+            "the cap does not apply. " +
+            "Plain spoken text only: no markdown, bullets, or emoji. " +
+            "On follow-up turns answer only what is new. " +
+            "Reply in the [OUTPUT LANGUAGE] tag's language — never default to English, " +
+            "never cross-translate, no reasoning chains."
 
         /**
          * Second-person spatial directive, emitted in the ACTIVE language by
@@ -3587,6 +3656,55 @@ class VlmEngineManager(
  * `internal` (not file-private) so the JVM tier-boundary test can pin
  * [VlmEngineManager.classifyTier] without constructing the manager.
  */
+/**
+ * One inference run's timing split, formatted for the crash-log timing
+ * lines (`[PIPELINE-BREAKDOWN]`, `[ANALYZE-BREAKDOWN]`,
+ * `[TEXT-BREAKDOWN]`). Pure data + pure format — JVM-testable; the
+ * engine call sites only fill the fields. Field order and spelling are
+ * pinned by [InferenceBreakdownTest]: Tier-3 latency analysis greps
+ * these lines, so every run must carry its serving backend (CPU vs a
+ * landed GPU swap) and device tier inline — no cross-line correlation.
+ */
+internal data class InferenceBreakdown(
+    val backend: String,
+    val tier: String,
+    val threads: Int,
+    val totalMs: Long,
+    val tPreprocess: Long,
+    val tJpeg: Long,
+    val tPayload: Long,
+    val tLane: Long,
+    val tPrefill: Long,
+    /** Wall decode at first-token time — PIPELINE line only. */
+    val decodeSoFarMs: Long,
+    /** Final decode duration — ANALYZE/TEXT lines. */
+    val decodeMs: Long,
+    val streamedFirstToken: Boolean,
+    val promptChars: Int,
+    val outChars: Int,
+) {
+    fun formatPipeline(): String =
+        "[PIPELINE-BREAKDOWN] backend=$backend tier=$tier threads=$threads " +
+            "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
+            "payload=${tPayload}ms lane-wait=${tLane}ms " +
+            "PREFILL=${tPrefill}ms DECODE=${decodeSoFarMs}ms-so-far"
+
+    fun formatAnalyze(): String =
+        "[ANALYZE-BREAKDOWN] backend=$backend tier=$tier total=${totalMs}ms " +
+            "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
+            "payload=${tPayload}ms lane-wait=${tLane}ms " +
+            "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${noStreamNote()} " +
+            "prompt=${promptChars}chars out=${outChars}chars"
+
+    fun formatText(): String =
+        "[TEXT-BREAKDOWN] backend=$backend tier=$tier total=${totalMs}ms " +
+            "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${noStreamNote()} " +
+            "prompt=${promptChars}chars out=${outChars}chars"
+
+    private fun noStreamNote(): String =
+        if (streamedFirstToken) "" else " (no streamed token — single-message response)"
+}
+
 internal enum class DeviceTier(val label: String) {
     TIER_1("Tier 1 (high-end)"),
     TIER_2("Tier 2 (mid-range)"),

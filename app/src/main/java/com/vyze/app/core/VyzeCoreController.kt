@@ -715,14 +715,15 @@ class VyzeCoreController(
                     // Rebind on every readiness report (model reload
                     // (resetSession re-init) re-lands on the fresh engine).
                     bindMasterAgentLane()
-                    // Eager warm-up: prime the pipeline so first real tap feels responsive
-                    scope.launch {
-                        try {
-                            withContext(kotlinx.coroutines.Dispatchers.Default) {
-                                analyzeTextDirect("hi", "warmup")
-                            }
-                        } catch (_: Throwable) {}
-                    }
+                    // NOTE (2026-11-07): the eager agent warm-up
+                    // (analyzeTextDirect("hi", "warmup")) was removed. It ran
+                    // a full ~8 s inference at every launch that warmed
+                    // nothing persistent (each inference opens a fresh
+                    // conversation), held the isInferring lane so an early
+                    // first tap was silently ignored, and fed a hallucinated
+                    // turn into rotation bookkeeping. Engine priming stays
+                    // with VlmEngineManager's dummy warm-up; nothing may
+                    // infer before the user's first explicit trigger.
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
                     mainHandler.post {

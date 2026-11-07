@@ -301,17 +301,52 @@ object VyzeAdaptiveBackend {
     /** Optional NPU probe. Only used when caller opts in. */
     const val NPU_EXPERIMENTAL_MAX_ATTEMPTS = 2
 
-    /** Device-HARDWARE-level heuristics for CPU-only fallbacks. */
+    /**
+     * Ultra-budget SoC families whose GPUs never win (see
+     * [deviceLooksCpuOnly]). Substring-matched against the lowercased
+     * Build.HARDWARE — entries are full chip/board ids or vendor
+     * prefixes with no known collisions in other vendors' ids.
+     */
+    private val CPU_ONLY_SOC_FAMILIES = listOf(
+        // Unisoc Tiger / ums board prefix / Spreadtrum SC.
+        "ums", "unisoc", "tiger", "sc98", "sc77",
+        // Low Helio: MT67xx below the G90-class mt6785 floor
+        // (A22/P22/P23/P35/G25/G35/P65/G70/G80/G85 and older).
+        "mt6761", "mt6762", "mt6763", "mt6765", "mt6768", "mt6769",
+        "mt6737", "mt6739", "mt6580",
+    )
+
+    /**
+     * Device-HARDWARE-level heuristics for CPU-only fallbacks.
+     *
+     * The input is Build.HARDWARE (an SoC/board id like "mt6768",
+     * "ums512", "kona") — only rarely a GPU marketing string. Two match
+     * layers, either of which vetoes GPU attempts for this device:
+     *  1. GPU-name layer (kept): some devices report the GPU in the
+     *     hardware string; known-fragile Mali classes match here.
+     *  2. SoC-family layer: ultra-budget SoCs whose GPU drivers are
+     *     unusable for LiteRT-LM (OpenCL compile faults / hangs) and
+     *     whose GPUs would serve slower than CPU regardless — Unisoc
+     *     Tiger/ums/SC across the board, and low Helio (MT67xx below
+     *     the G90-class mt6785 floor).
+     * Deliberately NOT vetoed: Helio G90+ / Dimensity (mt6785 and up)
+     * and all Qualcomm/Exynos — those keep the attempt-with-fallback
+     * path and the persisted per-device calibration learns their
+     * verdict instead of a static veto.
+     */
     fun deviceLooksCpuOnly(hardware: String): Boolean {
-        val hw = hardware.lowercase()
+        val hw = hardware.lowercase(java.util.Locale.US)
         // Known-bad Mali driver classes where GPU init fails silently.
-        return hw.contains("mali") && (
+        if (hw.contains("mali") && (
             hw.contains("g57") ||
             hw.contains("g76") ||
             hw.contains("g78") ||
             hw.contains("g68") ||
             hw.contains("g52")
-        )
+        )) return true
+        // Ultra-budget SoC families: a GPU attempt burns the init budget
+        // (up to ~90 s on first launch) for a backend that cannot win.
+        return CPU_ONLY_SOC_FAMILIES.any { hw.contains(it) }
     }
 
     /** Whether this device has any NPU-like API surface worth experimental probing. */
