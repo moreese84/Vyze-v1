@@ -21,6 +21,7 @@ import com.vyze.app.data.MemoryDao
 import com.vyze.app.data.RepetitionLoopGuard
 import com.vyze.app.data.SuspectMarker
 import com.vyze.app.memory.MemoryRepository
+import com.vyze.app.memory.NonAnswerRefusal
 import com.vyze.app.memory.PreferenceLearner
 import com.vyze.app.memory.SimilarInteraction
 import kotlinx.coroutines.CancellationException
@@ -116,6 +117,17 @@ class VyzeCoreController(
     /** True while the current snapshot is a bank card identification query. */
     @Volatile
     private var bankCardModeActive = false
+    /**
+     * True when the current turn's query explicitly asks to READ text
+     * ([isTextExtractionQuery] — read verbs only, NOT the tap-inclusive
+     * isTextQuery: a tap-to-look at a chair is an object question). Read
+     * by the completion-side text-vs-object refusal swap: a text refusal
+     * ("Text is unclear.") is honest for read questions but a wrong
+     * answer for object/scene questions. Set per trigger, cleared at
+     * completion alongside the sibling mode flags.
+     */
+    @Volatile
+    private var textReadQueryActive = false
 
     /**
      * Timestamp of the last inference activity (token received). The
@@ -599,6 +611,30 @@ class VyzeCoreController(
                     } else {
                         safeResponse
                     }
+                    // ── TEXT-vs-OBJECT REFUSAL SWAP (live 2026-11-07) ────
+                    // A text refusal ("Text is unclear.") is honest for a
+                    // READ question but a wrong answer for an object/scene
+                    // question ("what about the one behind?") — the user
+                    // hears text status nobody asked about. Swap the
+                    // delivered text for the object refusal. Storage keeps
+                    // the honest record (memory guards already exclude
+                    // refusals from injection); currency/card lanes are
+                    // never touched (see companion predicate).
+                    val spokenResponse = if (
+                        companionShouldSubstituteObjectRefusal(
+                            cleanedResponse, textReadQueryActive,
+                            currencyModeActive, bankCardModeActive
+                        )
+                    ) {
+                        CrashLogFile.log(TAG, "Refusal swap: text refusal on non-read query -> object refusal spoken")
+                        ttsManager.localized(
+                            "Not clearly visible.",
+                            "Ia tidak jelas kelihatan.",
+                            "看不清楚。"
+                        )
+                    } else {
+                        deliveredResponse
+                    }
                     flushRemainingSentenceBuffer()
                     scope.launch {
                         try {
@@ -644,12 +680,13 @@ class VyzeCoreController(
                         sensitiveIdModeActive = false
                         medicineMissModeActive = false
                         dateModeActive = false
+                        textReadQueryActive = false
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
                     mainHandler.post {
                         try {
-                            onInferenceComplete?.invoke(deliveredResponse)
+                            onInferenceComplete?.invoke(spokenResponse)
                             onStatusUpdate?.invoke("Ready")
                             CrashLogFile.log(TAG, "onComplete UI callbacks done (session=$sessionId)")
                         } catch (e: Throwable) {
@@ -1386,6 +1423,7 @@ class VyzeCoreController(
         sensitiveIdModeActive = false
         medicineMissModeActive = false
         dateModeActive = false
+        textReadQueryActive = false
         // A deliberate user action invalidates the continuous-mode scene
         // baseline — the next auto-capture should describe fresh.
         lastContinuousEmbedding = null
@@ -1508,6 +1546,9 @@ class VyzeCoreController(
         medicineMissModeActive = false
         // P1a: date-arithmetic contract armed per query.
         dateModeActive = dateQuery
+        // Text-vs-object refusal swap reads this at completion: narrow
+        // read verbs only — taps/pointing stay object questions.
+        textReadQueryActive = isTextExtractionQuery(query)
 
         // ── RECOVERY-CUE ARMING (implicit failure detection) ──────
         // A spoken recovery cue ("please say that again") means the
@@ -3919,6 +3960,25 @@ class VyzeCoreController(
             if (query.isNullOrBlank()) return false
             val lower = query.lowercase()
             return TEXT_KEYWORDS.any { keyword -> lower.contains(keyword) }
+        }
+
+        /**
+         * Text-vs-object refusal swap decision (live 2026-11-07): a text
+         * refusal ("Text is unclear.") is honest for READ questions but a
+         * wrong answer for object/scene questions — the ear must hear the
+         * object refusal instead. Currency/card lanes keep their pinned
+         * never-guess contracts and never swap. Pure — JVM-tested in
+         * VyzeCoreControllerRouteTest; the caller substitutes the localized
+         * object refusal when this returns true.
+         */
+        fun companionShouldSubstituteObjectRefusal(
+            cleanedResponse: String,
+            textReadActive: Boolean,
+            currencyActive: Boolean,
+            bankCardActive: Boolean,
+        ): Boolean {
+            if (textReadActive || currencyActive || bankCardActive) return false
+            return NonAnswerRefusal.isTextRefusal(cleanedResponse)
         }
 
         /**

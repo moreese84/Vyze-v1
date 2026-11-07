@@ -62,16 +62,53 @@ object NonAnswerRefusal {
     )
 
     /**
+     * The TEXT-reading subset of [REFUSALS]: "text is unclear" family, "no
+     * text visible", "cannot read" — en/ms/zh. Used by the completion-side
+     * text-vs-object swap: these are honest ONLY for read questions. The
+     * object ("not clearly visible"), card, currency-value and knowledge
+     * refusals are deliberately excluded — their lanes keep them.
+     */
+    private val TEXT_REFUSALS: Set<String> = setOf(
+        // en
+        "text is unclear",
+        "the text is unclear",
+        "no text visible",
+        "i cannot read this clearly",
+        // ms
+        "teks tidak jelas",
+        "teksnya tidak jelas",
+        "tiada teks kelihatan",
+        // zh
+        "文字不清楚",
+        "看不到文字",
+        "我读不清楚",
+    )
+
+    /**
      * True when [output] IS (a punctuated spelling of) a canned refusal —
      * i.e. it answers nothing about the scene and must never be injected or
      * spoken back as prior memory. Whole-output match only.
      */
     fun isNonAnswer(output: String?): Boolean {
-        if (output.isNullOrBlank()) return false
+        val normalized = normalize(output) ?: return false
+        return normalized in REFUSALS
+    }
+
+    /**
+     * True when [output] IS a text-reading refusal (see [TEXT_REFUSALS]).
+     * Whole-output match, same normalization as [isNonAnswer].
+     */
+    fun isTextRefusal(output: String?): Boolean {
+        val normalized = normalize(output) ?: return false
+        return normalized in TEXT_REFUSALS
+    }
+
+    /** Shared normalization: lowercase, outer punctuation stripped, spaces collapsed. Null when blank. */
+    private fun normalize(output: String?): String? {
+        if (output.isNullOrBlank()) return null
         val normalized = output.lowercase()
             .trim { it.isWhitespace() || it in ".,!?;:„\"'“”‘’…。！？；：、" }
             .replace(Regex("\\s+"), " ")
-        if (normalized.isEmpty()) return false
-        return normalized in REFUSALS
+        return normalized.ifEmpty { null }
     }
 }

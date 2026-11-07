@@ -29,6 +29,33 @@ class NonAnswerRefusalTest {
     }
 
     @Test
+    fun `text refusals are distinguished from object refusals`() {
+        // Live 2026-11-07: "Text is unclear." spoken for an OBJECT
+        // question ("what about the one behind?") — text status nobody
+        // asked about. The completion swap needs the text subset.
+        assertTrue(NonAnswerRefusal.isTextRefusal("Text is unclear."))
+        assertTrue(NonAnswerRefusal.isTextRefusal("The text is unclear."))
+        assertTrue(NonAnswerRefusal.isTextRefusal("No text visible"))
+        assertTrue(NonAnswerRefusal.isTextRefusal("I cannot read this clearly"))
+        assertTrue(NonAnswerRefusal.isTextRefusal("Teks tidak jelas."))
+        assertTrue(NonAnswerRefusal.isTextRefusal("Teksnya tidak jelas."))
+        assertTrue(NonAnswerRefusal.isTextRefusal("Tiada teks kelihatan."))
+        assertTrue(NonAnswerRefusal.isTextRefusal("文字不清楚。"))
+        assertTrue(NonAnswerRefusal.isTextRefusal("看不到文字"))
+        assertTrue(NonAnswerRefusal.isTextRefusal("我读不清楚。"))
+        // Object, card, currency-value and knowledge refusals are NOT
+        // text refusals — the swap must never touch their lanes.
+        assertFalse(NonAnswerRefusal.isTextRefusal("Not clearly visible."))
+        assertFalse(NonAnswerRefusal.isTextRefusal("tidak kelihatan dengan jelas"))
+        assertFalse(NonAnswerRefusal.isTextRefusal("看不清楚。"))
+        assertFalse(NonAnswerRefusal.isTextRefusal("I cannot identify this card clearly."))
+        assertFalse(NonAnswerRefusal.isTextRefusal("Saya tidak dapat membaca nilai ini dengan jelas."))
+        assertFalse(NonAnswerRefusal.isTextRefusal("I do not know that."))
+        assertFalse(NonAnswerRefusal.isTextRefusal("A black chair sits here."))
+        assertFalse(NonAnswerRefusal.isTextRefusal(""))
+    }
+
+    @Test
     fun `canned malay and chinese refusals are non-answers - localized failure phrases`() {
         // The FAILURE-PHRASE OVERRIDE pins these exact spoken forms per
         // language; the few-shots add the Teksnya/文字 spelling variants.

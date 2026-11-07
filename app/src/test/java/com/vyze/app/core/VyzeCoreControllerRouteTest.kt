@@ -189,4 +189,76 @@ class VyzeCoreControllerRouteTest {
         assertFalse(VyzeCoreController.companionHitsDateQuery(""))
         assertFalse(VyzeCoreController.companionHitsDateQuery("hello"))
     }
+
+    // ── Text-vs-object refusal swap (live 2026-11-07) ───────────────
+
+    @Test
+    fun `text refusal on a non-read query swaps to the object refusal`() {
+        // "what about the one behind?" answered with text status nobody
+        // asked about — the ear must hear the object refusal instead.
+        assertTrue(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Text is unclear.", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+        assertTrue(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Teksnya tidak jelas.", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+        assertTrue(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "文字不清楚。", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+    }
+
+    @Test
+    fun `explicit reads and money-card lanes keep their own refusals`() {
+        // A text refusal IS the honest answer to a read question.
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Text is unclear.", textReadActive = true,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+        // Currency/card lanes own pinned never-guess contracts — never touched.
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Text is unclear.", textReadActive = false,
+                currencyActive = true, bankCardActive = false
+            )
+        )
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Text is unclear.", textReadActive = false,
+                currencyActive = false, bankCardActive = true
+            )
+        )
+    }
+
+    @Test
+    fun `real answers object refusals and blanks never swap`() {
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "A black chair sits here.", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "Not clearly visible.", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+        assertFalse(
+            VyzeCoreController.companionShouldSubstituteObjectRefusal(
+                "", textReadActive = false,
+                currencyActive = false, bankCardActive = false
+            )
+        )
+    }
 }
