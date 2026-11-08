@@ -800,4 +800,29 @@ class DynamicPromptBuilderTest {
         // Class ceiling: hard cap for the ambient budget in EN.
         assertTrue("narration=${narration.length} exceeds class budget", narration.length <= 1_500)
     }
+
+    // ── 11. Read recital vs sentence cap (device 2026-11-08) ───
+
+    @Test
+    fun `read turns exempt the recital from the sentence cap`() = runBlocking {
+        // GT 50 Pro 18:20 turn: "read this label" + 166-char trilingual OCR
+        // answered with a 2-sentence summary. DIRECT prose capped reads at
+        // 1-3 sentences while the OCR carve-out overrode a "two sentence
+        // limit" that no longer exists by that name — the model obeyed the
+        // cap and summarized. The cap now scopes itself away from reads and
+        // the carve-out names the limits that actually exist above it.
+        val ocr = "Dapure\nKIÍCHEN\nPenambah Perisa\nMonosodium Glutamat Tulen 99%\n味精"
+        val p = builder().buildPrompt(queryOverride = "read this label", ocrText = ocr)
+        assertTrue(p.contains("Unless reading text aloud"))
+        assertTrue(p.contains("sentence limits above do NOT apply"))
+        assertFalse(p.contains("two sentence limit"))
+    }
+
+    @Test
+    fun `non-read text questions keep the sentence cap`() = runBlocking {
+        // The exemption is scoped: a brand question over OCR text must stay
+        // brief, not recite the panel.
+        val p = builder().buildPrompt(queryOverride = "what brand is this?", ocrText = "Dapure seasoning")
+        assertTrue(p.contains("1-3 short spoken sentences"))
+    }
 }

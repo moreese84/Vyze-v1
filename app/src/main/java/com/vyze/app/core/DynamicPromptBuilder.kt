@@ -138,13 +138,13 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     letter-by-letter ("H-U-R-I-X") or stops early on long
             //     passages (box back panels). Anchor the desired behavior.
             //     OCR CARVE-OUT (persona override): a full label/document read
-            //     is ground-truth playback — the conversational 2-sentence cap
+            //     is ground-truth playback — the conversational sentence cap
             //     in the system directive must never truncate it, so reading
             //     tasks explicitly override the cap here.
             sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
                 "continuous sentences — never spell it letter by letter. When asked to read " +
                 "text, read ALL of it in reading order; do not summarize, skip, or stop early. " +
-                "When reading text aloud, the two sentence limit does NOT apply — read every " +
+                "When reading text aloud, the sentence limits above do NOT apply — read every " +
                 "word of the OCR text completely. Output plain spoken text only: never " +
                 "markdown symbols, bullets, dashes, asterisks, or emoji.")
             // 2c-text. GROUNDING LICENSE (fix #4, 2026-10-01): when OCR text
@@ -515,7 +515,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "Read text verbatim in ORIGINAL language as whole words and sentences — never spell letter by letter. " +
             "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
             "When asked to read text, read the ENTIRE text in reading order; never stop halfway or summarize. " +
-            "Keep the whole answer to 1-3 short spoken sentences. " +
+            "Unless reading text aloud, keep the whole answer to 1-3 short spoken sentences. " +
             "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
             "If no text visible, say 'No text visible'. " +
             "LEAD WITH THE ANSWER: reply with what was asked, with no location preamble — the " +
