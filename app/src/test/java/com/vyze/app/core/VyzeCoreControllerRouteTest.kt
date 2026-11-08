@@ -428,4 +428,139 @@ class VyzeCoreControllerRouteTest {
         assertNull(cover("", "味精"))
         assertNull(cover("   ", "味精"))
     }
+
+    // ── Label recital lane: deterministic reads (device 2026-11-08) ──
+    // The 18:58 turn ("read this for me", 158-char OCR, conf 0.72) fell in
+    // the lanes' dead zone — below fast-path 0.85 AND below direct-read
+    // 300 chars — so the VLM summarized/invented instead of reciting.
+
+    private val labelOcr =
+        "Daplir\nKITCHEN\nPenambah Perisa\nMonosodium Glutamat Tulen 99%\n味精\n" +
+            "MONOSODIUM GLUTAMATE\n99% MURNI & BERKUALITA TINGGI\n99% PURE & HIGH QUALITY\n" +
+            "Berat Bersih / Net Weight 150g"
+
+    @Test
+    fun `label read with solid OCR takes the recital lane`() {
+        assertTrue(
+            VyzeCoreController.companionShouldReciteLabel(
+                ocrText = labelOcr, ocrConfidence = 0.72f,
+                textReadActive = true, isTap = false, isPreciseRead = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, ocrLooksIncomplete = false
+            )
+        )
+    }
+
+    @Test
+    fun `short thin and low-confidence OCR stays on the model lane`() {
+        val recite = { ocr: String?, conf: Float, incomplete: Boolean ->
+            VyzeCoreController.companionShouldReciteLabel(
+                ocrText = ocr, ocrConfidence = conf,
+                textReadActive = true, isTap = false, isPreciseRead = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, ocrLooksIncomplete = incomplete
+            )
+        }
+        // Sparse line is the grounding threshold (60): 59 stays, 60 goes.
+        assertFalse(recite("a".repeat(59), 0.72f, false))
+        assertTrue(recite("a".repeat(60), 0.72f, false))
+        // Confidence floor is the direct-read floor (0.65).
+        assertFalse(recite(labelOcr, 0.64f, false))
+        assertTrue(recite(labelOcr, 0.65f, false))
+        assertFalse(recite(null, 0.72f, false))
+        assertFalse(recite("   ", 0.72f, false))
+        assertFalse(recite(labelOcr, 0.72f, true))
+    }
+
+    @Test
+    fun `taps precise reads and guarded lanes never recite`() {
+        val recite = { flag: String ->
+            VyzeCoreController.companionShouldReciteLabel(
+                ocrText = labelOcr, ocrConfidence = 0.72f,
+                textReadActive = flag != "nonread",
+                isTap = flag == "tap",
+                isPreciseRead = flag == "precise",
+                sensitiveIdActive = flag == "id",
+                medicineMissActive = flag == "medicine",
+                dateActive = flag == "date",
+                ocrLooksIncomplete = false
+            )
+        }
+        assertFalse(recite("nonread"))
+        assertFalse(recite("tap"))
+        assertFalse(recite("precise"))
+        assertFalse(recite("id"))
+        assertFalse(recite("medicine"))
+        assertFalse(recite("date"))
+    }
+
+    @Test
+    fun `medicine-hit OCR stays on the model lane`() {
+        assertFalse(
+            VyzeCoreController.companionShouldReciteLabel(
+                ocrText = "$labelOcr\n[MEDICINE INFO: Panadol, paracetamol, 500mg. Take as needed. WARNING: Do not exceed.]",
+                ocrConfidence = 0.72f,
+                textReadActive = true, isTap = false, isPreciseRead = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, ocrLooksIncomplete = false
+            )
+        )
+    }
+
+    @Test
+    fun `mixed label splits into Latin-Han-Latin spans in order`() {
+        val spans = VyzeCoreController.companionBuildRecitalSpans(labelOcr)
+        assertEquals(3, spans.size)
+        assertFalse(spans[0].needsZhVoice)
+        assertTrue(spans[0].text.contains("Daplir KITCHEN"))
+        assertTrue(spans[0].text.contains("Tulen 99%"))
+        assertFalse(spans[0].text.contains("\n"))
+        assertEquals("味精", spans[1].text)
+        assertTrue(spans[1].needsZhVoice)
+        assertFalse(spans[2].needsZhVoice)
+        assertTrue(spans[2].text.contains("MONOSODIUM GLUTAMATE"))
+        assertTrue(spans[2].text.contains("150g"))
+        assertFalse(spans[2].text.contains("\n"))
+    }
+
+    @Test
+    fun `pure Latin yields one span and multiline Han joins with spaces`() {
+        val latin = VyzeCoreController.companionBuildRecitalSpans("Penambah Perisa\nTulen 99%")
+        assertEquals(1, latin.size)
+        assertFalse(latin[0].needsZhVoice)
+        val han = VyzeCoreController.companionBuildRecitalSpans("味精\n纯素")
+        assertEquals(1, han.size)
+        assertEquals("味精 纯素", han[0].text)
+        assertTrue(han[0].needsZhVoice)
+    }
+
+    @Test
+    fun `adjacent Han-Latin lines split and kana rides the current voice`() {
+        val spans = VyzeCoreController.companionBuildRecitalSpans("味精\nMONOSODIUM")
+        assertEquals(2, spans.size)
+        assertEquals("味精", spans[0].text)
+        assertTrue(spans[0].needsZhVoice)
+        assertEquals("MONOSODIUM", spans[1].text)
+        assertFalse(spans[1].needsZhVoice)
+        // Han-only scope (same as the CJK net): kana is not zh-routed.
+        val kana = VyzeCoreController.companionBuildRecitalSpans("の")
+        assertEquals(1, kana.size)
+        assertFalse(kana[0].needsZhVoice)
+    }
+
+    @Test
+    fun `blank OCR yields no spans`() {
+        assertTrue(VyzeCoreController.companionBuildRecitalSpans("").isEmpty())
+        assertTrue(VyzeCoreController.companionBuildRecitalSpans("  \n  ").isEmpty())
+    }
+
+    @Test
+    fun `RM prices expand to Ringgit words`() {
+        assertEquals("Ringgit 12.90", VyzeCoreController.companionExpandRmPrices("RM12.90"))
+        assertEquals("Ringgit 5", VyzeCoreController.companionExpandRmPrices("RM 5"))
+        assertEquals("Ringgit 5", VyzeCoreController.companionExpandRmPrices("rm5"))
+        assertEquals("Ringgit", VyzeCoreController.companionExpandRmPrices("RM"))
+        assertEquals("FIRM", VyzeCoreController.companionExpandRmPrices("FIRM"))
+        assertEquals("HARUM12", VyzeCoreController.companionExpandRmPrices("HARUM12"))
+    }
 }

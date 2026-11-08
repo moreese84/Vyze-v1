@@ -1943,7 +1943,7 @@ class VyzeCoreController(
                             val medicineInfo = lookupMedicine(ocrText)
                             if (medicineInfo != null) {
                                 CrashLogFile.log(TAG, "Medicine match: ${medicineInfo.name}")
-                                ocrText = "$ocrText\n[MEDICINE INFO: ${medicineInfo.name}, ${medicineInfo.genericName}, ${medicineInfo.dosage}. ${medicineInfo.frequency}. WARNING: ${medicineInfo.warnings}]"
+                                ocrText = "$ocrText\n$MEDICINE_INFO_MARKER ${medicineInfo.name}, ${medicineInfo.genericName}, ${medicineInfo.dosage}. ${medicineInfo.frequency}. WARNING: ${medicineInfo.warnings}]"
                             } else {
                                 // P1b EXPLICIT MISS (AI Edge Gallery mood-tracker
                                 // steal): the DB has no record for this label.
@@ -2088,6 +2088,50 @@ class VyzeCoreController(
                         }
                     }
                     return@launch
+                }
+
+                // ── LABEL RECITAL LANE (device 2026-11-08) ──
+                // Mid-length label reads (the fast-path/direct-read dead
+                // zone: below 0.85 confidence AND below 300 chars) recite
+                // deterministically — no VLM, ~1s to first audio, zero
+                // invention. Runs AFTER direct-read so documents keep their
+                // "Long document" announcement; labels fall through here.
+                // Speech is a sequential span chain (Han spans in the zh
+                // voice): spans submit one-at-a-time because the voice flip
+                // is global engine state. Completion reuses onComplete, so
+                // memory/telemetry/coverage behave; firstChunkSent steers
+                // the fragment to drain-wait (mic reopens after the last
+                // span — unlike direct-read's empty payload, labels stay
+                // conversational). Ear hears joined+price-expanded spans;
+                // memory keeps raw OCR lines for follow-ups (same split as
+                // caps-fold). Guarded lanes, taps, and medicine-hit OCR
+                // stay on the model (see the gate predicate).
+                val labelRecitalOcr = ocrText
+                if (companionShouldReciteLabel(
+                        ocrText = labelRecitalOcr, ocrConfidence = ocrConfidence,
+                        textReadActive = isTextExtractionQuery(query), isTap = isTapQuery,
+                        isPreciseRead = isPreciseRead, sensitiveIdActive = sensitiveIdModeActive,
+                        medicineMissActive = medicineMissModeActive, dateActive = dateModeActive,
+                        ocrLooksIncomplete = ocrLooksIncomplete
+                    ) && currentSessionId == activeSessionId
+                ) {
+                    val recitalOcr = labelRecitalOcr ?: ""
+                    val spans = companionBuildRecitalSpans(recitalOcr)
+                    if (spans.isEmpty()) {
+                        CrashLogFile.log(TAG, "LABEL RECITAL skipped: no speakable spans — falling through to VLM")
+                    } else {
+                        CrashLogFile.log(TAG, "LABEL RECITAL: ${spans.size} spans, ${recitalOcr.length} chars, conf=$ocrConfidence — skipping inference")
+                        // FIX 3 parity (fast-path): the recital enters
+                        // dialogue history raw (lines intact) for follow-ups
+                        // like "what does the second line say?".
+                        if (isVoiceFollowUpCandidate && !isPreciseRead) {
+                            recordDialogueTurn(query ?: "", recitalOcr)
+                        }
+                        firstChunkSent = true
+                        speakRecitalChain(spans, ttsManager.zhVoiceOrNull(), activeSessionId)
+                        vlmEngine.onComplete?.invoke(recitalOcr, activeSessionId)
+                        return@launch
+                    }
                 }
 
                 // ── CANCELLATION CHECK: bail out before prompt build ──
@@ -3449,6 +3493,40 @@ class VyzeCoreController(
     }
 
     /**
+     * Speaks recital spans strictly one-at-a-time: each span submits on
+     * the previous span's terminal event, so the queue holds at most one
+     * utterance and the zh-voice flip can never re-voice queued speech.
+     * Session-guarded (barge-ins rotate the session and the stale chain
+     * stops); terminal + accepted flags make every span advance
+     * exactly-once (an engine-level reject fires onError synchronously
+     * AND returns false — the local flag covers that double path).
+     */
+    private fun speakRecitalChain(
+        spans: List<RecitalSpan>,
+        zhVoice: Voice?,
+        sessionId: String,
+        index: Int = 0
+    ) {
+        if (index >= spans.size || activeSessionId != sessionId) return
+        val span = spans[index]
+        var terminalFired = false
+        val advance: () -> Unit = { speakRecitalChain(spans, zhVoice, sessionId, index + 1) }
+        val accepted = try {
+            ttsManager.speak(
+                span.text, TextToSpeech.QUEUE_ADD,
+                utteranceId = "${sessionId}_read_$index",
+                onDone = { terminalFired = true; advance() },
+                onError = { terminalFired = true; advance() },
+                voice = if (span.needsZhVoice) zhVoice else null
+            )
+        } catch (t: Throwable) {
+            CrashLogFile.logError(TAG, "Recital span $index speech failed: ${t.message}", t)
+            false
+        }
+        if (!accepted && !terminalFired) advance()
+    }
+
+    /**
      * Size the output-token budget to the text actually found by OCR.
      * The model mostly echoes the OCR block (~1 token per 4 chars) plus a
      * short intro, so a dense panel gets a proportionally large budget —
@@ -4103,6 +4181,89 @@ class VyzeCoreController(
                 else -> "and in Chinese:"
             }
             return CjkCoverage(bridge, missing.joinToString(" "))
+        }
+
+        /**
+         * Label-recital lane gate (device 2026-11-08): mid-length label
+         * reads (the fast-path/direct-read dead zone — below 0.85
+         * confidence AND below 300 chars) recite deterministically instead
+         * of suffering VLM summarize/invent. Length floor reuses the
+         * grounding threshold (60): thinner OCR needs model
+         * interpretation. Confidence floor reuses the direct-read floor.
+         * Guarded lanes, taps, and medicine-hit OCR (needs model
+         * explanation) stay on the model. Pure — JVM-tested in
+         * VyzeCoreControllerRouteTest.
+         */
+        fun companionShouldReciteLabel(
+            ocrText: String?,
+            ocrConfidence: Float,
+            textReadActive: Boolean,
+            isTap: Boolean,
+            isPreciseRead: Boolean,
+            sensitiveIdActive: Boolean,
+            medicineMissActive: Boolean,
+            dateActive: Boolean,
+            ocrLooksIncomplete: Boolean,
+        ): Boolean {
+            if (!textReadActive || isTap || isPreciseRead) return false
+            if (sensitiveIdActive || medicineMissActive || dateActive) return false
+            if (ocrText.isNullOrBlank() || ocrLooksIncomplete) return false
+            if (ocrText.contains(MEDICINE_INFO_MARKER)) return false
+            if (DynamicPromptBuilder.companionShouldGroundOcr(ocrText)) return false
+            if (ocrConfidence < DIRECT_READ_MIN_CONFIDENCE) return false
+            return true
+        }
+
+        /** Provenance marker the medicine-hit path appends to OCR text. */
+        private const val MEDICINE_INFO_MARKER = "[MEDICINE INFO:"
+
+        /** One speakable recital run: Han runs take the zh voice. */
+        data class RecitalSpan(val text: String, val needsZhVoice: Boolean)
+
+        /**
+         * Split OCR text into maximal same-script spans for the recital
+         * chain: Han runs (zh voice) alternate with Latin runs (current
+         * voice, soft wraps joined, RM prices expanded). Consecutive Han
+         * runs split only by whitespace merge with a space. Han-only scope
+         * matches the CJK net (kana/hangul ride the current voice). Pure —
+         * JVM-tested in VyzeCoreControllerRouteTest.
+         */
+        fun companionBuildRecitalSpans(ocrText: String): List<RecitalSpan> {
+            if (ocrText.isBlank()) return emptyList()
+            val spans = mutableListOf<RecitalSpan>()
+            var pos = 0
+            fun emitLatin(raw: String) {
+                val trimmed = raw.trim()
+                if (trimmed.isEmpty()) return
+                spans.add(RecitalSpan(companionExpandRmPrices(ResponseCleanup.joinSoftLineWraps(trimmed)), false))
+            }
+            fun emitHan(run: String) {
+                val last = spans.lastOrNull()
+                if (last != null && last.needsZhVoice) {
+                    spans[spans.size - 1] = last.copy(text = "${last.text} $run")
+                } else {
+                    spans.add(RecitalSpan(run, true))
+                }
+            }
+            for (m in cjkRunRegex.findAll(ocrText)) {
+                if (m.range.first > pos) emitLatin(ocrText.substring(pos, m.range.first))
+                emitHan(m.value)
+                pos = m.range.last + 1
+            }
+            if (pos < ocrText.length) emitLatin(ocrText.substring(pos))
+            return spans
+        }
+
+        /**
+         * Ear-only price expansion for recital spans (memory keeps raw OCR,
+         * same split as caps-fold): RM-prefixed amounts speak the currency
+         * word so the engine never spells "R M". V1 scope: word only, no
+         * sen expansion ("RM12.90" → "Ringgit 12.90"). Pure — JVM-tested.
+         */
+        fun companionExpandRmPrices(text: String): String {
+            return text
+                .replace(Regex("\\bRM\\s?(?=\\d)", RegexOption.IGNORE_CASE), "Ringgit ")
+                .replace(Regex("\\bRM\\b", RegexOption.IGNORE_CASE), "Ringgit")
         }
 
         /**
