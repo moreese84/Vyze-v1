@@ -994,16 +994,27 @@ class TTSManager private constructor(context: Context) {
     /**
      * Single text interceptor that every speak() entry point funnels through.
      * Runs, in order:
+     *  0. Soft-wrap join — layout newlines become spaces ("zinc\noxide" →
+     *     "zinc oxide") so OCR/fast-path reads never pause mid-phrase;
+     *     hard breaks keep their pause via punctuation (see
+     *     ResponseCleanup.joinSoftLineWraps).
      *  1. [applyPronunciationOverrides] — curated respellings (brand names,
      *     phonetic repairs for English loans read by the wrong voice).
-     *  2. [applyLanguageSmoothing] — per-language flow fixes: Malay liaison
+     *  2. Caps fold — ALL-CAPS words to Title case ("HILLARY" → "Hillary")
+     *     so the engine reads them as words instead of spelling them;
+     *     short initialisms and pinned acronyms keep spelling.
+     *  3. [expandIdentifierCodes] — plates/codes spaced character by
+     *     character ("QLB 3469" → "Q L B 3 4 6 9").
+     *  4. [applyLanguageSmoothing] — per-language flow fixes: Malay liaison
      *     and Chinese trailing particle so sentences do not sound like
      *     isolated word blocks with dead air between them.
-     *  3. [enhanceForNaturalProsody] — whitespace/punctuation normalization.
+     *  5. [enhanceForNaturalProsody] — whitespace/punctuation normalization.
      */
     private fun prepareForEngine(text: String): String {
         if (text.isBlank()) return text
-        var out = applyPronunciationOverrides(text)
+        var out = com.vyze.app.core.ResponseCleanup.joinSoftLineWraps(text)
+        out = applyPronunciationOverrides(out)
+        out = foldCapsWordsForSpeech(out)
         out = expandIdentifierCodes(out)
         out = applyLanguageSmoothing(out)
         out = enhanceForNaturalProsody(out)
@@ -1546,6 +1557,36 @@ class TTSManager private constructor(context: Context) {
             "NT", "RS", "R", "US", "AU", "NZ", "CA", "HK", "S",
             "KG", "CM", "MM", "KM", "ML", "MG", "OZ", "LB", "NO", "NUM"
         )
+
+        /**
+         * Four-plus-letter initialisms that MUST keep spelling (the length
+         * heuristic in [foldCapsWordsForSpeech] would fold them wrongly).
+         * Add entries when users report a spelled-vs-word miss, with a pin
+         * in CapsFoldPolicyTest.
+         */
+        private val SPELL_OUT_ACRONYMS = setOf("HSBC", "OCBC", "ECRL")
+
+        /** Four or more consecutive uppercase letters — a word, not initials. */
+        private val CAPS_WORD_REGEX = Regex("\\b[\\p{Lu}]{4,}\\b")
+
+        /**
+         * Fold ALL-CAPS words to Title case so the engine reads them as
+         * words ("HILLARY" → "Hillary", "TENOF" → "Tenof"). Live
+         * 2026-11-07: unknown caps tokens reached the ear spelled letter
+         * by letter. Short runs ("TV", "BMW", "USA") and the pinned
+         * [SPELL_OUT_ACRONYMS] keep spelling — those ARE pronounced that
+         * way. Dotted ("U.S.A") and alphanumeric ("COVID19", "G81") tokens
+         * cannot match (no 4-letter caps run) and pass through untouched.
+         * Pure — JVM-tested in CapsFoldPolicyTest.
+         */
+        internal fun foldCapsWordsForSpeech(text: String): String {
+            if (text.isBlank()) return text
+            return CAPS_WORD_REGEX.replace(text) { m ->
+                val word = m.value
+                if (word in SPELL_OUT_ACRONYMS) word
+                else word[0] + word.substring(1).lowercase(java.util.Locale.US)
+            }
+        }
 
         @Volatile
         private var instance: TTSManager? = null

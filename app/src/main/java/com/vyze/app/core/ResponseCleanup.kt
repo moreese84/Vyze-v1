@@ -229,6 +229,67 @@ object ResponseCleanup {
             .trim()
 
     /**
+     * Punctuation after which a line break is a real prosodic boundary
+     * (the mark itself carries the pause). Anything else before a newline
+     * is a soft layout wrap. 、 (enumeration comma) is deliberately
+     * excluded — "苹果、香蕉" must flow, not break.
+     */
+    private const val LINE_BREAK_PUNCT = ".!?。！？,，;；:："
+
+    /**
+     * True when a newline after [c] is a hard break: previous char is
+     * boundary punctuation, or another newline (blank-line paragraph).
+     * Shared by [joinSoftLineWraps] and the controller flush scanner's
+     * cut decision so both agree on every line.
+     */
+    fun isHardLineBreak(c: Char): Boolean = c in LINE_BREAK_PUNCT || c == '\n'
+
+    /**
+     * Join soft-wrapped lines into flowing phrases ("zinc\\noxide," →
+     * "zinc oxide,"). Live 2026-11-07: an ingredients read spoke "zinc."
+     * + "oxide," — OCR layout wraps (repeated by the model) cut one
+     * noun phrase into two utterances with a full-stop seam mid-phrase.
+     *
+     * Rules: a lone newline becomes a space (hard breaks keep their
+     * pause via the punctuation that precedes them); a blank-line run
+     * becomes a sentence break ("." appended unless already punctuated,
+     * so "Para one\\n\\nPara two" reads as two sentences, never run-on);
+     * CJK-to-CJK joins take no space ("苹果\\n香蕉" → "苹果香蕉") while
+     * mixed joins do ("苹果\\nApple" → "苹果 Apple"). CR/LF normalized.
+     */
+    fun joinSoftLineWraps(text: String): String {
+        if (!text.contains('\n') && !text.contains('\r')) return text
+        val norm = text.replace("\r\n", "\n").replace('\r', '\n')
+        val sb = StringBuilder(norm.length)
+        var i = 0
+        while (i < norm.length) {
+            val c = norm[i]
+            if (c != '\n') {
+                sb.append(c)
+                i++
+                continue
+            }
+            var j = i
+            while (j < norm.length && norm[j] == '\n') j++
+            val isParagraph = j - i >= 2
+            val prev = if (sb.isNotEmpty()) sb[sb.length - 1] else null
+            val next = if (j < norm.length) norm[j] else null
+            if (isParagraph) {
+                if (prev != null && prev !in LINE_BREAK_PUNCT && next != null) sb.append('.')
+                if (next != null) sb.append(' ')
+            } else if (prev != null && next != null) {
+                if (!(isCjkChar(prev) && isCjkChar(next))) sb.append(' ')
+            }
+            i = j
+        }
+        return sb.toString().trim().replace(Regex("\\s+"), " ")
+    }
+
+    /** CJK ranges (mirrors the flush read-ahead detector's blocks). */
+    private fun isCjkChar(c: Char): Boolean =
+        c.code in 0x2E80..0x9FFF || c.code in 0x3000..0x303F || c.code in 0xFF00..0xFFEF
+
+    /**
      * Drop a trailing canned-refusal sentence ("Text is unclear.") ONLY when
      * real content precedes it — a response that IS the refusal wholesale is
      * an honest answer and is returned untouched.

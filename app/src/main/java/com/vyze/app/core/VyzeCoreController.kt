@@ -1102,6 +1102,14 @@ class VyzeCoreController(
             var pendingClauseCut = false
             for (i in text.length - 1 downTo 0) {
                 if (text[i] in SENTENCE_TERMINATORS) {
+                    // SOFT-WRAP GUARD (live 2026-11-07): a newline cuts an
+                    // utterance only after punctuation or another newline
+                    // ("one.\ntwo" and paragraphs cut; "zinc\noxide" joins
+                    // and flows — no full-stop seam mid-phrase). Shared rule
+                    // with ResponseCleanup.joinSoftLineWraps.
+                    if (text[i] == '\n' && (i == 0 || !ResponseCleanup.isHardLineBreak(text[i - 1]))) {
+                        continue
+                    }
                     cut = i
                     break
                 }

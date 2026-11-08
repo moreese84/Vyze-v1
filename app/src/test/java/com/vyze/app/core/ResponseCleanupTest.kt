@@ -1,6 +1,7 @@
 package com.vyze.app.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -160,6 +161,73 @@ class ResponseCleanupTest {
             "Text is unclear.No text visible.",
             ResponseCleanup.stripRefusalSentences("Text is unclear.No text visible.")
         )
+    }
+
+    // ── joinSoftLineWraps (soft-clause line bleed) ────────────────
+
+    @Test
+    fun `soft wraps join into flowing phrases`() {
+        // Live 2026-11-07: ingredients read spoke "zinc." + "oxide," —
+        // a full-stop seam mid-phrase where the label wrapped lines.
+        assertEquals(
+            "Ingredients: zinc oxide, Aqua/Eau, Glycerin, " +
+                "Niacinamide, Butylene Glycol, Phenoxyethanol",
+            ResponseCleanup.joinSoftLineWraps(
+                "Ingredients: zinc\noxide, Aqua/Eau, Glycerin,\n" +
+                    "Niacinamide, Butylene\nGlycol, Phenoxyethanol"
+            )
+        )
+    }
+
+    @Test
+    fun `hard breaks keep their pause via punctuation`() {
+        assertEquals(
+            "First line. Second line.",
+            ResponseCleanup.joinSoftLineWraps("First line.\nSecond line.")
+        )
+        assertEquals(
+            "Glycerin, Niacinamide",
+            ResponseCleanup.joinSoftLineWraps("Glycerin,\nNiacinamide")
+        )
+    }
+
+    @Test
+    fun `blank lines become sentence breaks without doubling periods`() {
+        assertEquals(
+            "Para one. Para two",
+            ResponseCleanup.joinSoftLineWraps("Para one\n\nPara two")
+        )
+        assertEquals(
+            "One. Two.",
+            ResponseCleanup.joinSoftLineWraps("One.\n\nTwo.")
+        )
+    }
+
+    @Test
+    fun `cjk wraps join without spaces`() {
+        assertEquals("苹果香蕉", ResponseCleanup.joinSoftLineWraps("苹果\n香蕉"))
+        assertEquals("苹果 Apple", ResponseCleanup.joinSoftLineWraps("苹果\nApple"))
+    }
+
+    @Test
+    fun `crlf and edge newlines normalize cleanly`() {
+        assertEquals("a b", ResponseCleanup.joinSoftLineWraps("a\r\nb"))
+        assertEquals("Hello", ResponseCleanup.joinSoftLineWraps("\nHello\n"))
+        assertEquals("plain", ResponseCleanup.joinSoftLineWraps("plain"))
+    }
+
+    @Test
+    fun `hard line-break predicate matches the join rule`() {
+        // Shared by the join transform and the flush scanner's cut
+        // decision — punctuation or paragraph break cuts; bare wraps join.
+        assertTrue(ResponseCleanup.isHardLineBreak('.'))
+        assertTrue(ResponseCleanup.isHardLineBreak('。'))
+        assertTrue(ResponseCleanup.isHardLineBreak(','))
+        assertTrue(ResponseCleanup.isHardLineBreak('，'))
+        assertTrue(ResponseCleanup.isHardLineBreak('\n'))
+        assertFalse(ResponseCleanup.isHardLineBreak('c'))
+        assertFalse(ResponseCleanup.isHardLineBreak('、'))
+        assertFalse(ResponseCleanup.isHardLineBreak(' '))
     }
 
     // ── clean ──────────────────────────────────────────────────────
