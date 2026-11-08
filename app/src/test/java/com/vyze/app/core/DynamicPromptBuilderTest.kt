@@ -825,4 +825,40 @@ class DynamicPromptBuilderTest {
         val p = builder().buildPrompt(queryOverride = "what brand is this?", ocrText = "Dapure seasoning")
         assertTrue(p.contains("1-3 short spoken sentences"))
     }
+
+    // ── 12. Late read-recital clause (device 2026-11-08) ───
+
+    @Test
+    fun `explicit read renders the late recital clause`() = runBlocking {
+        // 18:47 turn: "read" + 176-char OCR still summarized — on lean
+        // (prose-only) turns the persona/cap lines outrank the mid-prompt
+        // carve-outs. The recital clause sits last (same doctrine as the
+        // privacy/medicine-miss contracts) and cancels describe-mode.
+        val ocr = "Daplir\nKIÍCHÈN\nPenambah Perisa\nMonosodium Glutanat Tulen 99%\n味精"
+        val p = builder().buildPrompt(
+            queryOverride = "read this label",
+            ocrText = ocr,
+            readRecitalMode = true
+        )
+        assertTrue(p.contains("READ ALOUD"))
+        assertTrue(p.contains("output ONLY the OCR text above"))
+        // Last-seen placement: after every rule it must outrank.
+        assertTrue(p.indexOf("READ ALOUD") > p.indexOf("Unless reading text aloud"))
+        assertTrue(p.indexOf("READ ALOUD") > p.indexOf("sentence limits above do NOT apply"))
+    }
+
+    @Test
+    fun `recital clause stays off without the flag OCR or on guarded lanes`() = runBlocking {
+        val ocr = "Daplir seasoning"
+        // No flag: brand-style questions never recite.
+        assertFalse(builder().buildPrompt(queryOverride = "what brand is this?", ocrText = ocr).contains("READ ALOUD"))
+        // No OCR: nothing to recite.
+        assertFalse(builder().buildPrompt(queryOverride = "read this label", readRecitalMode = true).contains("READ ALOUD"))
+        // Guarded lanes keep their own contracts.
+        assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, currencyMode = true).contains("READ ALOUD"))
+        assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, bankCardMode = true).contains("READ ALOUD"))
+        assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, sensitiveIdMode = true).contains("READ ALOUD"))
+        assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, medicineMissMode = true).contains("READ ALOUD"))
+        assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, dateRulesMode = true).contains("READ ALOUD"))
+    }
 }

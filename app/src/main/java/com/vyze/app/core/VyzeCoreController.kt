@@ -2151,6 +2151,7 @@ class VyzeCoreController(
                     sensitiveIdMode = sensitiveIdModeActive,
                     medicineMissMode = medicineMissModeActive,
                     dateRulesMode = dateModeActive,
+                    readRecitalMode = textReadQueryActive,
                     // LEAN SUPPRESS (2026-10-18): while lean, keep the prior-
                     // scene recall injection out of the rendered prompt — the
                     // builder already skips its block; skipping here avoids

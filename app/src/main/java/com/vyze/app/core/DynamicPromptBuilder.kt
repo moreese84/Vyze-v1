@@ -49,6 +49,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         sensitiveIdMode: Boolean = false,
         medicineMissMode: Boolean = false,
         dateRulesMode: Boolean = false,
+        readRecitalMode: Boolean = false,
         memoryContext: String? = null,
         textOnlyMode: Boolean = false,
         brevityLevel: com.vyze.app.memory.PreferenceLearner.BrevityLevel = com.vyze.app.memory.PreferenceLearner.BrevityLevel.NORMAL,
@@ -348,6 +349,24 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 sb.appendLine(dateClauseFor(userLocale.language))
             }
 
+            // 3h. READ-RECITAL CONTRACT (device 2026-11-08): explicit read
+            //     turns summarized the label in 2 sentences despite the
+            //     mid-prompt carve-outs — on lean (prose-only) turns the
+            //     persona/cap lines outrank them. Last-seen-wins placement
+            //     (same doctrine as the privacy/medicine-miss contracts):
+            //     output ONLY the OCR recital, cancelling describe-mode
+            //     (brand-first intro included) and the sentence caps.
+            //     Gated on OCR presence plus every guarded lane, so brand
+            //     questions and never-guess contracts never recite.
+            if (readRecitalMode && !ocrText.isNullOrBlank() &&
+                !currencyMode && !bankCardMode && !sensitiveIdMode &&
+                !medicineMissMode && !dateRulesMode
+            ) {
+                sb.appendLine("READ ALOUD: output ONLY the OCR text above, complete in " +
+                    "reading order, speaking prices in words — no description, no " +
+                    "summary, no brand-first intro. The sentence limits do not apply.")
+            }
+
             // 4. Language mirror — reinforce at bottom (ALL languages now:
             //    symmetric anchor, English included — see the top mirror note)
             sb.appendLine("REMEMBER: Respond only in $langName. Begin immediately with the answer itself — never repeat or echo the user's question.")
@@ -387,7 +406,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             Log.i(TAG, "Built prompt: ${prompt.length} chars, mode=$promptMode, " +
                 "lang=${userLocale.language}, currency=$currencyMode, bankCard=$bankCardMode, " +
                 "sensitiveId=$sensitiveIdMode, medicineMiss=$medicineMissMode, " +
-                "dateRules=$dateRulesMode, " +
+                "dateRules=$dateRulesMode, readRecital=$readRecitalMode, " +
                 "ocr=${!ocrText.isNullOrBlank()}, " +
                 "dialogue=${!dialogueContext.isNullOrBlank()}, brevity=$brevityLevel")
             prompt
