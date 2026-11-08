@@ -4235,7 +4235,9 @@ class VyzeCoreController(
             fun emitLatin(raw: String) {
                 val trimmed = raw.trim()
                 if (trimmed.isEmpty()) return
-                spans.add(RecitalSpan(companionExpandRmPrices(ResponseCleanup.joinSoftLineWraps(trimmed)), false))
+                val joined = ResponseCleanup.joinSoftLineWraps(trimmed)
+                val corrected = companionCorrectRecitalText(joined)
+                spans.add(RecitalSpan(companionExpandRmPrices(corrected), false))
             }
             fun emitHan(run: String) {
                 val last = spans.lastOrNull()
@@ -4264,6 +4266,198 @@ class VyzeCoreController(
             return text
                 .replace(Regex("\\bRM\\s?(?=\\d)", RegexOption.IGNORE_CASE), "Ringgit ")
                 .replace(Regex("\\bRM\\b", RegexOption.IGNORE_CASE), "Ringgit")
+        }
+
+        /**
+         * Label vocabulary for recital correction (lowercase, len>=3). Serves
+         * two roles: exact-match shields (a listed word is never "corrected"
+         * away) and correction targets for single/double-char OCR garble.
+         *
+         * Near-pairs (flavor/flavour, teh/tea, perisa/perasa) fail safe: a
+         * garble equidistant to both stays untouched. Variants that would
+         * STEAL a pinned correction stay out deliberately (bertambah would
+         * steal Pertambah→Penambah; tamat/gamat would tie Gatamat→Glutamat).
+         * No proper-noun brands: corrections never invent brand names.
+         *
+         * The correction tests are the collision detector: run the suite
+         * after any addition, and remove (never weaken around) colliders.
+         */
+        private val LABEL_LEXICON: Set<String> = setOf(
+            // Malay food.
+            "air", "asam", "ayam", "bawang", "bayam", "beras", "bihun",
+            "biskut", "buah", "cendawan", "cili", "coklat", "cuka", "daging",
+            "dapur", "daun", "durian", "enak", "epal", "garam", "garlic",
+            "gula", "halba", "halia", "hitam", "hijau", "ikan", "jintan",
+            "jus", "kacang", "kambing", "kangkung", "kari", "kayu", "kelapa",
+            "kentang", "ketumbar", "kicap", "kuey", "teow", "kuning", "kunir", "tinggi", "biru",
+            "kunyit", "kurma", "laksa", "lawang", "lazat", "lada", "lemak",
+            "lembu", "lengkuas", "limau", "lobak", "mangga", "manis",
+            "masak", "masakan", "masam", "masin", "mata", "mee", "mentega", "merah", "marjerin",
+            "mihun", "minyak", "nanas", "nasi", "oat", "oren", "pahit",
+            "pala", "pandan", "pedas", "pelaga", "peria", "pewarna",
+            "pisang", "pulut", "putih", "rangup", "rambutan", "rendang", "perang", "rendah",
+            "roti", "sambal", "santan", "sardin", "sayur", "sedap", "segar",
+            "segera", "serai", "serbuk", "sos", "sotong", "sup", "susu",
+            "teh", "telur", "tembikai", "tepung", "tomato", "tulang",
+            "tuna", "tawar", "ubat", "udang", "belacan", "campuran",
+            // Malay packaging & admin.
+            "amaran", "arahan", "awas", "bahan", "bancuh", "basuh",
+            "berat", "berkualita", "berkualiti", "bersih", "bilas",
+            "botol", "buatan", "bulan", "bungkus", "bungkusan", "buka",
+            "cawan", "cadangan", "cap", "cara", "dewasa", "diedar", "dos",
+            "edaran", "goncang", "guna", "halal", "hamil", "harga",
+            "hidang", "jauhkan", "jenama", "kalori", "kanak",
+            "kapsul", "karbohidrat", "karton", "khasiat", "kilang",
+            "kotak", "kurang", "larut", "lebih", "luput", "malaysia",
+            "mengandungi", "murni", "oleh", "paket", "pek", "penambah", "pengawet",
+            "perasa", "perisa", "protein", "ramuan", "ringgit", "sah",
+            "sajian", "sebelum", "sehingga", "sen", "simpan", "sukatan",
+            "sudu", "tablet", "tambah", "tambahan", "tarikh", "terbaik",
+            "tin", "titik", "titis", "tulen", "tutup", "untuk", "vitamin",
+            "zat", "farmasi", "doktor", "tahun", "hari", "semua", "baru",
+            "asli", "pes", "pasta", "kiub", "pati", "keju", "madu",
+            "sirap", "jam", "jem", "strawberi", "blackcurrant", "lychee",
+            "laici", "longan",
+            // Malay general (label-adjacent) + months.
+            "dan", "atau", "dengan", "dari", "untuk", "yang", "ini",
+            "itu", "setiap", "dalam", "pada", "adalah", "ialah",
+            "tidak", "bukan", "ada", "tiada", "boleh", "sila",
+            "selamat", "lain", "januari", "februari", "mac", "april",
+            "mei", "jun", "julai", "ogos", "september", "oktober",
+            "november", "disember",
+            // English food.
+            "apple", "banana", "beef", "bread", "butter", "can",
+            "cheese", "chicken", "chili", "chocolate", "coconut",
+            "coffee", "contains", "cup", "delicious", "dried", "egg",
+            "enhancer", "fish", "flavor", "flavour", "flour", "food",
+            "fresh", "frozen", "fruit", "ginger", "glutamate",
+            "glutamat", "grams", "high", "instant", "juice", "kitchen",
+            "liter", "litre", "meat", "milk", "monosodium", "noodles",
+            "onion", "orange", "packet", "peanut", "pepper", "powder",
+            "pure", "quality", "rice", "salt", "sauce", "seasoning",
+            "soup", "spicy", "spoon", "sugar", "sweet", "tea",
+            "tomato", "vegetable", "water", "disodium", "inosinate",
+            "guanylate", "stock", "stick", "macaroni", "makaroni",
+            "spaghetti", "spageti", "sachet", "sodium", "iron",
+            "calcium", "zinc", "oxide", "dioxide", "honey", "syrup",
+            "strawberry", "yogurt",
+            // English packaging + months (ms-shared spellings listed once).
+            "added", "before", "best", "brand", "caution", "children",
+            "cool", "distributed", "dosage", "drops", "dry", "energy",
+            "expiring", "expiry", "facts", "factory", "keep", "made",
+            "manufactured", "measure", "mix", "nutrition", "pack",
+            "place", "serve", "serving", "shake", "store", "suggestion",
+            "warning", "weight", "january", "february", "march", "may",
+            "june", "july", "august", "october", "december",
+            // Units + user-domain ingredients.
+            "gram", "grams", "kilogram", "milliliter", "net",
+            "aqua", "eau", "glycerin", "glycerine", "niacinamide",
+            "butylene", "glycol", "phenoxyethanol",
+        )
+
+        /** Fold Latin diacritics so OCR accents match plain lexicon forms. */
+        private fun foldDiacriticsChar(c: Char): Char = when (c) {
+            'à', 'á', 'â', 'ã', 'ä', 'å', 'À', 'Á', 'Â', 'Ã', 'Ä', 'Å' -> 'a'
+            'è', 'é', 'ê', 'ë', 'È', 'É', 'Ê', 'Ë' -> 'e'
+            'ì', 'í', 'î', 'ï', 'Ì', 'Í', 'Î', 'Ï' -> 'i'
+            'ò', 'ó', 'ô', 'õ', 'ö', 'Ò', 'Ó', 'Ô', 'Õ', 'Ö' -> 'o'
+            'ù', 'ú', 'û', 'ü', 'Ù', 'Ú', 'Û', 'Ü' -> 'u'
+            'ç', 'Ç' -> 'c'
+            'ñ', 'Ñ' -> 'n'
+            'ÿ', 'Ÿ' -> 'y'
+            else -> c
+        }
+
+        private fun foldDiacritics(s: String): String =
+            s.map(::foldDiacriticsChar).joinToString("")
+
+        /** Levenshtein distance with early exit past [cap]. */
+        private fun levenshteinCapped(a: String, b: String, cap: Int): Int {
+            if (a == b) return 0
+            if (a.isEmpty()) return b.length
+            if (b.isEmpty()) return a.length
+            var prev = IntArray(b.length + 1) { it }
+            var curr = IntArray(b.length + 1)
+            for (i in 1..a.length) {
+                curr[0] = i
+                var rowMin = curr[0]
+                for (j in 1..b.length) {
+                    val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                    curr[j] = minOf(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+                    if (curr[j] < rowMin) rowMin = curr[j]
+                }
+                if (rowMin > cap) return cap + 1
+                val tmp = prev
+                prev = curr
+                curr = tmp
+            }
+            return prev[b.length]
+        }
+
+        private fun mirrorCasing(sample: String, canonical: String): String {
+            if (sample.all { !it.isLetter() || it.isUpperCase() }) return canonical.uppercase()
+            val first = sample.firstOrNull()
+            if (first != null && first.isUpperCase() &&
+                sample.drop(1).all { !it.isLetter() || it.isLowerCase() }
+            ) {
+                return canonical[0].uppercaseChar() + canonical.substring(1)
+            }
+            return canonical
+        }
+
+        /**
+         * Correct one OCR word against the label lexicon: exact matches
+         * normalize casing only; otherwise the single closest candidate
+         * wins (distance 1 for len<=4, else <=2; ties fail safe to the
+         * original). Short tokens, digits, codes, and non-letters pass
+         * through untouched. Pure — JVM-tested.
+         */
+        fun companionCorrectWord(word: String): String {
+            if (word.length <= 2) return word
+            if (!word.all { it.isLetter() || it == '\'' || it == '’' }) return word
+            val folded = foldDiacritics(word.lowercase())
+            val match = if (folded in LABEL_LEXICON) {
+                folded
+            } else {
+                val maxDist = if (word.length <= 4) 1 else 2
+                var best: String? = null
+                var bestDist = Int.MAX_VALUE
+                var ambiguous = false
+                for (cand in LABEL_LEXICON) {
+                    if (kotlin.math.abs(cand.length - folded.length) > maxDist) continue
+                    val d = levenshteinCapped(folded, cand, maxDist)
+                    if (d <= maxDist) {
+                        if (d < bestDist) {
+                            bestDist = d
+                            best = cand
+                            ambiguous = false
+                        } else if (d == bestDist) {
+                            ambiguous = true
+                        }
+                    }
+                }
+                if (best == null || ambiguous) return word
+                best
+            }
+            return mirrorCasing(word, match)
+        }
+
+        /**
+         * Correct the letter-tokens of recital text, preserving every
+         * separator (spaces, digits, punctuation) byte-identical. Pure —
+         * covered via the span tests.
+         */
+        fun companionCorrectRecitalText(text: String): String {
+            if (text.isBlank()) return text
+            val out = StringBuilder(text.length)
+            var pos = 0
+            for (m in Regex("[\\p{L}'’]+").findAll(text)) {
+                out.append(text, pos, m.range.first)
+                out.append(companionCorrectWord(m.value))
+                pos = m.range.last + 1
+            }
+            out.append(text, pos, text.length)
+            return out.toString()
         }
 
         /**

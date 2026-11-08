@@ -512,7 +512,9 @@ class VyzeCoreControllerRouteTest {
         val spans = VyzeCoreController.companionBuildRecitalSpans(labelOcr)
         assertEquals(3, spans.size)
         assertFalse(spans[0].needsZhVoice)
-        assertTrue(spans[0].text.contains("Daplir KITCHEN"))
+        // Lexicon corrects the brand garble (Daplir→Dapur) — the span
+        // carries corrected words while memory keeps raw OCR.
+        assertTrue(spans[0].text.contains("Dapur KITCHEN"))
         assertTrue(spans[0].text.contains("Tulen 99%"))
         assertFalse(spans[0].text.contains("\n"))
         assertEquals("味精", spans[1].text)
@@ -562,5 +564,60 @@ class VyzeCoreControllerRouteTest {
         assertEquals("Ringgit", VyzeCoreController.companionExpandRmPrices("RM"))
         assertEquals("FIRM", VyzeCoreController.companionExpandRmPrices("FIRM"))
         assertEquals("HARUM12", VyzeCoreController.companionExpandRmPrices("HARUM12"))
+    }
+
+    // ── Lexicon correction for recital spans (device 2026-11-08) ──
+    // The deterministic recital speaks OCR garble literally ("Pertambah",
+    // "Nonosodium") — too rough for label reads. Single/double-char
+    // confusions on real words get lexicon-corrected; everything else
+    // (digits, codes, CJK, ambiguous, short) passes through untouched.
+
+    @Test
+    fun `observed label garble corrects to label words`() {
+        assertEquals("Penambah", VyzeCoreController.companionCorrectWord("Pertambah"))
+        assertEquals("Tulen", VyzeCoreController.companionCorrectWord("Tuleà"))
+        assertEquals("Monosodium", VyzeCoreController.companionCorrectWord("Nonosodium"))
+        assertEquals("Glutamat", VyzeCoreController.companionCorrectWord("Gatamat"))
+        assertEquals("Dapur", VyzeCoreController.companionCorrectWord("Daplir"))
+        assertEquals("Dapur", VyzeCoreController.companionCorrectWord("Dapure"))
+    }
+
+    @Test
+    fun `correction is conservative`() {
+        // Exact words (even mixed-case garble) normalize, never change.
+        assertEquals("Penambah", VyzeCoreController.companionCorrectWord("Penambah"))
+        // No close neighbor: untouched.
+        assertEquals("Xyzzq", VyzeCoreController.companionCorrectWord("Xyzzq"))
+        // Two closest (tulen/bulan): ambiguous, untouched.
+        assertEquals("tulan", VyzeCoreController.companionCorrectWord("tulan"))
+        // Short tokens: too ambiguous to touch.
+        assertEquals("ab", VyzeCoreController.companionCorrectWord("ab"))
+        assertEquals("RM", VyzeCoreController.companionCorrectWord("RM"))
+        // Digits, codes, CJK: never word-corrected.
+        assertEquals("150g", VyzeCoreController.companionCorrectWord("150g"))
+        assertEquals("QLB3469", VyzeCoreController.companionCorrectWord("QLB3469"))
+        assertEquals("味精", VyzeCoreController.companionCorrectWord("味精"))
+    }
+
+    @Test
+    fun `casing mirrors the OCR word`() {
+        assertEquals("TULEN", VyzeCoreController.companionCorrectWord("TULEÀ"))
+        assertEquals("tulen", VyzeCoreController.companionCorrectWord("tuleà"))
+        assertEquals("Tulen", VyzeCoreController.companionCorrectWord("Tuleà"))
+    }
+
+    @Test
+    fun `recital spans speak corrected words`() {
+        val spans = VyzeCoreController.companionBuildRecitalSpans("Pertambah Perisa\nTulen 99%")
+        assertEquals(1, spans.size)
+        assertTrue(spans[0].text.contains("Penambah Perisa"))
+        assertTrue(spans[0].text.contains("Tulen 99%"))
+    }
+
+    @Test
+    fun `price expansion survives word correction`() {
+        val spans = VyzeCoreController.companionBuildRecitalSpans("Harga RM12.90")
+        assertEquals(1, spans.size)
+        assertEquals("Harga Ringgit 12.90", spans[0].text)
     }
 }
