@@ -458,7 +458,8 @@ class TTSManager private constructor(context: Context) {
                     queueMode = TextToSpeech.QUEUE_ADD,
                     onStart = null,
                     onDone = null,
-                    onError = null
+                    onError = null,
+                    voice = null
                 )
                 if (!accepted) {
                     pendingUtteranceIds.remove(utteranceId)  // Phase 1 leak fix
@@ -507,7 +508,8 @@ class TTSManager private constructor(context: Context) {
         utteranceId: String? = null,
         onStart: (() -> Unit)? = null,
         onDone: (() -> Unit)? = null,
-        onError: (() -> Unit)? = null
+        onError: (() -> Unit)? = null,
+        voice: Voice? = null
     ): Boolean {
         Log.i(TAG, "speak() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}, pendingIds=${pendingUtteranceIds.size}")
 
@@ -547,7 +549,8 @@ class TTSManager private constructor(context: Context) {
             queueMode = queueMode,
             onStart = onStart,
             onDone = onDone,
-            onError = onError
+            onError = onError,
+            voice = voice
         )
         if (!accepted) {
             // Phase 1 LEAK FIX: a rejected submission never fires terminal
@@ -609,7 +612,8 @@ class TTSManager private constructor(context: Context) {
             queueMode = TextToSpeech.QUEUE_FLUSH,
             onStart = onStart,
             onDone = onDone,
-            onError = onError
+            onError = onError,
+            voice = null
         )
         if (!accepted) {
             pendingUtteranceIds.remove(id)  // Phase 1 leak fix — see speak()
@@ -658,7 +662,8 @@ class TTSManager private constructor(context: Context) {
         queueMode: Int,
         onStart: (() -> Unit)?,
         onDone: (() -> Unit)?,
-        onError: (() -> Unit)?
+        onError: (() -> Unit)?,
+        voice: Voice?
     ): Boolean {
         val tts = engine
         if (tts == null) {
@@ -666,6 +671,24 @@ class TTSManager private constructor(context: Context) {
             return false
         }
         return try {
+            // Voice flip (CJK coverage span): setVoice immediately before
+            // this utterance queues — the rate block below then re-applies
+            // the user's rate post-flip. Skipped when already on that voice
+            // (zh-locale turns). Restore lands at the terminal event.
+            if (voice != null) {
+                try {
+                    val currentName = tts.voice?.name
+                    if (currentName != voice.name) {
+                        if (tts.setVoice(voice) == TextToSpeech.SUCCESS) {
+                            voiceFlipPriorNameById[utteranceId] = currentName ?: ""
+                        } else {
+                            Log.w(TAG, "speakWithEngine: setVoice(${voice.name}) rejected — span keeps current voice")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "speakWithEngine: setVoice failed: ${e.message}")
+                }
+            }
             // Critical-info pacing: money amounts and medication doses are
             // safety-critical for a blind user — spoken ~15% slower so the
             // figures land clearly. Rate is applied per utterance via the
@@ -722,6 +745,9 @@ class TTSManager private constructor(context: Context) {
      * immediately after stop().
      */
     fun stop() {
+        // Restore BEFORE notifyFlushed: chains submitting new speech from
+        // the flushed onError callbacks must queue under the user's voice.
+        restoreAllVoiceFlips()
         notifyFlushed()
         try {
             engine?.stop()
@@ -740,6 +766,53 @@ class TTSManager private constructor(context: Context) {
 
     /** Utterance IDs currently playing at the slowed critical-info rate. */
     private val criticalUtteranceIds = ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Voice-flip ledger: utterance ID → prior voice NAME ("" when the prior
+     * voice was unknown). Android has no per-utterance voice key — the voice
+     * is global engine state read at synthesis time — so a voice-flipped
+     * utterance (CJK coverage span) flips via setVoice and restores here at
+     * its terminal event, mirroring [criticalUtteranceIds]. CALLER CONTRACT:
+     * submit voice-flipped utterances only when nothing else is queued or
+     * speaking — a flip also re-voices already-queued speech. Idempotent:
+     * terminal dispatch, engine callbacks after stop(), and [stop] itself
+     * may all attempt the same restore.
+     */
+    private val voiceFlipPriorNameById = ConcurrentHashMap<String, String>()
+
+    /** Restore the pre-flip voice after a voice-flipped utterance ends. */
+    private fun restoreVoiceAfterFlip(id: String) {
+        val priorName = voiceFlipPriorNameById.remove(id) ?: return
+        restoreVoiceByName(priorName)
+    }
+
+    /** Restore after stop(): at most one flip is ever outstanding. */
+    private fun restoreAllVoiceFlips() {
+        if (voiceFlipPriorNameById.isEmpty()) return
+        val priorName = voiceFlipPriorNameById.values.firstOrNull() ?: ""
+        voiceFlipPriorNameById.clear()
+        restoreVoiceByName(priorName)
+    }
+
+    private fun restoreVoiceByName(priorName: String) {
+        try {
+            val tts = engine ?: return
+            val prior = if (priorName.isNotEmpty()) {
+                tts.voices?.firstOrNull { it.name == priorName }
+            } else null
+            if (prior != null) {
+                tts.setVoice(prior)
+            } else {
+                // Unknown prior (or pack removed mid-flight): fall back to
+                // the engine default for the user's locale.
+                tts.setLanguage(currentLocale)
+            }
+            // setVoice/setLanguage may reset the rate on some engines —
+            // re-apply unconditionally (one binder call per flip).
+            tts.setSpeechRate(cachedRate)
+            engineRateApplied = cachedRate
+        } catch (_: Throwable) {}
+    }
 
     /** Rate last applied to the engine (avoids redundant setSpeechRate calls). */
     private var engineRateApplied = DEFAULT_SPEECH_RATE
@@ -765,6 +838,7 @@ class TTSManager private constructor(context: Context) {
     private fun onUtteranceDone(id: String) {
         pendingUtteranceIds.remove(id)
         restoreNormalRateAfterCritical(id)
+        restoreVoiceAfterFlip(id)
         val callbacks = utteranceCallbacks.remove(id)
         try { onUtteranceCompleted?.invoke(id) } catch (_: Throwable) {}
         try { callbacks?.onDone?.invoke() } catch (e: Throwable) {
@@ -776,6 +850,7 @@ class TTSManager private constructor(context: Context) {
     private fun onUtteranceError(id: String) {
         pendingUtteranceIds.remove(id)
         restoreNormalRateAfterCritical(id)
+        restoreVoiceAfterFlip(id)
         val callbacks = utteranceCallbacks.remove(id)
         try { callbacks?.onError?.invoke() } catch (e: Throwable) {
             Log.w(TAG, "onUtteranceError: callback error: ${e.message}")
@@ -901,6 +976,25 @@ class TTSManager private constructor(context: Context) {
         } catch (e: Throwable) {
             Log.w(TAG, "getInstalledVoicesForCurrentLanguage failed: ${e.message}")
             emptyList()
+        }
+    }
+
+    /**
+     * First installed OFFLINE Chinese voice ("zh" covers zh-CN/zh-TW/zh-HK),
+     * or null when none. Feeds the CJK coverage span's voice flip — the span
+     * must stay audible even when the user's locale is en/ms. Never triggers
+     * a network voice: fully offline.
+     */
+    fun zhVoiceOrNull(): Voice? {
+        val tts = engine ?: return null
+        return try {
+            tts.voices?.firstOrNull { voice ->
+                !voice.isNetworkConnectionRequired &&
+                    voice.locale.language == "zh"
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "zhVoiceOrNull failed: ${e.message}")
+            null
         }
     }
 

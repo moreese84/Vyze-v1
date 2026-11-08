@@ -1,6 +1,8 @@
 package com.vyze.app.core
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -260,5 +262,170 @@ class VyzeCoreControllerRouteTest {
                 currencyActive = false, bankCardActive = false
             )
         )
+    }
+
+    // ── CJK coverage net: OCR Han runs missing from a read answer ──
+    // (2026-11-08, GT 50 Pro: Malay answer fluent, OCR-captured 味精
+    // dropped from the answer — not truncation, ~30/1024 tokens used.)
+
+    @Test
+    fun `ms read missing OCR Han appends Malay bridge plus span`() {
+        val missingAppend = VyzeCoreController.companionCjkCoverage(
+            cleanedResponse = "Serbuk perasa yang lazat.",
+                ocrText = "SERBUK PERASA\n味精\nHALAL",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        assertEquals("dan dalam Bahasa Cina:", missingAppend?.bridge)
+        assertEquals("味精", missingAppend?.span)
+    }
+
+    @Test
+    fun `covered span is not repeated`() {
+        assertNull(
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "Serbuk perasa 味精 yang lazat.",
+                ocrText = "SERBUK PERASA\n味精",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        )
+    }
+
+    @Test
+    fun `ocr without Han yields nothing`() {
+        assertNull(
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "Serbuk perasa yang lazat.",
+                ocrText = "SERBUK PERASA\nHALAL",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        )
+    }
+
+    @Test
+    fun `non-read echo and refusal turns never append`() {
+        // Tap-to-describe: scene lane, no OCR baseline to append.
+        assertNull(
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "A packet sits on the table.",
+                ocrText = "味精",
+                language = "en",
+                textReadActive = false,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        )
+        // Echo fallback: the verbatim recital already contains the span.
+        assertNull(
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "SERBUK PERASA 味精",
+                ocrText = "SERBUK PERASA 味精",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = true
+            )
+        )
+        // Refusal: appending a span would contradict "unclear".
+        assertNull(
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "Text is unclear.",
+                ocrText = "味精",
+                language = "en",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        )
+    }
+
+    @Test
+    fun `money card id medicineMiss and date lanes never append`() {
+        val base = { flag: String ->
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "Sepuluh ringgit.",
+                ocrText = "味精",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = flag == "currency",
+                bankCardActive = flag == "card",
+                sensitiveIdActive = flag == "id",
+                medicineMissActive = flag == "medicine",
+                dateActive = flag == "date",
+                echoOnly = false
+            )
+        }
+        assertNull(base("currency"))
+        assertNull(base("card"))
+        assertNull(base("id"))
+        assertNull(base("medicine"))
+        assertNull(base("date"))
+    }
+
+    @Test
+    fun `bridges localize per language with English fallback`() {
+        val cover = { lang: String ->
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = "Seasoning powder.",
+                ocrText = "味精",
+                language = lang,
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        }
+        assertEquals("and in Chinese:", cover("en")?.bridge)
+        assertEquals("dan dalam Bahasa Cina:", cover("ms")?.bridge)
+        assertEquals("还有中文：", cover("zh")?.bridge)
+        assertEquals("and in Chinese:", cover("ta")?.bridge)
+    }
+
+    @Test
+    fun `multiple runs join in OCR order with single chars kept`() {
+        val multiAppend = VyzeCoreController.companionCjkCoverage(
+            cleanedResponse = "Serbuk perasa.",
+                ocrText = "成分：味精，酱油，酒",
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        assertEquals("dan dalam Bahasa Cina:", multiAppend?.bridge)
+        assertEquals("成分 味精 酱油 酒", multiAppend?.span)
+    }
+
+    @Test
+    fun `null blank OCR and blank answers yield nothing`() {
+        val cover = { cleaned: String, ocr: String? ->
+            VyzeCoreController.companionCjkCoverage(
+                cleanedResponse = cleaned,
+                ocrText = ocr,
+                language = "ms",
+                textReadActive = true,
+                currencyActive = false, bankCardActive = false,
+                sensitiveIdActive = false, medicineMissActive = false,
+                dateActive = false, echoOnly = false
+            )
+        }
+        assertNull(cover("Serbuk perasa.", null))
+        assertNull(cover("Serbuk perasa.", "  "))
+        assertNull(cover("", "味精"))
+        assertNull(cover("   ", "味精"))
     }
 }

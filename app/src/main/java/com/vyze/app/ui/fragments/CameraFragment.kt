@@ -583,16 +583,69 @@ class CameraFragment : Fragment() {
                                 maybeOpenFollowUpWindow()
                             } else if (coreController.isStreamingActive()) {
                                 Log.d(TAG, "Streaming active — waiting for TTS queue to drain")
+                                val turnSession = coreController.getActiveSessionId()
                                 waitForTtsDrain {
-                                    appState = AppState.IDLE
-                                    Log.d(TAG, "TTS drain complete — post-answer state")
-                                    maybeOpenFollowUpWindow()
+                                    // Post-drain CJK chain: the queue is empty,
+                                    // so the span's voice flip cannot re-voice
+                                    // anything else (the flip is global engine
+                                    // state). Session-guarded: a barge-in starts
+                                    // a new session and the stale chain stays
+                                    // silent.
+                                    val drainCoverage = coreController.coverageForTurn()
+                                    val drainZhVoice = drainCoverage?.let { coreController.zhVoiceOrNull() }
+                                    if (drainCoverage != null && drainZhVoice != null &&
+                                        coreController.getActiveSessionId() == turnSession
+                                    ) {
+                                        mainActivity.speakThenCallback(drainCoverage.bridge) {
+                                            if (coreController.getActiveSessionId() != turnSession) return@speakThenCallback
+                                            mainActivity.speakThenCallback(
+                                                drainCoverage.span, voice = drainZhVoice,
+                                                onDone = {
+                                                    if (coreController.getActiveSessionId() != turnSession) return@speakThenCallback
+                                                    appState = AppState.IDLE
+                                                    Log.d(TAG, "TTS drain + CJK span complete — post-answer state")
+                                                    maybeOpenFollowUpWindow()
+                                                }
+                                            )
+                                        }
+                                    } else {
+                                        appState = AppState.IDLE
+                                        Log.d(TAG, "TTS drain complete — post-answer state")
+                                        maybeOpenFollowUpWindow()
+                                    }
                                 }
                             } else {
-                                mainActivity.speakThenCallback(response) {
+                                // CJK coverage chain: response+bridge ride one
+                                // utterance (same voice); the Han span follows
+                                // on completion with the zh voice so the
+                                // follow-up mic waits for it. Duplicate turns
+                                // return before this branch (stay silent).
+                                // Session-guarded: a barge-in starts a new
+                                // session and the stale chain stays silent.
+                                val postAnswer: () -> Unit = {
                                     appState = AppState.IDLE
                                     Log.d(TAG, "Response spoken — post-answer state")
                                     maybeOpenFollowUpWindow()
+                                }
+                                val turnSession = coreController.getActiveSessionId()
+                                val coverage = coreController.coverageForTurn()
+                                val zhVoice = coverage?.let { coreController.zhVoiceOrNull() }
+                                if (coverage != null && zhVoice != null) {
+                                    mainActivity.speakThenCallback("${response.trimEnd()} ${coverage.bridge}") {
+                                        if (coreController.getActiveSessionId() != turnSession) return@speakThenCallback
+                                        mainActivity.speakThenCallback(
+                                            coverage.span, voice = zhVoice,
+                                            onDone = {
+                                                if (coreController.getActiveSessionId() != turnSession) return@speakThenCallback
+                                                postAnswer()
+                                            }
+                                        )
+                                    }
+                                } else {
+                                    if (coverage != null) {
+                                        Log.d(TAG, "CJK coverage skipped: no offline zh voice")
+                                    }
+                                    mainActivity.speakThenCallback(response) { postAnswer() }
                                 }
                             }
                         } else {

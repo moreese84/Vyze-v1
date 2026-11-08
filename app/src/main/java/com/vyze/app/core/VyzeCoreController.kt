@@ -13,6 +13,7 @@ import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
 import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.InteractionLogRow
@@ -128,6 +129,23 @@ class VyzeCoreController(
      */
     @Volatile
     private var textReadQueryActive = false
+
+    /**
+     * OCR text of the current turn (set at the OCR capture site, nulled for
+     * non-read turns at trigger time). Read at completion by the CJK
+     * coverage net. Cleared at completion (drop the big string ASAP) and at
+     * resetForNewCapture.
+     */
+    @Volatile
+    private var activeOcrText: String? = null
+
+    /**
+     * CJK coverage appendix computed at completion (null when the net does
+     * not fire). Read by the fragment for the non-streaming speech chain
+     * (see [coverageForTurn]); cleared at the next resetForNewCapture.
+     */
+    @Volatile
+    private var lastCoverage: CjkCoverage? = null
 
     /**
      * Timestamp of the last inference activity (token received). The
@@ -635,6 +653,30 @@ class VyzeCoreController(
                     } else {
                         deliveredResponse
                     }
+                    // ── CJK COVERAGE NET (live 2026-11-08) ────
+                    // Han runs the OCR captured but the read-turn answer
+                    // dropped are appended after the answer instead of
+                    // vanishing. Both lanes speak via the fragment chain
+                    // (response+bridge, then the span with the zh voice):
+                    // the flip is global engine state, so the span submits
+                    // only on an empty queue (post-response-terminal /
+                    // post-drain) — see the voice-flip contract.
+                    lastCoverage = companionCjkCoverage(
+                        cleanedResponse = cleanedResponse,
+                        ocrText = activeOcrText,
+                        language = activeUserLocale.language,
+                        textReadActive = textReadQueryActive,
+                        currencyActive = currencyModeActive,
+                        bankCardActive = bankCardModeActive,
+                        sensitiveIdActive = sensitiveIdModeActive,
+                        medicineMissActive = medicineMissModeActive,
+                        dateActive = dateModeActive,
+                        echoOnly = echoOnly
+                    )
+                    val coverage = lastCoverage
+                    if (coverage != null) {
+                        CrashLogFile.log(TAG, "CJK coverage: bridge='${coverage.bridge}' span='${coverage.span}' streaming=$firstChunkSent")
+                    }
                     flushRemainingSentenceBuffer()
                     scope.launch {
                         try {
@@ -681,6 +723,9 @@ class VyzeCoreController(
                         medicineMissModeActive = false
                         dateModeActive = false
                         textReadQueryActive = false
+                        // Drop the OCR string ASAP; lastCoverage survives for
+                        // the fragment's non-streaming chain (next reset clears).
+                        activeOcrText = null
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
@@ -1432,6 +1477,8 @@ class VyzeCoreController(
         medicineMissModeActive = false
         dateModeActive = false
         textReadQueryActive = false
+        activeOcrText = null
+        lastCoverage = null
         // A deliberate user action invalidates the continuous-mode scene
         // baseline — the next auto-capture should describe fresh.
         lastContinuousEmbedding = null
@@ -1557,6 +1604,9 @@ class VyzeCoreController(
         // Text-vs-object refusal swap reads this at completion: narrow
         // read verbs only — taps/pointing stay object questions.
         textReadQueryActive = isTextExtractionQuery(query)
+        // CJK coverage net: nulled per trigger; the OCR stage sets it only
+        // when this turn actually runs OCR (non-read lanes keep null).
+        activeOcrText = null
 
         // ── RECOVERY-CUE ARMING (implicit failure detection) ──────
         // A spoken recovery cue ("please say that again") means the
@@ -1842,6 +1892,7 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "Text query detected — running ML Kit OCR...")
                     val ocrResult = ocrHelper.extractTextWithConfidence(inferenceBitmap)
                     ocrText = ocrResult.first
+                    activeOcrText = ocrText
                     ocrConfidence = ocrResult.second
                     CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
 
@@ -3190,6 +3241,16 @@ class VyzeCoreController(
 
     fun isStreamingActive(): Boolean = firstChunkSent
 
+    /**
+     * CJK coverage appendix for the just-completed turn (null when the net
+     * did not fire). The fragment chains bridge+span speech behind the
+     * delivered answer on the non-streaming path.
+     */
+    fun coverageForTurn(): CjkCoverage? = lastCoverage
+
+    /** Offline Chinese TTS voice for the coverage span, null when none. */
+    fun zhVoiceOrNull(): Voice? = ttsManager.zhVoiceOrNull()
+
     fun isDuplicateDescription(response: String): Boolean {
         val normalized = response.trim().lowercase()
         if (normalized.isBlank()) return false
@@ -3987,6 +4048,60 @@ class VyzeCoreController(
         ): Boolean {
             if (textReadActive || currencyActive || bankCardActive) return false
             return NonAnswerRefusal.isTextRefusal(cleanedResponse)
+        }
+
+        /** Han-script runs (CJK Unified + Extension A). Kana/Hangul excluded:
+         *  Malaysian-packaging CJK is near-always Han. */
+        private val cjkRunRegex = Regex("[\\u3400-\\u4DBF\\u4E00-\\u9FFF]+")
+
+        /**
+         * CJK coverage net: Han-script runs the OCR captured but the read-turn
+         * answer dropped are appended after the answer ("…answer. dan dalam
+         * Bahasa Cina: 味精") instead of vanishing silently. Device evidence
+         * (2026-11-08, GT 50 Pro): Malay answer fluent, OCR-captured 味精
+         * missing from the answer — not truncation (~30/1024 tokens used).
+         *
+         * Gates: read turns only; currency/card/ID/medicine-miss/date lanes
+         * keep their pinned contracts; echo turns already recite the span
+         * verbatim; refusals must not gain a contradicting span. Runs already
+         * present in the answer (substring) are not repeated; the rest join
+         * in OCR order. Pure — JVM-tested in VyzeCoreControllerRouteTest.
+         */
+        data class CjkCoverage(val bridge: String, val span: String)
+
+        fun companionCjkCoverage(
+            cleanedResponse: String,
+            ocrText: String?,
+            language: String,
+            textReadActive: Boolean,
+            currencyActive: Boolean,
+            bankCardActive: Boolean,
+            sensitiveIdActive: Boolean,
+            medicineMissActive: Boolean,
+            dateActive: Boolean,
+            echoOnly: Boolean,
+        ): CjkCoverage? {
+            if (!textReadActive) return null
+            if (currencyActive || bankCardActive || sensitiveIdActive ||
+                medicineMissActive || dateActive
+            ) return null
+            if (echoOnly) return null
+            if (cleanedResponse.isBlank() || ocrText.isNullOrBlank()) return null
+            if (NonAnswerRefusal.isNonAnswer(cleanedResponse) ||
+                NonAnswerRefusal.isTextRefusal(cleanedResponse)
+            ) return null
+            val missing = cjkRunRegex.findAll(ocrText)
+                .map { it.value }
+                .filter { run -> !cleanedResponse.contains(run) }
+                .distinct()
+                .toList()
+            if (missing.isEmpty()) return null
+            val bridge = when (language.lowercase()) {
+                "ms" -> "dan dalam Bahasa Cina:"
+                "zh" -> "还有中文："
+                else -> "and in Chinese:"
+            }
+            return CjkCoverage(bridge, missing.joinToString(" "))
         }
 
         /**

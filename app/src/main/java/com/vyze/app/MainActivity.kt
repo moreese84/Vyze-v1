@@ -23,6 +23,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
 import android.text.TextUtils
 import android.util.Log
 import android.widget.ScrollView
@@ -442,7 +443,7 @@ class MainActivity : AppCompatActivity() {
      * phantom query. Callbacks now register per-utterance inside TTSManager
      * and can never cross-deliver.
      */
-    fun speakThenCallback(text: String, onDone: () -> Unit) {
+    fun speakThenCallback(text: String, voice: Voice? = null, onDone: () -> Unit) {
         if (!ttsReady || text.isBlank()) {
             onDone()
             return
@@ -466,7 +467,8 @@ class MainActivity : AppCompatActivity() {
             text,
             TextToSpeech.QUEUE_FLUSH,
             onDone = deliver,
-            onError = deliver
+            onError = deliver,
+            voice = voice
         )
         Log.d(TAG, "speakThenCallback: submission ${if (accepted) "OK" else "REJECTED (onDone already delivered)"}")
     }
