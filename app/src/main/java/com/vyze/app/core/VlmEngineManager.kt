@@ -29,6 +29,7 @@ import com.google.ai.edge.litertlm.SamplerConfig
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -156,6 +157,19 @@ class VlmEngineManager(
      */
     @Volatile
     private var activeBrain: BrainModel? = null
+
+    /**
+     * True when the most recent [initialize] failed because the brain's
+     * model file was missing from every searched location (whole-app
+     * audit P2 #34). Lets the controller speak missing-file guidance
+     * instead of the generic "check your connection" sentence. Reset at
+     * every init start; only the missing-file branch sets it.
+     */
+    @Volatile
+    private var lastInitMissedModelFile = false
+
+    /** See [lastInitMissedModelFile]. */
+    fun didLastInitMissModelFile(): Boolean = lastInitMissedModelFile
 
     /** Brain for inference-time seams; prod default until init resolves the file. */
     private fun brainForTurn(): BrainModel = activeBrain ?: BrainModel.PROD_DEFAULT
@@ -357,6 +371,21 @@ class VlmEngineManager(
 
     // Callbacks for UI updates
     var onTokenGenerated: ((String, String) -> Unit)? = null  // (token, sessionId)
+
+    /**
+     * First-token timing hook for the CURRENT turn only (audit P3 #66).
+     * analyzeImage/analyzeText used to WRAP [onTokenGenerated] per turn
+     * and never restore it: closures nested unboundedly (one per turn,
+     * retained forever) and every token traversed all prior turns'
+     * wrappers. Worse, cancel-then-start overlaps (cancelInference never
+     * joins) mean a finally-restore could resurrect a STALE wrapper or
+     * clobber a newer turn's. The hook inverts that: each turn installs
+     * its own lambda, the dispatch site fires it, and the turn's finally
+     * clears it ONLY if it is still installed (a newer turn wins ties).
+     * Clearing-to-null can never resurrect anything.
+     */
+    @Volatile
+    private var firstTokenHook: ((sid: String) -> Unit)? = null
     var onComplete: ((String, String) -> Unit)? = null         // (response, sessionId)
     var onError: ((String, String) -> Unit)? = null            // (error, sessionId)
     var onModelCopyProgress: ((copied: Long, total: Long) -> Unit)? = null
@@ -494,6 +523,9 @@ class VlmEngineManager(
     suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) return@withContext true
 
+        // P2 #34: every init starts unflagged; only the missing-file branch sets it.
+        lastInitMissedModelFile = false
+
         CrashLogFile.log(TAG, "=== INIT START (tiered) ===")
 
         // ── Tier 0: VLM bypassed entirely (< ~4GB RAM) ───────────────
@@ -585,10 +617,15 @@ class VlmEngineManager(
 
             val modelFile = resolveModelFile(brain)
             if (modelFile == null) {
-                val errorMsg = buildModelNotFoundError(brain)
-                Log.e(TAG, errorMsg)
-                CrashLogFile.logError(TAG, errorMsg)
-                onError?.invoke(errorMsg, "")
+                // The full paths+adb dump stays dev-facing (logcat + crash
+                // log). The user-facing onError carries ONE short line —
+                // LoadingFragment displays it and keys its sideload hint
+                // off "not found" (audit P2 #34).
+                val diagnostic = buildModelNotFoundError(brain)
+                Log.e(TAG, diagnostic)
+                CrashLogFile.logError(TAG, diagnostic)
+                lastInitMissedModelFile = true
+                onError?.invoke(companionModelMissingUserMessage(brain), "")
                 return@withContext false
             }
 
@@ -1975,6 +2012,8 @@ class VlmEngineManager(
         }
 
         var scaledBitmap: Bitmap? = null
+        // P3 #66: hoisted so the finally below can identity-check it.
+        var imageFirstTokenHook: ((String) -> Unit)? = null
         try {
             val startTime = System.currentTimeMillis()
             var tPreprocess = 0L
@@ -1983,6 +2022,7 @@ class VlmEngineManager(
             var tLane = 0L
             var tPrefill = 0L
             var firstTokenAt = 0L
+            var generationStartMs = 0L
             CrashLogFile.log(TAG, "=== ANALYZE IMAGE [PROFILED][brain=${brainForTurn().displayName}] ===")
             CrashLogFile.log(TAG, "Input bitmap: ${bitmap.width}x${bitmap.height}")
 
@@ -2023,7 +2063,7 @@ class VlmEngineManager(
             // inference so any prompt change is an A/B measurement, not a
             // guess. Baseline before prompt slimming: ~3,300 chars on the
             // continuous image lane (GPU prefill 8.0-8.1 s steady).
-            CrashLogFile.log(TAG, "Formatted prompt (${formattedPrompt.length} chars): ${formattedPrompt.take(120)}...")
+            CrashLogFile.logContent(TAG, "Formatted prompt (${formattedPrompt.length} chars): ${formattedPrompt.take(120)}...")
 
             // 4. Build multimodal contents — formatted prompt text + clamped bitmap.
             //    The native engine binds image patch tokens from Content.ImageBytes
@@ -2037,18 +2077,27 @@ class VlmEngineManager(
             //    interrupt-safe close all live in runConversation (one place for
             //    the image, text-only, and audio paths).
             // PROFILING: the first onTokenGenerated arrival marks the end of
-            // PREFILL (image encode + prompt ingest + vision tower) and the
-            // start of DECODE — the boundary we have never been able to see
-            // from outside. tLane covers the mutex/drain wait inside
-            // runConversation; [PREFILL-T0] arrives from the callback below.
-            stageStart = System.currentTimeMillis()
+            // PREFILL (native image encode + prompt ingest + vision tower)
+            // and the start of DECODE. Lane-wait (dispatcher queue + mutex
+            // + drain + GC + setup) ends at the generation-start instant
+            // stamped by runConversation's hook — the two were previously
+            // measured as one quantity and printed under both names (#67).
+            val conversationStartMs = System.currentTimeMillis()
             val firstTokenFlag = booleanArrayOf(false)
-            val outerCallback = onTokenGenerated
-            onTokenGenerated = { token, sid ->
+            // P3 #66: install THIS turn's timing hook (cleared in the
+            // finally below; the controller callback is never wrapped).
+            imageFirstTokenHook = { sid ->
                 if (!firstTokenFlag[0] && sid == sessionId) {
                     firstTokenFlag[0] = true
                     firstTokenAt = System.currentTimeMillis()
-                    tPrefill = firstTokenAt - (startTime + tPreprocess + tJpeg + tPayload + tLane)
+                    val firstSplit = companionSplitInferenceTiming(
+                        stageStartMs = conversationStartMs,
+                        generationStartMs = generationStartMs,
+                        firstTokenAtMs = firstTokenAt,
+                        endMs = firstTokenAt
+                    )
+                    tLane = firstSplit.laneMs
+                    tPrefill = firstSplit.prefillMs
                     CrashLogFile.log(
                         TAG,
                         InferenceBreakdown(
@@ -2061,7 +2110,7 @@ class VlmEngineManager(
                             tPayload = tPayload,
                             tLane = tLane,
                             tPrefill = tPrefill,
-                            decodeSoFarMs = firstTokenAt - startTime - tPrefill - tLane,
+                            decodeSoFarMs = 0L,
                             decodeMs = 0L,
                             streamedFirstToken = true,
                             promptChars = 0,
@@ -2069,21 +2118,26 @@ class VlmEngineManager(
                         ).formatPipeline()
                     )
                 }
-                outerCallback?.invoke(token, sid)
             }
-            val response = runConversation(contents, maxTokens, sessionId)
-            tLane = System.currentTimeMillis() - stageStart -
-                (if (firstTokenFlag[0]) (System.currentTimeMillis() - firstTokenAt) else 0)
+            firstTokenHook = imageFirstTokenHook
+            val response = runConversation(
+                contents, maxTokens, sessionId,
+                onGenerationStart = { generationStartMs = it }
+            )
             val elapsed = System.currentTimeMillis() - startTime
-            // DECODE duration: wall time from the FIRST streamed token to the
-            // completed response. The old template printed a hardcoded
-            // "EOF" placeholder here regardless of outcome — misleading,
-            // because "EOF" reads like a decode-terminated-anomaly instead
-            // of a label. Also: when NO token ever streamed (full response
-            // delivered as one terminal message), the first-token callback
-            // never fired and tPrefill stays 0 — report that honestly.
-            val decodeMs =
-                if (firstTokenFlag[0]) elapsed - (firstTokenAt - startTime) else 0L
+            // Same split at completion: lane/prefill repeat the PIPELINE
+            // values, decode covers first-token→done. When NO token ever
+            // streamed (full response as one terminal message), prefill
+            // and decode stay 0 — reported honestly.
+            val endSplit = companionSplitInferenceTiming(
+                stageStartMs = conversationStartMs,
+                generationStartMs = generationStartMs,
+                firstTokenAtMs = firstTokenAt,
+                endMs = startTime + elapsed
+            )
+            tLane = endSplit.laneMs
+            tPrefill = endSplit.prefillMs
+            val decodeMs = endSplit.decodeMs
             CrashLogFile.log(
                 TAG,
                 InferenceBreakdown(
@@ -2117,6 +2171,10 @@ class VlmEngineManager(
             onError?.invoke("Inference error: ${e.message}", sessionId)
             null
         } finally {
+            // Audit P3 #66: clear OUR timing hook (guarded: only when
+            // still installed — a newer overlapped turn wins ties, and
+            // clearing-to-null can never resurrect a stale wrapper).
+            if (firstTokenHook === imageFirstTokenHook) firstTokenHook = null
             // Explicitly recycle the scaled bitmap to free memory after inference
             try {
                 if (scaledBitmap != null && !scaledBitmap.isRecycled) {
@@ -2156,43 +2214,56 @@ class VlmEngineManager(
         val textStartMs = System.currentTimeMillis()
         val textFirstTokenFlag = booleanArrayOf(false)
         var textFirstTokenAt = 0L
-        val textOuterCallback = onTokenGenerated
-        onTokenGenerated = { token, sid ->
+        var textGenerationStartMs = 0L
+        // P3 #66: install THIS turn's timing hook (same hook design as
+        // analyzeImage; cleared in the finally below).
+        val textFirstTokenHook: (String) -> Unit = { sid ->
             if (!textFirstTokenFlag[0] && sid == sessionId) {
                 textFirstTokenFlag[0] = true
                 textFirstTokenAt = System.currentTimeMillis()
             }
-            textOuterCallback?.invoke(token, sid)
         }
-        val textResponse = runConversation(
-            contents = Contents.of(Content.Text(formattedPrompt)),
-            maxTokens = maxTokens,
-            sessionId = sessionId
-        )
-        val textElapsed = System.currentTimeMillis() - textStartMs
-        val textPrefill = if (textFirstTokenFlag[0]) textFirstTokenAt - textStartMs else 0L
-        val textDecode =
-            if (textFirstTokenFlag[0]) textElapsed - (textFirstTokenAt - textStartMs) else 0L
-        CrashLogFile.log(
-            TAG,
-            InferenceBreakdown(
-                backend = activeBackend,
-                tier = deviceProfile.tier.name,
-                threads = cpuThreadCount(),
-                totalMs = textElapsed,
-                tPreprocess = 0L,
-                tJpeg = 0L,
-                tPayload = 0L,
-                tLane = 0L,
-                tPrefill = textPrefill,
-                decodeSoFarMs = 0L,
-                decodeMs = textDecode,
-                streamedFirstToken = textFirstTokenFlag[0],
-                promptChars = formattedPrompt.length,
-                outChars = textResponse?.length ?: 0,
-            ).formatText()
-        )
-        textResponse
+        firstTokenHook = textFirstTokenHook
+        try {
+            val textResponse = runConversation(
+                contents = Contents.of(Content.Text(formattedPrompt)),
+                maxTokens = maxTokens,
+                sessionId = sessionId,
+                onGenerationStart = { textGenerationStartMs = it }
+            )
+            val textElapsed = System.currentTimeMillis() - textStartMs
+            // Same lane/prefill split as the image lane (#67): the old
+            // firstToken - start reported lane-wait AS prefill.
+            val textSplit = companionSplitInferenceTiming(
+                stageStartMs = textStartMs,
+                generationStartMs = textGenerationStartMs,
+                firstTokenAtMs = textFirstTokenAt,
+                endMs = textStartMs + textElapsed
+            )
+            CrashLogFile.log(
+                TAG,
+                InferenceBreakdown(
+                    backend = activeBackend,
+                    tier = deviceProfile.tier.name,
+                    threads = cpuThreadCount(),
+                    totalMs = textElapsed,
+                    tPreprocess = 0L,
+                    tJpeg = 0L,
+                    tPayload = 0L,
+                    tLane = textSplit.laneMs,
+                    tPrefill = textSplit.prefillMs,
+                    decodeSoFarMs = 0L,
+                    decodeMs = textSplit.decodeMs,
+                    streamedFirstToken = textFirstTokenFlag[0],
+                    promptChars = formattedPrompt.length,
+                    outChars = textResponse?.length ?: 0,
+                ).formatText()
+            )
+            textResponse
+        } finally {
+            // Audit P3 #66: clear OUR hook only (a newer turn wins ties).
+            if (firstTokenHook === textFirstTokenHook) firstTokenHook = null
+        }
     }
 
     /**
@@ -2313,15 +2384,17 @@ class VlmEngineManager(
     private suspend fun runConversation(
         contents: Contents,
         maxTokens: Int,
-        sessionId: String
+        sessionId: String,
+        onGenerationStart: ((Long) -> Unit)? = null
     ): String? = inferenceLane.lane {
-        runConversationInLane(contents, maxTokens, sessionId)
+        runConversationInLane(contents, maxTokens, sessionId, onGenerationStart)
     }
 
     private suspend fun runConversationInLane(
         contents: Contents,
         maxTokens: Int,
-        sessionId: String
+        sessionId: String,
+        onGenerationStart: ((Long) -> Unit)? = null
     ): String? {
         val eng = engine
         if (eng == null || !isInitialized) {
@@ -2359,7 +2432,7 @@ class VlmEngineManager(
             generationFinished = turnFinished
 
             try {
-                runConversationLocked(contents, maxTokens, sessionId, turnFinished)
+                runConversationLocked(contents, maxTokens, sessionId, turnFinished, onGenerationStart)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Job cancelled while waiting on the drain (or during setup) —
                 // propagate so the inference ends silently, and leave
@@ -2401,7 +2474,8 @@ class VlmEngineManager(
         contents: Contents,
         maxTokens: Int,
         sessionId: String,
-        turnFinished: CompletableDeferred<Unit>
+        turnFinished: CompletableDeferred<Unit>,
+        onGenerationStart: ((Long) -> Unit)? = null
     ): String? {
         val eng = engine
         if (eng == null || !isInitialized) {
@@ -2440,6 +2514,9 @@ class VlmEngineManager(
                             val text = message.toString()
                             if (text.isNotEmpty()) {
                                 responseBuilder.append(text)
+                                // P3 #66: per-turn timing hook BEFORE
+                                // delivery (the old wrapper's order).
+                                firstTokenHook?.invoke(sessionId)
                                 onTokenGenerated?.invoke(text, sessionId)
                             }
                         } catch (e: Throwable) {
@@ -2461,6 +2538,11 @@ class VlmEngineManager(
                     }
                 }
 
+                // TIMING HOOK (#67): stamp the instant native generation
+                // starts so callers can split lane-wait (dispatcher queue
+                // + mutex + drain + GC + setup) from true prefill (native
+                // image encode + prompt ingest + first token).
+                onGenerationStart?.invoke(System.currentTimeMillis())
                 conversation.sendMessageAsync(contents, callback)
 
                 // Wait for completion (max 180s — Gemma 3n E2B int4 at 3.66GB)
@@ -2522,7 +2604,7 @@ class VlmEngineManager(
                 }
 
                 Log.i(TAG, "Inference complete: ${fullResponse.length} chars [backend=$activeBackend]")
-                CrashLogFile.log(TAG, "Response: ${fullResponse.take(200)}...")
+                CrashLogFile.logContent(TAG, "Response: ${fullResponse.take(200)}...")
 
                 onComplete?.invoke(fullResponse, sessionId)
                 CrashLogFile.exportToDownloads(context)
@@ -3049,6 +3131,16 @@ class VlmEngineManager(
     // ── Cleanup ────────────────────────────────────────────────────
 
     override fun close() {
+        // Teardown order matters (#54): stop new work first. In-flight
+        // background builds hold wake locks and publish engines, so they
+        // must unwind (their finallys release the locks) instead of
+        // publishing into a closed manager. Single-shot by construction —
+        // the scope is a val, and callers drop the manager after close.
+        try {
+            scope.cancel()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error cancelling engine scope: ${e.message}")
+        }
         try {
             engine?.close()
         } catch (e: Throwable) {
@@ -3067,6 +3159,13 @@ class VlmEngineManager(
             Log.w(TAG, "Error closing parked GPU engine: ${e.message}")
         }
         pendingGpuEngine = null
+        // Same for a parked fresh-state engine awaiting its quiet swap.
+        try {
+            pendingFreshEngine?.close()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error closing parked fresh-state engine: ${e.message}")
+        }
+        pendingFreshEngine = null
     }
 
     // ── Companion ──────────────────────────────────────────────────
@@ -3101,6 +3200,16 @@ class VlmEngineManager(
          */
         @Volatile
         var cpuThreadCountOverride: Int? = null
+
+        /**
+         * One-line user-facing message for a missing model file (audit P2
+         * #34): names the brain, keeps the "not found" substring
+         * LoadingFragment keys its sideload hint off, and carries no
+         * paths, no adb, no raw filename. Companion so JVM unit tests pin
+         * it without constructing the engine.
+         */
+        internal fun companionModelMissingUserMessage(brain: BrainModel): String =
+            "${brain.displayName} model file not found."
 
         /**
          * Pure Gemma 4 turn-format builder (companion so JVM unit tests can
@@ -3680,7 +3789,11 @@ internal data class InferenceBreakdown(
     val tPayload: Long,
     val tLane: Long,
     val tPrefill: Long,
-    /** Wall decode at first-token time — PIPELINE line only. */
+    /**
+     * Always 0: decode starts AT the first token, so nothing has decoded
+     * when the PIPELINE line prints (it once carried the preprocess sum
+     * under this name — #67). Kept for line-format stability.
+     */
     val decodeSoFarMs: Long,
     /** Final decode duration — ANALYZE/TEXT lines. */
     val decodeMs: Long,
@@ -3708,6 +3821,39 @@ internal data class InferenceBreakdown(
 
     private fun noStreamNote(): String =
         if (streamedFirstToken) "" else " (no streamed token — single-message response)"
+}
+
+/**
+ * One inference run's lane/prefill/decode split in ms. Lane covers
+ * everything before native generation starts (dispatcher queue + mutex
+ * + drain + GC + conversation setup); prefill covers native image
+ * encode + prompt ingest + first token; decode covers first token to
+ * completion. Parts sum to the measured conversation wall.
+ */
+internal data class InferenceTiming(val laneMs: Long, val prefillMs: Long, val decodeMs: Long)
+
+/**
+ * Split the conversation wall into lane/prefill/decode off three
+ * instants (audit P2 #67, 2026-11-09). Zero generation-start (native
+ * send never ran) zeroes the lane; zero first-token (single-message
+ * response) zeroes prefill and decode while keeping the lane. Pure —
+ * JVM-tested in InferenceBreakdownTest.
+ */
+internal fun companionSplitInferenceTiming(
+    stageStartMs: Long,
+    generationStartMs: Long,
+    firstTokenAtMs: Long,
+    endMs: Long
+): InferenceTiming {
+    val laneMs = (generationStartMs - stageStartMs).coerceAtLeast(0L)
+    if (firstTokenAtMs <= 0L || generationStartMs <= 0L) {
+        return InferenceTiming(laneMs, 0L, 0L)
+    }
+    return InferenceTiming(
+        laneMs = laneMs,
+        prefillMs = (firstTokenAtMs - generationStartMs).coerceAtLeast(0L),
+        decodeMs = (endMs - firstTokenAtMs).coerceAtLeast(0L)
+    )
 }
 
 internal enum class DeviceTier(val label: String) {

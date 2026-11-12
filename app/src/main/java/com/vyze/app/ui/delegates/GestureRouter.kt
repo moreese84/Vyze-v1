@@ -16,8 +16,13 @@ import android.view.MotionEvent
 import android.view.View
 import com.vyze.app.R
 import com.vyze.app.data.ScanRepository
-import kotlinx.coroutines.MainScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Handles all gesture-to-action routing for the camera screen.
@@ -52,6 +57,14 @@ class GestureRouter(
     private lateinit var gestureDetectorHelper: GestureDetectorHelper
     private lateinit var gestureDetector: GestureDetector
     private var isAttached = false
+    private var attachedView: View? = null
+
+    /**
+     * Structured scope for color analysis + scan persistence (#88):
+     * replaces the fire-and-forget MainScope so in-flight work dies
+     * with the view instead of persisting past detach.
+     */
+    private val routerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     /**
      * Attaches the gesture router to a container view.
@@ -59,6 +72,7 @@ class GestureRouter(
     fun attach(containerView: View) {
         if (isAttached) return
         isAttached = true
+        attachedView = containerView
 
         gestureDetectorHelper = GestureDetectorHelper(
             onSingleTap = { e ->
@@ -98,6 +112,15 @@ class GestureRouter(
     fun detach() {
         if (!isAttached) return
         isAttached = false
+        // The view holds the listener lambda, which captures this router
+        // (Activity context + fragment callbacks) — release all of it (#58).
+        attachedView?.setOnTouchListener(null)
+        attachedView = null
+        onSingleTapAction = { _, _ -> }
+        onDoubleTapAction = {}
+        onLongPressAction = {}
+        // In-flight color analysis dies with the view (#88).
+        routerScope.cancel()
         gestureDetectorHelper.reset()
     }
 
@@ -112,35 +135,54 @@ class GestureRouter(
             )
         )
 
-        try {
-            val bitmap = Bitmap.createBitmap(
-                containerView.width.coerceAtLeast(1),
-                containerView.height.coerceAtLeast(1),
-                Bitmap.Config.ARGB_8888
+        if (containerView.width < 4 || containerView.height < 4) {
+            ttsManager.speak(
+                context.getString(R.string.color_result, context.getString(R.string.color_unknown))
             )
-            val canvas = android.graphics.Canvas(bitmap)
-            containerView.draw(canvas)
+            return
+        }
 
-            val colorName = colorAnalyzer.analyzeCenterColor(context, bitmap)
-            bitmap.recycle()
-
-            val announcement = context.getString(R.string.color_result, colorName)
-            ttsManager.speak(announcement)
-
-            // Persist scan
-            MainScope().launch {
-                scanRepository.saveColorScan(colorName)
+        // Center ROI only (#88): the analyzer samples the middle 20%, so
+        // a 96px crop replaces the full-frame alloc + draw. View.draw must
+        // stay on this (main) thread — only the pixels leave it.
+        val roiBitmap = try {
+            Bitmap.createBitmap(COLOR_ROI_PX, COLOR_ROI_PX, Bitmap.Config.ARGB_8888).also { roi ->
+                val (tx, ty) = companionRoiTranslate(containerView.width, containerView.height, COLOR_ROI_PX)
+                val canvas = android.graphics.Canvas(roi)
+                canvas.translate(tx, ty)
+                containerView.draw(canvas)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Color analysis failed", e)
-            ttsManager.speakImmediate(
-                ttsManager.localized(
-                    "Color analysis failed.",
-                    "Analisis warna gagal.",
-                    "颜色分析失败。"
-                )
-            )
+            speakColorFailure()
+            return
         }
+        routerScope.launch(Dispatchers.Default) {
+            try {
+                val colorName = colorAnalyzer.analyzeCenterColor(context, roiBitmap)
+                withContext(Dispatchers.Main) {
+                    val announcement = context.getString(R.string.color_result, colorName)
+                    ttsManager.speak(announcement)
+                }
+                scanRepository.saveColorScan(colorName)
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.e(TAG, "Color analysis failed", e)
+                withContext(Dispatchers.Main) { speakColorFailure() }
+            } finally {
+                roiBitmap.recycle()
+            }
+        }
+    }
+
+    private fun speakColorFailure() {
+        ttsManager.speakImmediate(
+            ttsManager.localized(
+                "Color analysis failed.",
+                "Analisis warna gagal.",
+                "颜色分析失败。"
+            )
+        )
     }
 
     // ── Emergency SOS ─────────────────────────────────────────────────
@@ -171,5 +213,15 @@ class GestureRouter(
     companion object {
         const val SOS_EMERGENCY_NUMBER = "999"
         const val SOS_DIAL_DELAY_MS = 1500L
+
+        /** Center-crop edge for triple-tap color analysis (#88). */
+        private const val COLOR_ROI_PX = 96
+
+        /**
+         * Canvas translate that centers a [roiPx] crop on a
+         * [viewW]×[viewH] view. Pure — JVM-pinned (GestureRouterRoiTest).
+         */
+        internal fun companionRoiTranslate(viewW: Int, viewH: Int, roiPx: Int): Pair<Float, Float> =
+            Pair((roiPx - viewW) / 2f, (roiPx - viewH) / 2f)
     }
 }

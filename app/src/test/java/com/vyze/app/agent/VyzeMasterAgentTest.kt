@@ -1,7 +1,14 @@
 package com.vyze.app.agent
 
+import com.google.adk.kt.agents.RunConfig
+import com.google.adk.kt.runners.InMemoryRunner
+import com.google.adk.kt.types.Blob
+import com.google.adk.kt.types.Content
+import com.google.adk.kt.types.Part
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -148,5 +155,156 @@ class VyzeMasterAgentTest {
         )
         assertEquals("text-answer", bridge.generateText("q", "s1"))
         assertEquals("q", textPrompt)
+    }
+
+    // ── Haptic fast path (audit P2 #36/#37, P3 #78) ────────────────
+
+    @Test
+    fun `haptic commands match case-insensitively and normalize to canonical names`() {
+        // #36: the regex had no ignore-case, so "Double tap" fell through
+        // to VLM. #37: "double tap" uppercased to "DOUBLE TAP" (space),
+        // which the underscore-only wiring ignored — yet "Done." was
+        // spoken. #78: default-locale uppercase broke Turkish matching.
+        assertEquals("TAP", VyzeMasterAgent.companionHapticPatternForCommand("tap"))
+        assertEquals("TAP", VyzeMasterAgent.companionHapticPatternForCommand("Tap"))
+        assertEquals("DOUBLE_TAP", VyzeMasterAgent.companionHapticPatternForCommand("double tap"))
+        assertEquals("DOUBLE_TAP", VyzeMasterAgent.companionHapticPatternForCommand("Double tap"))
+        assertEquals("DOUBLE_TAP", VyzeMasterAgent.companionHapticPatternForCommand("DOUBLE TAP"))
+        assertEquals("DOUBLE_TAP", VyzeMasterAgent.companionHapticPatternForCommand("double-tap"))
+        assertEquals("LONG_PRESS", VyzeMasterAgent.companionHapticPatternForCommand("long press"))
+        assertEquals("LONG_PRESS", VyzeMasterAgent.companionHapticPatternForCommand("Long Press"))
+        assertEquals("WARNING", VyzeMasterAgent.companionHapticPatternForCommand("warning"))
+    }
+
+    @Test
+    fun `non-commands and unknown patterns return null, never a fake Done`() {
+        assertNull(VyzeMasterAgent.companionHapticPatternForCommand("what is tap water?"))
+        assertNull(VyzeMasterAgent.companionHapticPatternForCommand("doublextap"))
+        assertNull(VyzeMasterAgent.companionHapticPatternForCommand("tap twice fast"))
+        assertNull(VyzeMasterAgent.companionHapticPatternForCommand(""))
+    }
+
+    @Test
+    fun `fast haptic path fires the canonical pattern and says Done`() = runBlocking {
+        val fired = mutableListOf<String>()
+        val agent = VyzeMasterAgent.create(
+            bridgeProvider = {
+                MasterModelBridge(
+                    generateText = { _, _ -> "vlm-fallback" },
+                    generateImage = { _, _, _ -> "vlm-fallback" },
+                )
+            },
+            frameProvider = { null },
+            ocrFrame = { null },
+            speakImmediate = { false },
+            hapticPattern = { fired.add(it) },
+        )
+        val runner = InMemoryRunner(agent = agent, appName = "test")
+        var lastText = ""
+        runner.runAsync(
+            userId = "u",
+            sessionId = "s-haptic",
+            invocationId = null,
+            newMessage = Content("user", listOf(Part(text = "Double tap"))),
+            stateDelta = emptyMap(),
+            runConfig = RunConfig(),
+        ).collect { event ->
+            val text = event.content?.parts?.mapNotNull { it.text }
+                ?.joinToString("").orEmpty()
+            if (text.isNotEmpty()) lastText = text
+        }
+        // Pre-fix "Double tap" fell through to VLM (no fire, vlm text).
+        assertEquals(listOf("DOUBLE_TAP"), fired)
+        assertEquals("Done.", lastText)
+    }
+
+    // ── Undecodable frame (audit P2 #11) ───────────────────────────
+
+    @Test
+    fun `undecodable frame bytes fail safe, never reach the engine`() = runBlocking {
+        var imageCalls = 0
+        val agent = VyzeMasterAgent.create(
+            bridgeProvider = {
+                MasterModelBridge(
+                    generateText = { _, _ -> "text-answer" },
+                    generateImage = { _, _, _ -> imageCalls++; "image-answer" },
+                )
+            },
+            frameProvider = { null },
+            ocrFrame = { null },
+            speakImmediate = { false },
+            hapticPattern = {},
+        )
+        val runner = InMemoryRunner(agent = agent, appName = "test")
+        var lastText = ""
+        runner.runAsync(
+            userId = "u",
+            sessionId = "s-frame",
+            invocationId = null,
+            newMessage = Content(
+                "user",
+                listOf(
+                    Part(text = "what is this?"),
+                    Part(
+                        inlineData = Blob(
+                            mimeType = "image/jpeg",
+                            displayName = "f.jpg",
+                            data = byteArrayOf(0x00, 0x01, 0x02, 0x03, 0x04),
+                        )
+                    ),
+                ),
+            ),
+            stateDelta = emptyMap(),
+            runConfig = RunConfig(),
+        ).collect { event ->
+            val text = event.content?.parts?.mapNotNull { it.text }
+                ?.joinToString("").orEmpty()
+            if (text.isNotEmpty()) lastText = text
+        }
+        assertEquals(0, imageCalls)
+        assertEquals("I couldn't read that camera frame.", lastText)
+    }
+
+    // ── Read-intent matching: CJK substring + reading (#76) ──
+
+    @Test
+    fun `latin read intents match whole words`() {
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("read the label"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("Read this sign"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("baca label ini"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("teks ini apa"))
+    }
+
+    @Test
+    fun `reading counts as a read intent`() {
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("reading the sign"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("I am reading this"))
+    }
+
+    @Test
+    fun `cjk read intents match as substrings`() {
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("请读这个"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("这是什么字"))
+        assertTrue(VyzeMasterAgent.companionIsReadIntent("念一下"))
+    }
+
+    @Test
+    fun `embeddings and non-reads do not match`() {
+        assertFalse(VyzeMasterAgent.companionIsReadIntent("bread"))
+        assertFalse(VyzeMasterAgent.companionIsReadIntent("already done"))
+        assertFalse(VyzeMasterAgent.companionIsReadIntent("what is this"))
+        assertFalse(VyzeMasterAgent.companionIsReadIntent(""))
+    }
+
+    // ── read_scene_text declares no decorative knobs (#77) ──
+
+    @Test
+    fun `read scene text declares no parameters`() {
+        // OcrHelper always merges both recognizers — the old required
+        // includeChinese taught the model a knob that did nothing.
+        val tool = ReadSceneTextTool(frameProvider = { null }, ocrFrame = { null })
+        val declaration = tool.declaration()
+        assertTrue(declaration.parameters?.required.isNullOrEmpty())
+        assertTrue(declaration.parameters?.properties.isNullOrEmpty())
     }
 }

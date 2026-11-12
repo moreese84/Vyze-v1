@@ -620,4 +620,207 @@ class VyzeCoreControllerRouteTest {
         assertEquals(1, spans.size)
         assertEquals("Harga Ringgit 12.90", spans[0].text)
     }
+
+    // ── Verbatim-read gate: who may speak OCR directly (2026-11-09) ──
+    // Whole-app audit P1 #2: the OCR fast-path spoke sensitive reads
+    // verbatim — no sensitive-ID or precise-read exclusion. Every lane
+    // that speaks OCR text directly (fast-path, direct-read, label
+    // recital) now shares this gate: explicit reads only.
+
+    @Test
+    fun `clean explicit reads take verbatim lanes`() {
+        assertTrue(
+            VyzeCoreController.companionVerbatimReadAllowed(
+                textReadActive = true, isTap = false,
+                isPreciseRead = false, sensitiveIdActive = false
+            )
+        )
+    }
+
+    @Test
+    fun `non-reads and taps never take verbatim lanes`() {
+        // Scene asks keep the VLM in the loop for framing/grounding.
+        assertFalse(
+            VyzeCoreController.companionVerbatimReadAllowed(
+                textReadActive = false, isTap = false,
+                isPreciseRead = false, sensitiveIdActive = false
+            )
+        )
+        // A tap on a product must keep the model in the loop — the
+        // fast path would commit Latin-only OCR and never let the
+        // model read small/mixed script the OCR missed.
+        assertFalse(
+            VyzeCoreController.companionVerbatimReadAllowed(
+                textReadActive = true, isTap = true,
+                isPreciseRead = false, sensitiveIdActive = false
+            )
+        )
+    }
+
+    @Test
+    fun `precise-read modes keep the VLM no-guess rules`() {
+        // "read this note" IS a text-extraction ask — without this
+        // exclusion a 0.85-confidence capture would speak raw OCR and
+        // bypass the currency/bank-card never-guess contracts.
+        assertFalse(
+            VyzeCoreController.companionVerbatimReadAllowed(
+                textReadActive = true, isTap = false,
+                isPreciseRead = true, sensitiveIdActive = false
+            )
+        )
+    }
+
+    @Test
+    fun `sensitive-ID asks never take verbatim lanes`() {
+        // "read my IC number" at high OCR confidence must reach the
+        // pinned refusal — never spoken digits.
+        assertFalse(
+            VyzeCoreController.companionVerbatimReadAllowed(
+                textReadActive = true, isTap = false,
+                isPreciseRead = false, sensitiveIdActive = true
+            )
+        )
+    }
+
+    // ── Precise-mode banks: word boundaries (audit P2 #21) ──
+    // Bare-substring banks misfired on food labels: "wang" in "bawang"
+    // armed currency mode on onions, "kad" in "kadar" armed bank-card
+    // on sugar levels, "card" in "cardboard", "pill" in "spill".
+    // Latin keywords now need word boundaries (trailing -s and Malay
+    // -nya/-ku/-mu allowed); CJK stays substring (no word breaks).
+
+    @Test
+    fun `food and object words no longer arm money mode`() {
+        assertFalse(VyzeCoreController.companionIsCurrencyQuery("baca label bawang putih ini"))
+        assertFalse(VyzeCoreController.companionIsCurrencyQuery("minyak wangi apa ini"))
+        assertFalse(VyzeCoreController.companionIsCurrencyQuery("kacang cashew"))
+        assertFalse(VyzeCoreController.companionIsCurrencyQuery("timbang berat ini"))
+    }
+
+    @Test
+    fun `genuine money asks still arm money mode`() {
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("berapa duit ini"))
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("what money is this"))
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("wang kertas ini"))
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("duit syiling"))
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("这个多少钱"))
+        // Malay possessive clitic: still money.
+        assertTrue(VyzeCoreController.companionIsCurrencyQuery("wangnya berapa"))
+    }
+
+    @Test
+    fun `cardboard kadar and postcards no longer arm bank-card mode`() {
+        assertFalse(VyzeCoreController.companionIsBankCardQuery("what is this cardboard"))
+        assertFalse(VyzeCoreController.companionIsBankCardQuery("discard this"))
+        assertFalse(VyzeCoreController.companionIsBankCardQuery("berapa kadar gula ini"))
+        assertFalse(VyzeCoreController.companionIsBankCardQuery("read this postcard"))
+    }
+
+    @Test
+    fun `genuine card asks still arm bank-card mode`() {
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("what card is this"))
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("kad bank ini"))
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("which bank"))
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("kad apa ini"))
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("卡号是多少"))
+        assertTrue(VyzeCoreController.companionIsBankCardQuery("debit cards"))
+    }
+
+    @Test
+    fun `spills and dosa no longer arm medicine mode`() {
+        assertFalse(VyzeCoreController.companionIsMedicineQuery("don't spill the water"))
+        assertFalse(VyzeCoreController.companionIsMedicineQuery("read this dosa packet"))
+        assertFalse(VyzeCoreController.companionIsMedicineQuery("endorse this cheque"))
+    }
+
+    @Test
+    fun `genuine medicine asks still arm medicine mode`() {
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("ubat apa ini"))
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("take two tablets"))
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("panadol dosage"))
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("dos ubat ini"))
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("这是什么药"))
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("ubatmu apa"))
+        // Genuine ambiguity, preset behavior: a bare "capsule" is read
+        // as the medicine sense (coffee capsules misroute by design —
+        // no lexicon can split them, and medicine needs the recall).
+        assertTrue(VyzeCoreController.companionIsMedicineQuery("capsule"))
+    }
+
+    @Test
+    fun `null blank and scene queries arm no precise mode`() {
+        for (q in listOf(null, "", "   ", "what is this", "apa ini")) {
+            assertFalse(VyzeCoreController.companionIsCurrencyQuery(q))
+            assertFalse(VyzeCoreController.companionIsBankCardQuery(q))
+            assertFalse(VyzeCoreController.companionIsMedicineQuery(q))
+        }
+    }
+
+    // ── Locale token headroom (audit P2 #35, 2026-11-09) ──
+    // Malay morphology runs ~30% more tokens per sentence — the image
+    // lane carries a x4/3 headroom but the text lane passed the bare
+    // English-sized cap, truncating Malay answers mid-word. One shared
+    // rule now serves both lanes (Chinese needs none — denser script).
+
+    @Test
+    fun `malay budgets grow by four thirds`() {
+        assertEquals(256, VyzeCoreController.companionLocaleTokenHeadroom(192, "ms"))
+        assertEquals(128, VyzeCoreController.companionLocaleTokenHeadroom(96, "ms"))
+    }
+
+    @Test
+    fun `english chinese and unknown keep the base budget`() {
+        assertEquals(192, VyzeCoreController.companionLocaleTokenHeadroom(192, "en"))
+        assertEquals(192, VyzeCoreController.companionLocaleTokenHeadroom(192, "zh"))
+        assertEquals(192, VyzeCoreController.companionLocaleTokenHeadroom(192, "ta"))
+    }
+
+    // ── Thermal token cap (audit P3 #72, 2026-11-09) ──
+    // MODERATE+ heat tightens the scene-token budget so generation —
+    // the hottest inference phase — ends sooner. The rule was inline
+    // in the image lane only; the expansion ("tell me more") lane ran
+    // the raw cap into an overheating SoC. One shared rule now serves
+    // both (same `in 1 until base` semantics, extracted verbatim).
+
+    @Test
+    fun `thermal cap below base tightens the budget`() {
+        assertEquals(64, VyzeCoreController.companionThermalCappedTokens(96, 64))
+        assertEquals(64, VyzeCoreController.companionThermalCappedTokens(128, 64))
+    }
+
+    @Test
+    fun `degenerate caps keep the base budget`() {
+        // Zero/negative = no cap published; at-or-above base = no
+        // tightening (the `in 1 until base` rule, both bounds pinned).
+        assertEquals(128, VyzeCoreController.companionThermalCappedTokens(128, 0))
+        assertEquals(128, VyzeCoreController.companionThermalCappedTokens(128, -1))
+        assertEquals(128, VyzeCoreController.companionThermalCappedTokens(128, 128))
+        assertEquals(128, VyzeCoreController.companionThermalCappedTokens(128, 256))
+    }
+
+    // ── Direct-read length gate (audit P2 #23, 2026-11-09) ──
+    // A conf>=0.85 shortcut bypassed the 300-char dense-doc gate, so a
+    // confident fragment ("150g", partial OCR) was announced as "Long
+    // document. Reading now." Short reads belong to the fast-path
+    // (complete) or the VLM (fragment); the document lane needs bulk.
+
+    @Test
+    fun `short confident reads skip the document lane`() {
+        assertFalse(VyzeCoreController.companionShouldReadDirectly("150g", 0.9f))
+        assertFalse(VyzeCoreController.companionShouldReadDirectly("a".repeat(100), 0.95f))
+        assertFalse(VyzeCoreController.companionShouldReadDirectly("a".repeat(299), 0.95f))
+    }
+
+    @Test
+    fun `long confident docs take the document lane`() {
+        assertTrue(VyzeCoreController.companionShouldReadDirectly("a".repeat(300), 0.9f))
+        assertTrue(VyzeCoreController.companionShouldReadDirectly("a".repeat(1200), 0.65f))
+    }
+
+    @Test
+    fun `low confidence blank and null skip the document lane`() {
+        assertFalse(VyzeCoreController.companionShouldReadDirectly("a".repeat(500), 0.5f))
+        assertFalse(VyzeCoreController.companionShouldReadDirectly("", 0.95f))
+        assertFalse(VyzeCoreController.companionShouldReadDirectly(null, 0.95f))
+    }
 }

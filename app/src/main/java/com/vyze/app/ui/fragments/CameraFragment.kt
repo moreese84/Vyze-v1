@@ -124,12 +124,10 @@ class CameraFragment : Fragment() {
     private var isCameraActive = false
 
     /**
-     * PHASE 6 MAINTENANCE TICKER — the production caller for
-     * [VyzeAgentRuntime.maintenanceTick] (episode idle-eviction + orphan ADK
-     * session sweep). Runs every [MAINTENANCE_TICK_MS] while the fragment is
-     * STARTED; thermal status is supplied READ-ONLY from
-     * ThermalPowerController (the sole thermal authority — never modified,
-     * never bypassed; we only ask). Purely in-memory bookkeeping: no VLM,
+     * PHASE 6 MAINTENANCE TICKER — shadow-eval flip-review logging.
+     * Runs every [MAINTENANCE_TICK_MS] while the fragment is STARTED.
+     * (P4 #105 retired the maintenanceTick episode sweep it used to
+     * drive — production never opened an episode.) Log-only: no VLM,
      * TTS, camera, or hardware interaction, so the tick can never contend
      * with an active capture or generation.
      */
@@ -141,9 +139,6 @@ class CameraFragment : Fragment() {
             while (true) {
                 delay(MAINTENANCE_TICK_MS)
                 try {
-                    val thermallyConstrained =
-                        thermalController().policy.tier >= ThermalPolicy.TIER_MODERATE
-                    VyzeAgentRuntime.maintenanceTick { thermallyConstrained }
                     // Flip-review visibility: log the eval window + promote
                     // predicate so the shadow→live decision is observable
                     // on-device via `adb logcat -s CameraFragment`.
@@ -348,7 +343,7 @@ class CameraFragment : Fragment() {
             consecutiveConfirmationAsks = 0
             appState = AppState.SPEAKING
             updateStatus("Answering [agent]")
-            ttsManager.speakQueued(answer)
+            ttsManager.speakImmediate(answer)
             waitForTtsDrain {
                 appState = AppState.IDLE
                 maybeOpenFollowUpWindow()
@@ -891,6 +886,14 @@ class CameraFragment : Fragment() {
         cameraSetup.releaseCamera()
     }
 
+    override fun onStop() {
+        super.onStop()
+        // Symmetric with onStart (#57): the ticker lives in the view
+        // lifecycleScope, which survives backgrounding — stop it here so
+        // the app does no work it cannot see.
+        stopMaintenanceTicker()
+    }
+
     override fun onStart() {
         super.onStart()
         // PHASE 6: periodic agent-lane hygiene (episodes + orphan sessions).
@@ -906,6 +909,7 @@ class CameraFragment : Fragment() {
             talkbackStateListener?.let { am?.removeTouchExplorationStateChangeListener(it) }
         } catch (_: Throwable) {}
         talkbackStateListener = null
+        unwireSpeechCallbacks()
         _fragmentCameraBinding = null
         super.onDestroyView()
 
@@ -1549,6 +1553,19 @@ class CameraFragment : Fragment() {
     // Speech Recognition Integration
     // ══════════════════════════════════════════════════════════════════
 
+    /**
+     * Clear the MainActivity speech callbacks this fragment installed (#56).
+     * The activity outlives the view — without this, post-destroy results
+     * re-fire into a dead fragment (and pin it in memory).
+     */
+    private fun unwireSpeechCallbacks() {
+        val activity = activity as? MainActivity ?: return
+        activity.onSpeechResult = null
+        activity.onPartialSpeechResult = null
+        activity.onSpeechError = null
+        activity.onNoiseDetected = null
+    }
+
     private fun wireSpeechCallbacks() {
         val activity = requireActivity() as? MainActivity ?: return
 
@@ -1889,7 +1906,7 @@ class CameraFragment : Fragment() {
      */
     private fun handleReportContent(reportText: String) {
         Log.i(TAG, "Report content received: ${reportText.take(80)}...")
-        CrashLogFile.log(TAG, "Report content: ${reportText.take(100)}")
+        CrashLogFile.logContent(TAG, "Report content: ${reportText.take(100)}")
         updateStatus("Saving report...")
 
         // Save report to local file
@@ -2090,11 +2107,8 @@ class CameraFragment : Fragment() {
         }
     }
 
-    private fun startContinuousLoop() {
-        if (isContinuousMode && !mainHandler.hasCallbacks(autoSnapshotRunnable)) {
-            mainHandler.postDelayed(autoSnapshotRunnable, AUTO_SNAPSHOT_INTERVAL_MS)
-        }
-    }
+    // NOTE (P4 #110, 2026-11-09): startContinuousLoop lived here with zero
+    // callers — toggleContinuousMode posts the runnable directly. Deleted.
 
     private fun stopContinuousLoop() {
         mainHandler.removeCallbacks(autoSnapshotRunnable)
@@ -3020,7 +3034,7 @@ class CameraFragment : Fragment() {
          * releasing audio focus. Compensates for Android AudioTrack
          * hardware drain latency after onDone() fires.
          */
-        private const val AUDIO_DRAIN_GRACE_MS = 600L
+        internal const val AUDIO_DRAIN_GRACE_MS = 600L
 
         /** Spoken phrases that open Accessibility Settings (disable TalkBack). */
         private val ACCESSIBILITY_SETTINGS_PHRASES = listOf(
@@ -3132,8 +3146,13 @@ class CameraFragment : Fragment() {
         /** Delay before a silent follow-up reopen listens again (ms). */
         private const val FOLLOW_UP_RETRY_DELAY_MS = 500L
 
-        /** Delay before the mic opens after an answer ends (ms). */
-        private const val FOLLOW_UP_OPEN_DELAY_MS = 450L
+        /**
+         * Delay before the mic opens after an answer ends (ms). Tied to
+         * the drain grace (#85): the non-streaming answer path has no
+         * other protection, so the mic must open after the AudioTrack
+         * tail or it captures the answer as the next query.
+         */
+        internal const val FOLLOW_UP_OPEN_DELAY_MS = AUDIO_DRAIN_GRACE_MS + 50L
 
         /** Delay between the better-voice prompt and opening the mic (ms). */
         private const val VOICE_INSTALL_PROMPT_GAP_MS = 600L

@@ -73,15 +73,24 @@ object PreGatePolicy {
     fun evaluate(spokenText: String): ResponseMode {
         val d = StudentRouter.decide(spokenText)
         if (d.action != RouterDecision.Action.IGNORE) return ResponseMode.PASS_THROUGH
-        return when {
-            d.reason.contains("app-cue echo") -> ResponseMode.SILENT
-            // v3: the app's own status cue captured inside a garble hybrid —
-            // same family as the echo (Vyze is already talking; answering a
-            // scene nobody asked for is the dev6 regression). Silent skip.
-            d.reason.contains("app-cue garble hybrid") -> ResponseMode.SILENT
-            d.reason.contains("greeting garble") -> ResponseMode.GENTLE_IGNORE
-            d.reason.contains("filler-only") -> ResponseMode.GENTLE_IGNORE
-            else -> ResponseMode.PASS_THROUGH
+        // Typed families (#75), never reason substrings — rewording a
+        // reason string can no longer silently drop a family. The hybrid
+        // stays silent like the echo (Vyze is already talking; answering
+        // a scene nobody asked for is the dev6 regression).
+        return when (d.ignoreFamily) {
+            RouterDecision.IgnoreFamily.APP_CUE_ECHO,
+            RouterDecision.IgnoreFamily.APP_CUE_HYBRID,
+            -> ResponseMode.SILENT
+            RouterDecision.IgnoreFamily.GREETING_GARBLE,
+            RouterDecision.IgnoreFamily.FILLER_ONLY,
+            -> ResponseMode.GENTLE_IGNORE
+            // Empty transcripts stay the dispatch ladder's job, and
+            // out-of-domain keeps its catch-all escape hatch — both pass
+            // through exactly as before.
+            RouterDecision.IgnoreFamily.EMPTY_TRANSCRIPT,
+            RouterDecision.IgnoreFamily.OUT_OF_DOMAIN,
+            RouterDecision.IgnoreFamily.NONE,
+            -> ResponseMode.PASS_THROUGH
         }
     }
 }

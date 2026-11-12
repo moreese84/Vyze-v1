@@ -67,6 +67,16 @@ class VyzeAdaptiveBackendPolicyTest {
         assertEquals(listOf("CPU"), chain("NPU", gpu = false, npu = true))
     }
 
+    @Test
+    fun `NPU never rides without GPU in the chain`() {
+        // Whole-app audit P3 #70 (2026-11-09): with CPU preference +
+        // GPU-capable hardware + NPU opt-in, NPU was the SOLE non-CPU
+        // attempt ([NPU, CPU]) despite the doc ban. NPU only appends
+        // when GPU is already chained.
+        assertEquals(listOf("CPU"), chain("CPU", gpu = true, npu = true))
+        assertEquals(listOf("CPU"), chain("NPU", gpu = true, npu = true))
+    }
+
     // ── preference staleness: one build re-adapts across devices ─────
 
     @Test
@@ -83,6 +93,23 @@ class VyzeAdaptiveBackendPolicyTest {
             preferredBackend = "GPU", lastValidatedMs = 1000L,
         )
         assertFalse(VyzeAdaptiveBackend.prefersHardwareBackend(state, nowMs = 1000L + DAY_MS))
+    }
+
+    @Test
+    fun `sub-threshold overtemps do not veto the hardware preference`() {
+        // Whole-app audit P3 #68 (2026-11-09): the veto fired at
+        // overtempCount > 0 while the CPU fallback needs
+        // OVERTEMP_FALLBACK_THRESHOLD — one transient overheat vetoed
+        // hardware. Veto and fallback now share the threshold. (The veto
+        // window still keys off validation age — no dedicated overheat
+        // timestamp is persisted; the pipeline is unwired, so minting
+        // one is unjustified. See the KDoc.)
+        val state = VyzeAdaptiveBackend.PersistentState(
+            preferredBackend = "GPU",
+            lastValidatedMs = 1000L,
+            overtempCount = VyzeAdaptiveBackend.OVERTEMP_FALLBACK_THRESHOLD - 1,
+        )
+        assertTrue(VyzeAdaptiveBackend.prefersHardwareBackend(state, nowMs = 1000L + 60_000L))
     }
 
     @Test
@@ -225,6 +252,36 @@ class VyzeAdaptiveBackendPolicyTest {
         assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("mt6899"))
         assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("kona"))
         assertFalse(VyzeAdaptiveBackend.deviceLooksCpuOnly("sm8550"))
+    }
+
+    @Test
+    fun `real chip ids detect NPU hardware`() {
+        // Whole-app audit P3 #71 (2026-11-09): detect required literal
+        // "dimensity"/"snapdragon", but real Build.HARDWARE holds chip
+        // ids — NPU was never detected on real hardware. Matching is
+        // Locale.US (Turkish-safe) and case-insensitive.
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("mt6899"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("MT6989"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("sm8550"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("SM8450"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("tensor"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("Tensor G3"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("dimensity 9300"))
+        assertTrue(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("snapdragon 8 gen 2"))
+    }
+
+    @Test
+    fun `non-NPU hardware stays negative`() {
+        // Pinned gaps (documented, not oversights): board codenames
+        // ("kona"), Exynos, and 7-series Snapdragon have real accelerators
+        // but no stable id pattern is claimed yet — extending coverage is
+        // a follow-up, not this fix.
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("mt6768"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("ums512"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("kona"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("exynos2100"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu("sm7675"))
+        assertFalse(VyzeAdaptiveBackend.deviceLooksLikeItHasNpu(""))
     }
 
     @Test

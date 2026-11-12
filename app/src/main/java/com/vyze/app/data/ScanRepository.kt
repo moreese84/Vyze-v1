@@ -1,6 +1,7 @@
 package com.vyze.app.data
 
 import android.content.Context
+import com.vyze.app.util.StorageRedaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
@@ -24,8 +25,8 @@ class ScanRepository(context: Context) {
             scanDao.insertScan(
                 ScanEntity(
                     type = type,
-                    content = content,
-                    metadata = metadata
+                    content = StorageRedaction.sanitizeForStorage(content, StorageRedaction.STORED_SCAN_MAX_CHARS),
+                    metadata = StorageRedaction.sanitizeForStorage(metadata, StorageRedaction.STORED_META_MAX_CHARS)
                 )
             )
         }

@@ -59,6 +59,7 @@ class LoadingFragment : Fragment() {
 
     private var coreController: VyzeCoreController? = null
     private var pulseAnimator: ObjectAnimator? = null
+    private var pulseAnimatorY: ObjectAnimator? = null
 
     /** Guard: prevents duplicate init or premature navigation. */
     private var initStarted = false
@@ -145,24 +146,7 @@ class LoadingFragment : Fragment() {
 
         // Safety timeout: if stuck for 60s, speak a warning and navigate
         // anyway (previously a SILENT dump into a dead camera).
-        safeRun {
-            val timeout = Runnable {
-                if (isAdded && _binding != null && !initStarted) {
-                    CrashLogFile.log(TAG, "Safety timeout — speaking warning, navigating to camera")
-                    playCue(errorSoundId)
-                    appTts()?.speakQueued(
-                        appTts()?.localized(
-                            getString(R.string.loading_still_working),
-                            getString(R.string.loading_still_working_ms),
-                            getString(R.string.loading_still_working_zh)
-                        ) ?: ""
-                    )
-                    navigateToCamera()
-                }
-            }
-            safetyTimeoutRunnable = timeout
-            binding.root.postDelayed(timeout, 60_000L)
-        }
+        safeRun { postSafetyTimeout() }
 
         // Startup feedback: sound cue + spoken announcement. The TTS may
         // not be initialized yet — speak() buffers until it is.
@@ -190,6 +174,8 @@ class LoadingFragment : Fragment() {
         stopPulseAnimation()
         pulseAnimator?.cancel()
         pulseAnimator = null
+        pulseAnimatorY?.cancel()
+        pulseAnimatorY = null
         safetyTimeoutRunnable?.let { binding.root.removeCallbacks(it) }
         safetyTimeoutRunnable = null
         releaseSoundPool()
@@ -445,11 +431,42 @@ class LoadingFragment : Fragment() {
             initStarted = false
             startPulseAnimation()
         }
+        // The error path consumed the safety net — re-arm it so a retry
+        // that hangs mid-pipeline still trips the 60s warning (#53).
+        safeRun { postSafetyTimeout() }
     }
 
     private fun cancelSafetyTimeout() {
         safetyTimeoutRunnable?.let { binding.root.removeCallbacks(it) }
         safetyTimeoutRunnable = null
+    }
+
+    /**
+     * Post the 60s safety net (audit P2 #53): fires whenever init
+     * neither finished nor errored — the old `!initStarted` guard
+     * covered only a pipeline that never STARTED, while a hang
+     * MID-pipeline (download stall, engine-build wedge) spun forever.
+     * Error states cancel this runnable and success destroys the view,
+     * so a live runnable always means STUCK. Re-posted on every retry.
+     */
+    private fun postSafetyTimeout() {
+        cancelSafetyTimeout()
+        val timeout = Runnable {
+            if (isAdded && _binding != null) {
+                CrashLogFile.log(TAG, "Safety timeout — speaking warning, navigating to camera")
+                playCue(errorSoundId)
+                appTts()?.speakQueued(
+                    appTts()?.localized(
+                        getString(R.string.loading_still_working),
+                        getString(R.string.loading_still_working_ms),
+                        getString(R.string.loading_still_working_zh)
+                    ) ?: ""
+                )
+                navigateToCamera()
+            }
+        }
+        safetyTimeoutRunnable = timeout
+        binding.root.postDelayed(timeout, 60_000L)
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -482,7 +499,7 @@ class LoadingFragment : Fragment() {
                 interpolator = AccelerateDecelerateInterpolator()
                 start()
             }
-            ObjectAnimator.ofFloat(
+            pulseAnimatorY = ObjectAnimator.ofFloat(
                 binding.logoImage, "scaleY", 0.95f, 1.05f, 0.95f
             ).apply {
                 duration = 2000L
@@ -497,6 +514,10 @@ class LoadingFragment : Fragment() {
     private fun stopPulseAnimation() {
         try {
             pulseAnimator?.cancel()
+        } catch (_: Throwable) {
+        }
+        try {
+            pulseAnimatorY?.cancel()
         } catch (_: Throwable) {
         }
     }

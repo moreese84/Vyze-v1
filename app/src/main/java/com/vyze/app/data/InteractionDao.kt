@@ -35,8 +35,13 @@ interface InteractionDao {
      * Text-based recall: most recent records whose PROMPT OR OUTPUT mentions
      * the given terms (LIKE — no FTS available without a schema migration).
      * Backs spoken recall queries ("where are my keys?") with no camera frame.
+     * Callers pass backslash-escaped terms (see
+     * MemoryRepository.companionEscapeLikeTerms) — the ESCAPE clause below
+     * is what makes that escaping MEAN anything (audit P2 #19: without it
+     * SQLite read the backslashes literally and any query containing % or _
+     * matched nothing).
      */
-    @Query("SELECT * FROM interaction_records WHERE prompt LIKE '%' || :terms || '%' OR output LIKE '%' || :terms || '%' ORDER BY timestamp DESC LIMIT :limit")
+    @Query("SELECT * FROM interaction_records WHERE prompt LIKE '%' || :terms || '%' ESCAPE '\\' OR output LIKE '%' || :terms || '%' ESCAPE '\\' ORDER BY timestamp DESC LIMIT :limit")
     suspend fun searchRecentByPromptAndOutput(terms: String, limit: Int = 5): List<InteractionRecord>
 
     /** Get total number of stored interactions. */

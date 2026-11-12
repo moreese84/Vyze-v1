@@ -72,8 +72,19 @@ data class InteractionRecord(
             return byteBuffer.array()
         }
 
-        /** Deserialize a ByteArray back to FloatArray. */
+        /**
+         * Deserialize a ByteArray back to FloatArray.
+         *
+         * Whole-app audit P3 #91: the size contract now fails fast at the
+         * boundary (symmetric with [serializeEmbedding]'s require) —
+         * short/long bodies used to produce silent wrong-length vectors.
+         * The similarity search already skips failed rows per record, so a
+         * corrupt BLOB degrades recall instead of crashing it.
+         */
         fun deserializeEmbedding(bytes: ByteArray): FloatArray {
+            require(bytes.size == EMBEDDING_SIZE * 4) {
+                "Embedding must be ${EMBEDDING_SIZE * 4} bytes, got ${bytes.size}"
+            }
             val byteBuffer = java.nio.ByteBuffer.wrap(bytes)
             byteBuffer.order(java.nio.ByteOrder.LITTLE_ENDIAN)
             val floatArray = FloatArray(bytes.size / 4)

@@ -204,4 +204,38 @@ class FrameBudgetProbeTest {
         p.onSceneSkip()
         assertNull(p.summary().openFrameT0Ms)
     }
+
+    // ── Clock-step safety (audit P2 #42) ───────────────────────────
+
+    @Test
+    fun `stepped-back clock closes corrupt, never averages it`() {
+        // NTP/wall-clock step-back mid-window used to record a NEGATIVE
+        // latency and average it straight into the verdict. A corrupt
+        // sample now closes as ABANDONED — counted, never averaged (the
+        // same rule as lost frames).
+        val p = probe()
+        p.beginFrame("GREEN") // t0 = 10_000
+        clock -= 30_000 // wall clock steps back 30 s mid-window
+        val s = p.onFirstAudio()
+        assertEquals(FrameBudgetProbe.Outcome.ABANDONED, s?.outcome)
+        assertNull(s?.frameToAudioMs)
+        assertNull(s?.firstAudioAtMs)
+    }
+
+    @Test
+    fun `corrupt samples cannot drag the verdict fast`() {
+        val p = probe()
+        // The corrupt sample first (pre-fix: −30 s averaged in).
+        p.beginFrame("GREEN")
+        clock -= 30_000
+        p.onFirstAudio()
+        // Five honest 6 s answers.
+        repeat(5) { p.answerAfter(6_000) }
+        val sum = p.summary()
+        assertEquals(1, sum.abandoned)
+        assertEquals(5, sum.answered)
+        assertEquals(6_000L, sum.avgMs)
+        // Pre-fix the −30 s sample dragged the mean to 0 → E2_VIABLE.
+        assertEquals(FrameBudgetProbe.Verdict.E3_PREREQUISITE, sum.verdict)
+    }
 }

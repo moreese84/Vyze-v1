@@ -1,38 +1,68 @@
 package com.vyze.app.data
 
-import android.content.Context
+import android.util.Log
+import androidx.annotation.VisibleForTesting
 import androidx.room.RoomDatabase
 import androidx.sqlite.db.SupportSQLiteDatabase
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 
 /**
- * Pre-populates the medicine database with common Malaysian medicines
- * on first app launch. Runs as a Room database callback.
+ * Seeds the medicine database with common Malaysian medicines. Runs as a
+ * Room database callback.
  *
  * Medicines are sourced from:
  * - Malaysian Ministry of Health OTC drug list
  * - Common pharmacy stock in Malaysia (Guardian, Watsons, farmasi)
  * - Frequently encountered medicine labels in Malaysian households
+ *
+ * Whole-app audit P2 #16/#17 (2026-11-09): the seed ran once in onCreate,
+ * fire-and-forget, which left upgraded databases (onCreate never
+ * re-fires) with an empty medicines table forever (#16) and raced
+ * first-launch readers against the background insert (#17; the reader
+ * path also built a SECOND Room database instance). The seed now runs
+ * synchronously inside onOpen — Room holds the open lock there, so every
+ * path (fresh install, version upgrade, destructive fallback) is seeded
+ * before the first query returns — as idempotent INSERT..WHERE NOT
+ * EXISTS statements, so re-runs on later opens change nothing.
  */
 object MedicineDatabaseCallback {
 
-    fun createCallback(context: Context) = object : RoomDatabase.Callback() {
-        override fun onCreate(db: SupportSQLiteDatabase) {
-            super.onCreate(db)
-            // Pre-populate on first database creation
-            CoroutineScope(Dispatchers.IO).launch {
-                try {
-                    val medicineDao = VyzeDatabase.getInstance(context).medicineDao()
-                    medicineDao.insertAll(getCommonMedicines())
-                    android.util.Log.i("MedicineDB", "Pre-populated ${medicineDao.count()} medicines")
-                } catch (e: Throwable) {
-                    android.util.Log.e("MedicineDB", "Pre-population failed: ${e.message}", e)
+    fun createCallback() = object : RoomDatabase.Callback() {
+        override fun onOpen(db: SupportSQLiteDatabase) {
+            super.onOpen(db)
+            try {
+                for (statement in companionMedicineSeedStatements(getCommonMedicines())) {
+                    db.execSQL(statement)
                 }
+            } catch (e: Exception) {
+                Log.e("MedicineDB", "Reference seed failed: ${e.message}", e)
             }
         }
     }
+
+    /**
+     * Idempotent seed statements for [medicines]: each inserts only when
+     * no row with the same searchName exists yet, so re-running after an
+     * upgrade or a later open never duplicates rows.
+     */
+    fun companionMedicineSeedStatements(medicines: List<MedicineEntity>): List<String> =
+        medicines.map { medicine ->
+            "INSERT INTO medicines " +
+                "(name, genericName, dosage, frequency, warnings, category, searchName) " +
+                "SELECT ${sqlLiteral(medicine.name)}, " +
+                "${sqlLiteral(medicine.genericName)}, " +
+                "${sqlLiteral(medicine.dosage)}, " +
+                "${sqlLiteral(medicine.frequency)}, " +
+                "${sqlLiteral(medicine.warnings)}, " +
+                "${sqlLiteral(medicine.category)}, " +
+                "${sqlLiteral(medicine.searchName)} " +
+                "WHERE NOT EXISTS (SELECT 1 FROM medicines " +
+                "WHERE searchName = ${sqlLiteral(medicine.searchName)})"
+        }
+
+    private fun sqlLiteral(value: String): String = "'" + value.replace("'", "''") + "'"
+
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    fun commonMedicinesForTests(): List<MedicineEntity> = getCommonMedicines()
 
     /**
      * Common Malaysian medicines — OTC and widely prescribed.

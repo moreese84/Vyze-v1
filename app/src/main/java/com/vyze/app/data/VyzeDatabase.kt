@@ -11,6 +11,9 @@ import com.vyze.app.data.InteractionRecord
 /**
  * Room database for Vyze.
  *
+ * Version 7 — Unique (category, key) index on `vyze_memory` (+ dedupe):
+ * upsert(REPLACE) finally honors its contract (audit P2 #18).
+ *
  * Version 5 — Added `interaction_records` table with image embeddings for adaptive
  * intelligence and similarity-based retrieval.
  *
@@ -26,7 +29,7 @@ import com.vyze.app.data.InteractionRecord
  */
 @Database(
     entities = [ScanEntity::class, ErrorLogEntity::class, VyzeMemoryEntity::class, InteractionRecord::class, MedicineEntity::class],
-    version = 6,
+    version = 7,
     exportSchema = false
 )
 abstract class VyzeDatabase : RoomDatabase() {
@@ -140,6 +143,27 @@ abstract class VyzeDatabase : RoomDatabase() {
          * every statement in migrate() on a real SQLite engine — the bug
          * cannot return silently.
          */
+        /**
+         * 6 → 7 (audit P2 #18): enforce the (category, key) unique index
+         * the upsert KDoc always promised. Dedupe first — the missing
+         * constraint let fixed-key writes pile rows, and CREATE UNIQUE
+         * INDEX fails on duplicates. Keeps the latest row per key.
+         * Index name matches Room's generated `index_<table>_<cols>`
+         * convention so open-time schema validation passes.
+         */
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "DELETE FROM vyze_memory WHERE id NOT IN " +
+                        "(SELECT MAX(id) FROM vyze_memory GROUP BY category, `key`)"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_vyze_memory_category_key` " +
+                        "ON vyze_memory (`category`, `key`)"
+                )
+            }
+        }
+
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL(
@@ -163,12 +187,13 @@ abstract class VyzeDatabase : RoomDatabase() {
             }
         }
 
-        /** All registered migrations, in order. */
-        private val ALL_MIGRATIONS = arrayOf(
+        /** All registered migrations, in order. Internal for the chain test. */
+        internal val ALL_MIGRATIONS = arrayOf(
             MIGRATION_2_3,
             MIGRATION_3_4,
             MIGRATION_4_5,
-            MIGRATION_5_6
+            MIGRATION_5_6,
+            MIGRATION_6_7
         )
 
         // ── Instance Creation ──────────────────────────────────────
@@ -181,7 +206,15 @@ abstract class VyzeDatabase : RoomDatabase() {
                     DATABASE_NAME
                 )
                     .addMigrations(*ALL_MIGRATIONS)
-                    .addCallback(MedicineDatabaseCallback.createCallback(context))
+                    // V1 HAS NO MIGRATION ON PURPOSE (audit P1 #8,
+                    // 2026-11-09): version 1 never existed — the database
+                    // was born at version 2 (dbd68e3), so there is no v1
+                    // schema to migrate from. A v1-stamped file can only
+                    // be foreign; wipe it instead of bricking at open.
+                    // Migrations FROM 2+ stay strict (chain pinned by
+                    // MigrationChainTest).
+                    .fallbackToDestructiveMigrationFrom(true, 1)
+                    .addCallback(MedicineDatabaseCallback.createCallback())
                     .build()
                     .also { INSTANCE = it }
             }

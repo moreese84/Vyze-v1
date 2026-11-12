@@ -14,19 +14,9 @@ package com.vyze.app.performance
  */
 object VyzePerformanceConfig {
 
-    // ── OCR-first routing ──────────────────────────────────────────────────
-
-    /** Minimum OCR confidence to speak the result immediately. */
-    const val OCR_SPEAK_NOW_CONFIDENCE_MIN = 0.72f
-
-    /** Higher confidence boundary for “speak now, skip VLM follow-up.” */
-    const val OCR_SPEAK_NOW_HIGH_CONFIDENCE = 0.85f
-
-    /** Document-style reads that may still go to VLM for cleanup. */
-    const val OCR_DOCUMENT_MIN_CHARS_FOR_VLM_FOLLOWUP = 60
-
-    /** Barcodes we speak immediately when recognized. */
-    const val BARCODE_SPEAK_IMMEDIATELY = true
+    // NOTE (P4 #108, 2026-11-09): the OCR-first routing consts lived
+    // here with zero readers — the controller's private DIRECT_READ /
+    // OCR_FAST_PATH consts are the live thresholds. Deleted.
 
     // ── MiniCPM payload rules ──────────────────────────────────────────────
 
@@ -116,9 +106,6 @@ object VyzePerformanceConfig {
     const val THERMAL_THOTTLE_REDUCE_FACTOR = 0.75f
 
     // ── Graceful degradation ───────────────────────────────────────────────
-
-    /** OCR confidence below which we do NOT fast-path speak. */
-    const val FAST_PATH_CONFIDENCE_FLOOR = 0.65f
 
     /** Maximum wall time to wait for a VLM first token before degrading. */
     const val VLM_FIRST_TOKEN_GRACE_MS = 8_000L

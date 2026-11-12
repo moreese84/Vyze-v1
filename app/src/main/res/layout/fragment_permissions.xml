@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Recovery screen for denied permissions (audit P2 #14): the old headless
+     fragment always forwarded to camera, which bounced straight back here
+     from onResume — an endless swap on any denial. This screen stays put
+     and offers Retry + Open Settings instead. -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:padding="32dp"
+    android:background="@android:color/black">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="@string/perms_title"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:textColor="@android:color/white"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:id="@+id/text_permissions_status"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/perms_guidance_rationale"
+        android:textSize="17sp"
+        android:textColor="@android:color/white"
+        android:layout_marginBottom="32dp" />
+
+    <Button
+        android:id="@+id/btn_permissions_retry"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:text="@string/perms_retry"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:backgroundTint="#FFD700"
+        android:textColor="@android:color/black"
+        android:layout_marginBottom="12dp" />
+
+    <Button
+        android:id="@+id/btn_permissions_settings"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:text="@string/perms_open_settings"
+        android:textSize="18sp"
+        android:layout_marginBottom="12dp" />
+
+</LinearLayout>

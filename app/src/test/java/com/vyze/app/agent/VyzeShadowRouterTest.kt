@@ -2,6 +2,7 @@ package com.vyze.app.agent
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -10,9 +11,9 @@ import org.junit.Test
  * the ADK-native sub-agents were removed — execution now lives in
  * [AdkAgentManager] / [VyzeMasterAgent]).
  *
- * Scope: the PURE decision function ([VyzeShadowRouter.decide]) and the
- * [SessionEpisodeManager] lifecycle. The master-agent runner pipeline
- * belongs to instrumented tests in a later phase.
+ * Scope: the PURE decision function ([VyzeShadowRouter.decide]). The
+ * master-agent runner pipeline belongs to instrumented tests in a
+ * later phase.
  */
 class VyzeShadowRouterTest {
 
@@ -98,6 +99,31 @@ class VyzeShadowRouterTest {
     }
 
     @Test
+    fun `read inside other words does not misroute to text read`() {
+        // Whole-app audit P2 #22 (2026-11-09): bare contains("read")
+        // matched bread/thread/already and stole the legacy OCR-still
+        // lane from the student router. Latin keywords are
+        // word-boundary matched now (CJK stays substring — no word
+        // boundaries there); the -ing form keeps its legacy routing.
+        for (q in listOf(
+            "is this bread fresh?",
+            "what thread count are these sheets?",
+            "i already asked about this",
+        )) {
+            val d = VyzeShadowRouter.decide(
+                RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = q),
+                snapshot(),
+            )
+            assertNotEquals(q, RouterDecision.Action.VLM_TEXT_READ, d.action)
+        }
+        val reading = VyzeShadowRouter.decide(
+            RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = "start reading now"),
+            snapshot(),
+        )
+        assertEquals(RouterDecision.Action.VLM_TEXT_READ, reading.action)
+    }
+
+    @Test
     fun `empty speech is ignored`() {
         val d = VyzeShadowRouter.decide(
             RouterSignal(kind = RouterSignal.Kind.SPEECH, spokenText = "   "),
@@ -135,50 +161,6 @@ class VyzeShadowRouterTest {
         assertEquals(VyzeShadowRouter.decide(signal, s), VyzeShadowRouter.decide(signal, s))
     }
 
-    // ── SessionEpisodeManager (Section 6 thermal design) ─────────
-
-    @Test
-    fun `episode openOrTouch refreshes lastUsedAt`() {
-        var now = 1_000L
-        val m = SessionEpisodeManager(nowMs = { now })
-        m.openOrTouch("s1")
-        now = 60_000L
-        m.openOrTouch("s1")
-        // 60s idle but touched at 60s → 0s idle → survives the 90s thermal window
-        val evicted = m.evictIdle(isThermallyConstrained = true)
-        assertTrue(evicted.isEmpty())
-        assertEquals(1, m.size())
-    }
-
-    @Test
-    fun `idle episodes evicted after the normal window`() {
-        var now = 1_000L
-        val m = SessionEpisodeManager(nowMs = { now }, idleEvictMs = 300_000L)
-        m.openOrTouch("s1")
-        now = 1_000L + 301_000L
-        val evicted = m.evictIdle(isThermallyConstrained = false)
-        assertEquals(listOf("s1"), evicted)
-        assertEquals(0, m.size())
-    }
-
-    @Test
-    fun `thermal pressure shrinks the eviction window`() {
-        var now = 1_000L
-        val m = SessionEpisodeManager(nowMs = { now }, thermalEvictMs = 90_000L)
-        m.openOrTouch("s1")
-        now = 1_000L + 100_000L // 100s idle: survives 5min normal, dies under thermal
-        assertTrue(m.evictIdle(isThermallyConstrained = false).isEmpty())
-        m.openOrTouch("s1") // re-open (fresh lastUsedAt)
-        now += 100_000L
-        val evicted = m.evictIdle(isThermallyConstrained = true)
-        assertTrue(evicted.contains("s1"))
-    }
-
-    @Test
-    fun `close removes the episode immediately`() {
-        val m = SessionEpisodeManager(nowMs = { 0L })
-        m.openOrTouch("s1")
-        m.close("s1")
-        assertEquals(0, m.size())
-    }
+    // NOTE (P4 #105, 2026-11-09): the SessionEpisodeManager section lived
+    // here — deleted with the manager (production never opened an episode).
 }

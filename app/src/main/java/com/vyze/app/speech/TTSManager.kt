@@ -143,10 +143,14 @@ class TTSManager private constructor(context: Context) {
     private val utteranceCallbacks = ConcurrentHashMap<String, PerUtteranceCallbacks>()
 
     /**
-     * Additive, engine-global callback fired ONLY for utterances that played
-     * to completion — never for speech flushed by stop()/QUEUE_FLUSH (those
-     * are reported as onError instead). Multiple concerns can observe
-     * completion independently. Used by the preference learner.
+     * Engine-global callback fired ONLY for utterances that played to
+     * completion — never for speech flushed by stop()/QUEUE_FLUSH (those
+     * are reported as onError instead). SINGLE slot by design (audit P3
+     * #87): the sole assigner is VyzeCoreController.init (preference
+     * learner), and the controller is app-scoped, so re-assignment on a
+     * rebuild correctly drops the stale closure — there is no second
+     * observer to clobber. If a second concern ever needs completion,
+     * convert this to an observer list THEN, not before.
      */
     var onUtteranceCompleted: ((utteranceId: String) -> Unit)? = null
 
@@ -623,6 +627,14 @@ class TTSManager private constructor(context: Context) {
         return accepted
     }
 
+    /**
+     * Queue speech WITHOUT clipping in-flight utterances (audit P2 #28,
+     * 2026-11-09): this used to delegate to [speakImmediate] (QUEUE_FLUSH),
+     * so the direct-read announcement was instantly flushed by its own
+     * document and the dead-air filler clipped in-flight answers despite
+     * its QUEUE_ADD comment. Callers that want barge-in use
+     * [speakImmediate]/[speakImmediateQueued] explicitly.
+     */
     fun speakQueued(text: String, deadAirFiller: Boolean = false) {
         Log.i(TAG, "speakQueued() INVOKED: text='${text.take(100)}', isReady=${isInitialized}, bufferSize=${speechBuffer.size}")
 
@@ -632,7 +644,10 @@ class TTSManager private constructor(context: Context) {
         }
 
         if (isInitialized) {
-            speakImmediate(text, deadAirFiller = deadAirFiller)
+            val id = nextUtteranceId()
+            if (deadAirFiller) deadAirUtteranceIds.add(id)
+            val accepted = speak(text, TextToSpeech.QUEUE_ADD, utteranceId = id)
+            if (!accepted && deadAirFiller) deadAirUtteranceIds.remove(id)
         } else {
             Log.d(TAG, "speakQueued: TTS not ready — buffering: \"${text.take(60)}\"")
             speechBuffer.add(text)
@@ -869,6 +884,15 @@ class TTSManager private constructor(context: Context) {
         if (ids.isEmpty()) return
         pendingUtteranceIds.removeAll(ids)
         ids.forEach { id ->
+            // Audit P2 #31: a flush is a terminal event for the dropped
+            // utterance — run the same cleanup onUtteranceError runs.
+            // Without this, a QUEUE_FLUSH barge-in over a voice-flipped
+            // (zh) span leaked the flip: the engine stayed on the zh
+            // voice and the barging-in utterance spoke with it. Both
+            // restores are idempotent, so a late engine onError/onDone
+            // for the same id is a harmless no-op.
+            restoreNormalRateAfterCritical(id)
+            restoreVoiceAfterFlip(id)
             val callbacks = utteranceCallbacks.remove(id)
             try { callbacks?.onError?.invoke() } catch (_: Throwable) {}
         }
@@ -924,6 +948,17 @@ class TTSManager private constructor(context: Context) {
                 .setAudioAttributes(focusAttributes)
                 .setOnAudioFocusChangeListener { focusChange ->
                     Log.d(TAG, "Audio focus changed: $focusChange")
+                    // PERMANENT loss (phone call, another app): stop speech
+                    // NOW — talking over a call is a safety failure (#30).
+                    // Transient loss (notification ping) is ignored: Vyze
+                    // speech is primary UI. No auto-reacquire — the dead
+                    // request is dropped and re-held only if
+                    // holdSessionFocus() runs again.
+                    if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+                        CrashLogFile.log(TAG, "Audio focus LOST — stopping speech")
+                        audioFocusRequest = null
+                        stop()
+                    }
                 }
                 .build()
 

@@ -66,9 +66,6 @@ class TtsSettingsFragment : Fragment() {
     // P2 views
     private lateinit var valueNightMode: TextView
     private lateinit var spinnerNightMode: Spinner
-    private lateinit var btnReadingMode: Button
-    private lateinit var btnMedicineMode: Button
-    private lateinit var btnGestureTutorial: Button
     private lateinit var btnErrorLog: Button
 
     // Debounce for slider changes — speak sample only after 500ms of inactivity
@@ -124,9 +121,6 @@ class TtsSettingsFragment : Fragment() {
         // P2 views
         valueNightMode = view.findViewById(R.id.value_night_mode)
         spinnerNightMode = view.findViewById(R.id.spinner_night_mode)
-        btnReadingMode = view.findViewById(R.id.btn_reading_mode)
-        btnMedicineMode = view.findViewById(R.id.btn_medicine_mode)
-        btnGestureTutorial = view.findViewById(R.id.btn_gesture_tutorial)
         btnErrorLog = view.findViewById(R.id.btn_error_log)
         setupNightModeSpinner()
         setupModeButtons()
@@ -136,11 +130,13 @@ class TtsSettingsFragment : Fragment() {
      * Loads saved settings from SharedPreferences and positions sliders accordingly.
      */
     private fun loadSavedSettings() {
-        // Language
+        // Language label only — the spinner position is set in
+        // setupLanguageSpinner AFTER its adapter exists. Selecting here
+        // (pre-adapter) drops the position: the spinner sits at 0
+        // (English) and the initial onItemSelected then overwrites a
+        // saved ms/zh choice and speaks on entry (audit P2 #45).
         val savedLang = prefs.getString(TTSManager.KEY_LANGUAGE, TTSManager.LANGUAGE_ENGLISH)
             ?: TTSManager.LANGUAGE_ENGLISH
-        val langIndex = TTSManager.SUPPORTED_LANGUAGES.indexOf(savedLang).coerceAtLeast(0)
-        spinnerLanguage.setSelection(langIndex)
         valueLanguage.text = languageDisplayName(savedLang)
 
         // Rate
@@ -282,6 +278,16 @@ class TtsSettingsFragment : Fragment() {
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         spinnerLanguage.adapter = adapter
 
+        // Position AFTER the adapter exists (#45): the initial
+        // onItemSelected then carries the saved position and the
+        // selected==current equality check below no-ops it — no reset,
+        // no speech on entry.
+        val savedLang = prefs.getString(TTSManager.KEY_LANGUAGE, TTSManager.LANGUAGE_ENGLISH)
+            ?: TTSManager.LANGUAGE_ENGLISH
+        spinnerLanguage.setSelection(
+            TTSManager.SUPPORTED_LANGUAGES.indexOf(savedLang).coerceAtLeast(0)
+        )
+
         spinnerLanguage.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val selectedKey = TTSManager.SUPPORTED_LANGUAGES[position]
@@ -336,11 +342,19 @@ class TtsSettingsFragment : Fragment() {
         refreshVoiceChoices()
     }
 
-    /** Rebuild the voice list for the current language and reset to automatic. */
+    /**
+     * Rebuild the voice list for the current language, restoring the
+     * persisted pick when it belongs to this language (the manager
+     * already applied it at engine init — this only aligns the label
+     * and the Use button). A new language's list never contains the
+     * old pick, so switching falls back to automatic. (#45 family.)
+     */
     private fun refreshVoiceChoices() {
         voiceChoices.clear()
         voiceChoices.addAll(ttsManager.getInstalledVoicesForCurrentLanguage())
-        voiceIndex = 0 // 0 = automatic (best available)
+        val savedVoice = prefs.getString(TTSManager.KEY_VOICE_NAME, TTSManager.VOICE_AUTO)
+        val savedIndex = voiceChoices.indexOfFirst { it.name == savedVoice }
+        voiceIndex = if (savedIndex >= 0) savedIndex + 1 else 0 // 0 = automatic
         updateVoiceLabel()
     }
 
@@ -442,28 +456,12 @@ class TtsSettingsFragment : Fragment() {
         }
     }
 
-    // ── Specialized Mode Buttons ──────────────────────────────────────
+    // ── Diagnostics ─────────────────────────────────────────────────
+    // (Reading/medicine/tutorial placebo buttons removed 2026-11-09,
+    // audit #46: they spoke "activated" and set no flag — no such modes
+    // exist. If real modes are ever designed, add them with flags here.)
 
     private fun setupModeButtons() {
-        btnReadingMode.setOnClickListener {
-            ttsManager.speakImmediate(requireContext().getString(R.string.reading_mode_activated))
-            // Return to camera with reading mode flag
-            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
-            navController.popBackStack()
-        }
-
-        btnMedicineMode.setOnClickListener {
-            ttsManager.speakImmediate(requireContext().getString(R.string.medicine_mode_activated))
-            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
-            navController.popBackStack()
-        }
-
-        btnGestureTutorial.setOnClickListener {
-            ttsManager.speakImmediate(requireContext().getString(R.string.tutorial_start))
-            val navController = androidx.navigation.Navigation.findNavController(requireActivity(), R.id.fragment_container)
-            navController.popBackStack()
-        }
-
         btnErrorLog.setOnClickListener {
             val app = requireContext().applicationContext as com.vyze.app.VyzeApplication
             kotlinx.coroutines.MainScope().launch {

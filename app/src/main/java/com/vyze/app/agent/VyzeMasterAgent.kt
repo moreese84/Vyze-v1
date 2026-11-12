@@ -14,6 +14,7 @@ import com.google.adk.kt.types.Schema
 import com.google.adk.kt.types.Type
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -95,10 +96,13 @@ class VyzeMasterAgent private constructor(
         if (fastResult == null) {
             val bridge = bridgeProvider()
             val sessionId = "adk_master_${SEQ.incrementAndGet()}"
+            // Audit P2 #11: undecodable bytes used to reach the engine as
+            // a blank 1x1 bitmap (a guaranteed hallucination). Fail safe
+            // with an honest message — never a blind VLM answer either.
             val answer = if (userFrameBytes != null) {
                 val frame = bitmapFromBytes(userFrameBytes)
-                    ?: Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-                bridge.generateImage(frame, prompt, sessionId)
+                if (frame != null) bridge.generateImage(frame, prompt, sessionId)
+                else "I couldn't read that camera frame."
             } else {
                 bridge.generateText(prompt, sessionId)
             }
@@ -139,15 +143,13 @@ class VyzeMasterAgent private constructor(
      */
     private suspend fun runFastPath(userText: String): FastPathResult? {
         val text = userText.trim()
-        val lower = text.lowercase()
 
         // Haptic confirmation requests — pure device action. The whole
         // utterance must BE the command (e.g. "double tap"); a mention of
         // a pattern word inside a longer question ("what is tap water?")
         // is NOT a haptic request and falls through to VLM inference.
-        val hapticMatch = HAPTIC_INTENT_REGEX.matchEntire(text)
-        if (hapticMatch != null) {
-            val pattern = hapticMatch.groupValues[1].uppercase()
+        val pattern = companionHapticPatternForCommand(text)
+        if (pattern != null) {
             val hapticPattern = toolRegistry.hapticPattern ?: return null
             // Unknown names are ignored inside the tool binding: haptics
             // must never crash or misfire from a malformed pattern name.
@@ -158,7 +160,7 @@ class VyzeMasterAgent private constructor(
         }
 
         // Reading intents — instant OCR through the native ML Kit pipeline.
-        if (READ_INTENT_REGEX.containsMatchIn(lower)) {
+        if (companionIsReadIntent(text)) {
             val ocr = toolRegistry.ocr
             if (ocr != null) {
                 val frame = latestFrame(toolRegistry.frameProvider)
@@ -194,13 +196,65 @@ class VyzeMasterAgent private constructor(
         /** Model identity reported to the ADK pipeline. */
         const val MODEL_ID = "gemma-4-E2B-it.litertlm (local LiteRT-LM)"
 
-        /** Reading intent keywords (aligned with the native pipeline). */
-        private val READ_INTENT_REGEX =
-            Regex("\\b(read|text|label|sign|baca|teks|字|读|念)\\b")
+        /**
+         * Reading intent keywords (aligned with the native pipeline).
+         * Latin matches whole words, CJK matches as substrings — \b never
+         * fires inside CJK, so the old single regex could never hit 字/读/念
+         * (#76, same split as the #22 shadow taxonomy).
+         */
+        private val READ_INTENT_LATIN = listOf(
+            "read", "reading", "text", "label", "sign", "baca", "teks",
+        )
+        private val READ_INTENT_CJK = listOf("字", "读", "念")
+        private val READ_INTENT_LATIN_REGEX =
+            Regex("\\b(${READ_INTENT_LATIN.joinToString("|")})\\b")
+
+        /**
+         * True when [text] carries a reading intent. Locale.ROOT lowercase
+         * so Turkish locale can't break matching (#78 class).
+         */
+        internal fun companionIsReadIntent(text: String): Boolean {
+            val lower = text.lowercase(Locale.ROOT)
+            return READ_INTENT_LATIN_REGEX.containsMatchIn(lower) ||
+                READ_INTENT_CJK.any { lower.contains(it) }
+        }
 
         /** Haptic confirmation intents, capturing the pattern name. */
         private val HAPTIC_INTENT_REGEX =
-            Regex("\\b(tap|double.?tap|long.?press|warning)\\b")
+            Regex("\\b(tap|double.?tap|long.?press|warning)\\b", RegexOption.IGNORE_CASE)
+
+        /**
+         * Canonical haptic pattern names — the ONE allowlist shared by the
+         * fast path and the trigger_haptics tool gate (audit P2 #37).
+         */
+        internal val HAPTIC_PATTERN_NAMES = setOf("TAP", "DOUBLE_TAP", "LONG_PRESS", "WARNING")
+
+        /**
+         * Canonical pattern for a whole-utterance haptic command, or null
+         * when the text is not one (audit P2 #36/#37, P3 #78).
+         * Case-insensitive (#36); inner separators fold to "_" so
+         * "double tap"/"double-tap" hit DOUBLE_TAP instead of firing
+         * nothing while "Done." is spoken (#37); Locale.ROOT uppercases
+         * so Turkish locale can't break matching (#78). Unknown shapes
+         * ("doublextap") return null so the caller falls through to VLM
+         * instead of lying.
+         */
+        internal fun companionHapticPatternForCommand(text: String): String? {
+            val match = HAPTIC_INTENT_REGEX.matchEntire(text.trim()) ?: return null
+            return companionNormalizeHapticPattern(match.groupValues[1])
+        }
+
+        /**
+         * Canonical pattern name for a raw pattern word, or null when it
+         * names nothing known. Shared by the fast path and
+         * [TriggerHapticsTool] so both gates agree.
+         */
+        internal fun companionNormalizeHapticPattern(raw: String): String? {
+            val canonical = raw.uppercase(Locale.ROOT)
+                .replace(Regex("[^A-Z]+"), "_")
+                .trim('_')
+            return canonical.takeIf { it in HAPTIC_PATTERN_NAMES }
+        }
 
         /**
          * ONE-PASS SYSTEM INSTRUCTION (plan Phase 2) — kept as data for
@@ -329,23 +383,17 @@ internal class ReadSceneTextTool(
         FunctionDeclaration(
             name = name,
             description = description,
-            parameters = Schema(
-                type = Type.OBJECT,
-                properties = mapOf(
-                    "includeChinese" to Schema(
-                        type = Type.BOOLEAN,
-                        description = "Merge the Chinese-capable recognizer for CJK signage",
-                    ),
-                ),
-                required = listOf("includeChinese"),
-            ),
+            // No parameters (#77): OcrHelper always merges both
+            // recognizers, so a required includeChinese would teach the
+            // model a knob that does nothing.
+            parameters = Schema(type = Type.OBJECT),
         )
 
     override suspend fun execute(ctx: ToolContext, args: Map<String, Any>): Any {
         val frame = latestFrame(frameProvider)
             ?: return mapOf("error" to "No camera frame available right now")
-        // OcrHelper merges the latin + Chinese recognizers internally; the
-        // parameter is accepted for contract parity and per-recognizer tuning.
+        // OcrHelper always merges the latin + Chinese recognizers — the
+        // tool takes no arguments because there is no latin-only mode.
         val text = try {
             ocrFrame(frame)
         } catch (t: Throwable) {
@@ -430,13 +478,12 @@ internal class TriggerHapticsTool(
         )
 
     override suspend fun execute(ctx: ToolContext, args: Map<String, Any>): Any {
-        val name = (args["pattern"] as? String)?.uppercase().orEmpty()
+        val raw = (args["pattern"] as? String).orEmpty()
         // Unknown names are ignored: haptics must never crash or misfire
-        // from a malformed tool argument.
-        if (name in setOf("TAP", "DOUBLE_TAP", "LONG_PRESS", "WARNING")) {
-            hapticPattern(name)
-        }
-        return mapOf("triggered" to name)
+        // from a malformed tool argument. Canonicalization is shared with
+        // the fast path (P2 #37) and Locale.ROOT (P3 #78).
+        VyzeMasterAgent.companionNormalizeHapticPattern(raw)?.let { hapticPattern(it) }
+        return mapOf("triggered" to raw.uppercase(Locale.ROOT))
     }
 }
 

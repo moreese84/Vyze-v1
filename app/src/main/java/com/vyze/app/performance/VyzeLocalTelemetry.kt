@@ -30,22 +30,31 @@ object VyzeLocalTelemetry {
     /** Maximum telemetry rows kept in memory before oldest are dropped. */
     const val MAX_IN_MEMORY_ROWS = 200
 
-    /** Max telemetry rows written per file before rotating. */
+    /** Max telemetry rows flushed per batch (remainder waits for the next flush). */
     const val ROWS_PER_FILE = 300
 
-    /** Directory for local telemetry files (Downloads/Vyze_Telemetry/). */
-    fun telemetryDirectory(context: Context): File {
-        val dir = File(
-            android.os.Environment.getExternalStoragePublicDirectory(
-                android.os.Environment.DIRECTORY_DOWNLOADS
-            ),
-            "Vyze_Telemetry"
-        )
+    /** Serializes the header check-then-act + append (audit P3 #63). */
+    private val fileLock = Any()
+
+    /** Telemetry files older than this are swept on write (audit P3 #63). */
+    private const val TELEMETRY_RETENTION_MS = 30L * 24 * 60 * 60 * 1000
+
+    /**
+     * App-private telemetry directory (audit P1 #6 scope-down,
+     * 2026-11-09): CSVs used to land in public
+     * Downloads/Vyze_Telemetry. Pure java.io — JVM-tested in
+     * VyzeLocalTelemetryTest.
+     */
+    fun telemetryDir(filesDir: File): File {
+        val dir = File(filesDir, "telemetry")
         if (!dir.exists()) {
             dir.mkdirs()
         }
         return dir
     }
+
+    /** Directory for local telemetry files (app-private files/telemetry/). */
+    fun telemetryDirectory(context: Context): File = telemetryDir(context.filesDir)
 
     /** In-memory event buffer. */
     private val eventBuffer = ConcurrentLinkedQueue<TelemetryEvent>()
@@ -106,30 +115,20 @@ object VyzeLocalTelemetry {
         }
         if (batch.isEmpty()) return
         try {
-            val lines = batch.map { it.toCsvLine() }
-            File(dir, file.name).appendText(lines.joinToString("\n") + "\n")
+            companionSweepOldFiles(dir, System.currentTimeMillis())
+            companionAppendCsvLines(file, batch.map { it.toCsvLine() })
             bumpIngestionCount(context)
         } catch (e: Throwable) {
             CrashLogFile.log(TAG, "writeBufferedEventsToFile failed: ${e.message}")
         }
     }
 
-    /** Read the last N persisted rows for diagnostics. */
-    fun readRecentRows(context: Context, maxRows: Int): List<String> {
-        val dir = telemetryDirectory(context)
-        val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-        val out = mutableListOf<String>()
-        outer@ for (f in files) {
-            if (out.size >= maxRows) break
-            try {
-                f.readLines().reversed().forEach { line ->
-                    if (out.size >= maxRows) break@outer
-                    out.add(line)
-                }
-            } catch (_: Throwable) {}
-        }
-        return out
-    }
+    // NOTE (audit P2 #43, 2026-11-09): the diagnostics reader
+    // (readRecentRows) was DELETED, not fixed — it had zero callers in
+    // every source set and loaded whole daily files via readLines()
+    // (OOM risk on low-RAM Tier-3 phones). If a diagnostics reader is
+    // ever needed again, it must tail-read (bounded bytes from the end),
+    // never readLines(). Persisted rows stay write-only until then.
 
     /** Clear persisted telemetry for this app. */
     fun clear(context: Context) {
@@ -152,6 +151,72 @@ object VyzeLocalTelemetry {
             .take(64)
     }
 
+    /**
+     * CSV cell sanitizer (audit P3 #63): deviceModel/socModel went into
+     * rows RAW — a comma/newline in a Build string shifts columns (or
+     * rows). Unlike [sanitizeTag] this KEEPS spaces (readable corridor
+     * analysis: "samsung SM-S918B" survives) and only neutralizes what
+     * breaks the format: commas become semicolons, quotes and newlines
+     * go. Pure java.io-free — JVM-tested in VyzeLocalTelemetryTest.
+     */
+    internal fun companionCsvCell(value: String?): String {
+        if (value == null) return ""
+        return value.trim().take(64)
+            .replace(',', ';')
+            .filter { it != '"' && it != '\r' && it != '\n' }
+    }
+
+    /**
+     * True when [file] needs the HEADER row first (audit P3 #63): the
+     * HEADER const existed but was never written, so no CSV ever had a
+     * header. Only missing/empty files take one — pre-existing headerless
+     * files keep appending data (no mid-file header, no migration).
+     */
+    internal fun companionNeedsHeader(file: File): Boolean =
+        !file.exists() || file.length() == 0L
+
+    /**
+     * Delete telemetry_*.csv files older than the retention window
+     * (audit P3 #63 — daily files used to accumulate forever). Total:
+     * never throws, ignores foreign files and per-file failures.
+     * Returns the swept count. Pure java.io — JVM-tested.
+     */
+    internal fun companionSweepOldFiles(dir: File, nowMs: Long): Int {
+        val files = try {
+            dir.listFiles()
+        } catch (_: Throwable) {
+            null
+        } ?: return 0
+        var swept = 0
+        for (f in files) {
+            try {
+                if (f.isFile && f.name.startsWith("telemetry_") && f.name.endsWith(".csv") &&
+                    nowMs - f.lastModified() > TELEMETRY_RETENTION_MS
+                ) {
+                    if (f.delete()) swept++
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return swept
+    }
+
+    /**
+     * Append [lines] to [file], writing the HEADER row first when the
+     * file is new (audit P3 #63). The check-then-act + append run under
+     * [fileLock], so concurrent flushes can neither duplicate the header
+     * nor tear lines. Pure java.io — JVM-tested (hammer).
+     */
+    internal fun companionAppendCsvLines(file: File, lines: List<String>) {
+        if (lines.isEmpty()) return
+        synchronized(fileLock) {
+            if (companionNeedsHeader(file)) {
+                file.writeText(TelemetryEvent.HEADER + "\n")
+            }
+            file.appendText(lines.joinToString("\n") + "\n")
+        }
+    }
+
     private fun clampLatency(ms: Long): Long {
         if (ms < 0L) return 0L
         return min(ms, 999_999L)
@@ -159,7 +224,7 @@ object VyzeLocalTelemetry {
 
     private fun deviceModel(): String {
         return try {
-            "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim().take(64)
+            companionCsvCell("${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}")
         } catch (_: Throwable) {
             "unknown"
         }
@@ -174,10 +239,10 @@ object VyzeLocalTelemetry {
      */
     private fun socModel(): String {
         return try {
-            android.os.Build.SOC_MODEL.trim().take(64)
+            companionCsvCell(android.os.Build.SOC_MODEL)
         } catch (_: Throwable) {
             try {
-                android.os.Build.HARDWARE.trim().take(64)
+                companionCsvCell(android.os.Build.HARDWARE)
             } catch (_: Throwable) {
                 "unknown"
             }
@@ -246,8 +311,8 @@ object VyzeLocalTelemetry {
         companion object {
             // Schema v2 (2026-10-17): adds socModel after deviceModel so
             // cross-vendor corridor rows are chipset-comparable. Older same-day
-            // CSV files lack the column; readRecentRows consumers treat rows
-            // as opaque diagnostics strings, so no migration needed.
+            // CSV files lack the column; rows are opaque diagnostics
+            // strings, so no migration needed.
             val HEADER = "tsMs,taskType,backend,latencyMs,success,failureKind,deviceModel,socModel,osApi,totalRamMB,lowRamFlag,localeLanguage"
         }
 

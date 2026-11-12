@@ -9,8 +9,8 @@ import org.junit.Test
  * lever #1). The policy is pure: text in → [ResponseMode] out, no Android,
  * no state. These tests pin the execution contract:
  *
- *  - ONLY the three high-confidence IGNORE families are admitted
- *    (app-cue echo / greeting garble / filler-only).
+ *  - ONLY the four high-confidence IGNORE families are admitted
+ *    (app-cue echo / app-cue hybrid / greeting garble / filler-only).
  *  - EVERY positive intent and the catch-all PASS THROUGH — the pre-gate
  *    must never touch traffic that needs the camera or the model.
  *  - Out-of-domain asks deliberately pass through too: seed evidence marks

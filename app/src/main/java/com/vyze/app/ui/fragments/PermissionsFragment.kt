@@ -20,10 +20,16 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -38,8 +44,14 @@ private val PERMISSIONS_REQUIRED = arrayOf(
 )
 
 /**
- * The sole purpose of this fragment is to request permissions and, once granted, display the camera
- * fragment to the user.
+ * Requests permissions and, once granted, displays the camera fragment.
+ *
+ * LOOP BREAK (audit P2 #14, 2026-11-09): this fragment used to navigate
+ * to camera on EVERY result — granted or denied — while CameraFragment
+ * bounces back here from onResume whenever permissions are missing. Any
+ * denial (dialog or never-ask-again) spun an endless camera ⇄
+ * permissions swap. Denials now STAY on a recovery screen (Retry +
+ * Open Settings) instead of forwarding; only a grant proceeds.
  *
  * On Android 11+ (API 30+), also checks [Environment.isExternalStorageManager()]
  * for `MANAGE_EXTERNAL_STORAGE`. This is non-blocking — if the user denies it,
@@ -47,26 +59,26 @@ private val PERMISSIONS_REQUIRED = arrayOf(
  */
 class PermissionsFragment : Fragment() {
 
+    private var statusText: TextView? = null
+
+    /** True once a permission result arrived (distinguishes first-run from denial). */
+    private var hasAskedOnce = false
+
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            val allGranted = permissions.values.all { it }
-            if (allGranted) {
+            hasAskedOnce = true
+            val denied = permissions.filter { !it.value }.keys.toList()
+            if (denied.isEmpty()) {
                 Toast.makeText(
                     context,
                     "All permissions granted",
                     Toast.LENGTH_LONG
                 ).show()
+                checkAndRequestStoragePermission()
             } else {
-                // Check which permissions were denied
-                val denied = permissions.filter { !it.value }.keys
-                Toast.makeText(
-                    context,
-                    "Denied permissions: ${denied.joinToString(", ")}",
-                    Toast.LENGTH_LONG
-                ).show()
+                // STAY — forwarding to camera re-bounces here (#14).
+                updateDenialUi(denied)
             }
-            // Always navigate to camera — storage permission is non-blocking
-            checkAndRequestStoragePermission()
         }
 
     /**
@@ -90,20 +102,89 @@ class PermissionsFragment : Fragment() {
             navigateToCamera()
         }
 
+    /**
+     * Launcher for the app-details Settings page (permanent denial
+     * recovery). On return, granted proceeds; denied stays put.
+     */
+    private val appSettingsLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (!isAdded) return@registerForActivityResult
+            if (hasPermissions(requireContext())) {
+                checkAndRequestStoragePermission()
+            } else {
+                updateDenialUi(missingPermissions())
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val missingPermissions = PERMISSIONS_REQUIRED.filter {
-            ContextCompat.checkSelfPermission(requireContext(), it) !=
-                    PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missingPermissions.isEmpty()) {
+        if (hasPermissions(requireContext())) {
             // Camera/audio permissions already granted — check storage next
             checkAndRequestStoragePermission()
         } else {
-            requestPermissionLauncher.launch(missingPermissions.toTypedArray())
+            requestPermissionLauncher.launch(missingPermissions().toTypedArray())
         }
+    }
+
+    override fun onCreateView(
+        inflater: LayoutInflater,
+        container: ViewGroup?,
+        savedInstanceState: Bundle?
+    ): View? {
+        // Headless fast path when nothing is missing (no screen flash);
+        // otherwise the denial recovery screen.
+        if (context == null || hasPermissions(requireContext())) return null
+        return inflater.inflate(R.layout.fragment_permissions, container, false)
+    }
+
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        statusText = view.findViewById(R.id.text_permissions_status)
+        view.findViewById<Button>(R.id.btn_permissions_retry).setOnClickListener {
+            requestPermissionLauncher.launch(missingPermissions().toTypedArray())
+        }
+        view.findViewById<Button>(R.id.btn_permissions_settings).setOnClickListener {
+            openAppSettings()
+        }
+        updateDenialUi(missingPermissions())
+    }
+
+    override fun onDestroyView() {
+        statusText = null
+        super.onDestroyView()
+    }
+
+    private fun missingPermissions(): List<String> = PERMISSIONS_REQUIRED.filter {
+        ContextCompat.checkSelfPermission(
+            requireContext(),
+            it
+        ) != PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Show denial guidance: rationale text while the system would still
+     * show a dialog (first denial), Settings guidance once a denial is
+     * permanent (never-ask-again: no rationale + still denied after a
+     * result arrived).
+     */
+    private fun updateDenialUi(denied: List<String>) {
+        val ctx = context ?: return
+        val permanent = hasAskedOnce && denied.any { !shouldShowRequestPermissionRationale(it) }
+        val text = if (permanent) {
+            ctx.getString(R.string.perms_guidance_permanent)
+        } else {
+            ctx.getString(R.string.perms_guidance_rationale)
+        }
+        statusText?.text = text
+        Toast.makeText(ctx, text, Toast.LENGTH_LONG).show()
+    }
+
+    private fun openAppSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.parse("package:${requireContext().packageName}")
+        }
+        appSettingsLauncher.launch(intent)
     }
 
     /**

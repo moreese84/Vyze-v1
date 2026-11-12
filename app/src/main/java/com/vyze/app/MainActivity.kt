@@ -41,6 +41,7 @@ import com.vyze.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
 /**
@@ -251,6 +252,16 @@ class MainActivity : AppCompatActivity() {
 
             onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
+                    // Pop first, exit last (audit P2 #44): a blanket finish()
+                    // exited the app from pushed destinations (TTS settings).
+                    // At a start destination the stacks are empty and the
+                    // app still exits.
+                    val navHost = supportFragmentManager.findFragmentById(R.id.fragment_container) as? NavHostFragment
+                    if (navHost?.navController?.popBackStack() == true) return
+                    if (supportFragmentManager.backStackEntryCount > 0) {
+                        supportFragmentManager.popBackStack()
+                        return
+                    }
                     finish()
                 }
             })
@@ -323,6 +334,12 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         destroySpeechRecognizer()
         ttsManager.releaseSessionFocus()
+        // No post-destroy voice work (#55): stop model-ASR lanes from
+        // launching captures, and drop queued mic restarts/status posts —
+        // an in-flight blocking capture runs to its bounded end and its
+        // post lands in the purged handler.
+        asrScope.cancel()
+        mainHandler.removeCallbacksAndMessages(null)
         super.onDestroy()
         hapticManager?.cancel()
 
@@ -470,6 +487,8 @@ class MainActivity : AppCompatActivity() {
             onError = deliver,
             voice = voice
         )
+        // Rejection (debounce-drop) fires no callback — deliver here (#29).
+        if (!accepted) deliver()
         Log.d(TAG, "speakThenCallback: submission ${if (accepted) "OK" else "REJECTED (onDone already delivered)"}")
     }
 
@@ -702,12 +721,12 @@ class MainActivity : AppCompatActivity() {
                     // the user — never deliver that as a query.
                     SelfTalkPolicy.isSelfTalk(transcription) -> {
                         Log.w(TAG, "Gemma-primary: SELF-TALK dropped: \"$transcription\"")
-                        CrashLogFile.log(TAG, "SELF-TALK GUARD: gemma-primary dropped \"$transcription\"")
+                        CrashLogFile.logContent(TAG, "SELF-TALK GUARD: gemma-primary dropped \"$transcription\"")
                         onSpeechError?.invoke("I didn't catch that — tap the mic to try again")
                     }
                     else -> {
                         Log.i(TAG, "Gemma-primary transcript: $transcription")
-                        CrashLogFile.log(TAG, "GEMMA-PRIMARY TRANSCRIPT: $transcription")
+                        CrashLogFile.logContent(TAG, "GEMMA-PRIMARY TRANSCRIPT: $transcription")
                         // The EXACT original post-transcript pipeline — same
                         // entry point a recognized query uses. Student router
                         // untouched.
@@ -787,12 +806,12 @@ class MainActivity : AppCompatActivity() {
                     // (self-ID/refusal) is never the user's query.
                     if (SelfTalkPolicy.isSelfTalk(transcription)) {
                         Log.w(TAG, "Model-ASR rescue: SELF-TALK dropped: \"$transcription\"")
-                        CrashLogFile.log(TAG, "SELF-TALK GUARD: rescue dropped \"$transcription\"")
+                        CrashLogFile.logContent(TAG, "SELF-TALK GUARD: rescue dropped \"$transcription\"")
                         finishRescueWithError(originalError)
                         return@launch
                     }
                     Log.i(TAG, "Model-ASR transcription: \"$transcription\"")
-                    CrashLogFile.log(TAG, "MODEL-ASR transcription: \"$transcription\"")
+                    CrashLogFile.logContent(TAG, "MODEL-ASR transcription: \"$transcription\"")
                     runOnUiThread {
                         // The user may have tapped away while the rescue was
                         // recording (e.g. they chose a tap instead of repeating)
@@ -885,12 +904,12 @@ class MainActivity : AppCompatActivity() {
                 // ── LAYER 1: SELF-TALK FILTER (L4 stack) ─────────────
                 if (SelfTalkPolicy.isSelfTalk(transcription)) {
                     Log.w(TAG, "Suspect audio replay: SELF-TALK dropped: \"$transcription\"")
-                    CrashLogFile.log(TAG, "SELF-TALK GUARD: replay dropped \"$transcription\"")
+                    CrashLogFile.logContent(TAG, "SELF-TALK GUARD: replay dropped \"$transcription\"")
                     finishRescueWithError("No speech detected.")
                     return@launch
                 }
                 Log.i(TAG, "Suspect audio replay transcription: \"$transcription\"")
-                CrashLogFile.log(TAG, "SUSPECT AUDIO REPLAY result: \"$transcription\"")
+                CrashLogFile.logContent(TAG, "SUSPECT AUDIO REPLAY result: \"$transcription\"")
                 runOnUiThread {
                     if (!voiceSessionWanted) {
                         Log.d(TAG, "Suspect audio replay result after session aborted — dropping")
@@ -1233,6 +1252,19 @@ class MainActivity : AppCompatActivity() {
     fun startListeningSafely() {
         mainHandler.post {
             try {
+                // SESSION GRANT (#84): delayed retries (busy, adaptive,
+                // mic-pause) must not reopen a mic the user aborted —
+                // checked at FIRE time, not post time.
+                if (!voiceSessionWanted) {
+                    Log.d(TAG, "startListeningSafely: session no longer wanted — dropping")
+                    return@post
+                }
+                // STALE-AUDIO DROP (audit P2 #32): sessions entering here
+                // (mic restarts, busy retries, Gemma turns) skipped the
+                // clear in startListeningInternal — a suspect replay could
+                // transcribe a PREVIOUS utterance's retained bytes. Ladder
+                // retries bypass this method (same utterance) and keep them.
+                AudioCapture.clearLastCapture()
                 // ── GEMMA-PRIMARY OFFLINE VOICE ────────────────────
                 // The platform recognizer service accepts offline sessions
                 // and returns NOTHING (verified in the device log: three
@@ -1301,8 +1333,16 @@ class MainActivity : AppCompatActivity() {
                 } else if (!offline && !VyzeAgentRuntime.gemmaAlwaysEnabled) {
                     CrashLogFile.log(TAG, "GEMMA-PRIMARY SKIP: online + flag off → system recognizer (legacy)")
                 }
+                // LAZY RE-INIT (audit P2 #13): the Gemma branch destroys the
+                // platform recognizer to free the audio source and nothing
+                // rebuilt it — every later online turn died here until the
+                // process restarted.
                 if (speechRecognizer == null) {
-                    Log.w(TAG, "startListeningSafely: SpeechRecognizer is null")
+                    Log.i(TAG, "startListeningSafely: recognizer null — re-initializing")
+                    initSpeechRecognizer()
+                }
+                if (speechRecognizer == null) {
+                    Log.w(TAG, "startListeningSafely: SpeechRecognizer unavailable")
                     return@post
                 }
 
@@ -2058,7 +2098,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 Log.i(TAG, "onResults: \"$bestMatch\" lang=$finalLocale (bundle=$detectedLang)")
-                CrashLogFile.log(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
+                CrashLogFile.logContent(TAG, "Speech result: \"$bestMatch\" lang=$finalLocale")
                 lastDetectedLocale = finalLocale
                 localeFallbackIndex = 0 // a session succeeded — ladder back to start
                 suspectLadderRetries = 0 // a transcription was accepted — suspect budget restored

@@ -1,9 +1,6 @@
 package com.vyze.app.performance
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.os.Build
-import androidx.core.os.LocaleListCompat
 import com.google.ai.edge.litertlm.Backend
 
 /**
@@ -121,7 +118,11 @@ object VyzeAdaptiveBackend {
         if (osPreferredBackend.uppercase() == "GPU" && deviceCanGpu) {
             attempts.add("GPU")
         }
-        if (npuExperimental && deviceCanGpu) {
+        // Audit P3 #70: NPU appends ONLY when GPU is already chained —
+        // gating on deviceCanGpu alone made NPU the sole non-CPU attempt
+        // ([NPU, CPU]) on capable hardware with a CPU preference, despite
+        // the doc ban above.
+        if (npuExperimental && attempts.contains("GPU")) {
             attempts.add("NPU")
         }
         // CPU is always present and is the final fallback.
@@ -129,7 +130,16 @@ object VyzeAdaptiveBackend {
         return attempts
     }
 
-    /** True when the persisted preferred backend is GPU or NPU and still valid. */
+    /**
+     * True when the persisted preferred backend is GPU or NPU and still valid.
+     *
+     * Audit P3 #68: the overheat veto shares OVERTEMP_FALLBACK_THRESHOLD
+     * with the CPU fallback — a lone sub-threshold overheat must not veto
+     * hardware. The veto window keys off validation age (no dedicated
+     * overheat timestamp is persisted): conservative by design — a device
+     * sitting at/over the fallback threshold re-validates before any
+     * hardware preference is honored again.
+     */
     fun prefersHardwareBackend(state: PersistentState, nowMs: Long): Boolean {
         if (state.preferredBackend.uppercase() !in listOf("GPU", "NPU")) return false
         // A backend that was never validated (lastValidatedMs == 0, the fresh-
@@ -137,7 +147,7 @@ object VyzeAdaptiveBackend {
         if (state.lastValidatedMs <= 0L) return false
         // Re-validate after 24 hours or if the device has overheated recently.
         val staleAfterMs = 24 * 60 * 60 * 1000L
-        val recentOverheat = state.overtempCount > 0 &&
+        val recentOverheat = state.overtempCount >= OVERTEMP_FALLBACK_THRESHOLD &&
             (nowMs - state.lastValidatedMs) < staleAfterMs
         return !recentOverheat && (nowMs - state.lastValidatedMs) < staleAfterMs
     }
@@ -207,21 +217,31 @@ object VyzeAdaptiveBackend {
         prefs.edit().putBoolean(KEY_NPU_EXPERIMENTAL, enabled).apply()
     }
 
-    /** Increment overtemp counter and degrade to CPU if threshold reached. */
+    /**
+     * Increment the overtemp counter; true once the CPU-fallback
+     * threshold is reached.
+     *
+     * Audit P3 #69: this used to ALSO persist preferredBackend=CPU in a
+     * second, non-atomic commit — a verdict [resetOvertemp] never cleared
+     * (counter only), wedging the device on CPU forever after one hot
+     * episode. Enforcement is read-side instead ([isCpuOnlyForDevice]
+     * honors the counter), so cooldown fully lifts the fallback and
+     * there is only one commit to make.
+     */
     fun recordOvertemp(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val current = prefs.getInt(KEY_OVERTEMP_COUNT, 0)
         val next = current + 1
         prefs.edit().putInt(KEY_OVERTEMP_COUNT, next).apply()
-        val degraded = next >= OVERTEMP_FALLBACK_THRESHOLD
-        if (degraded) {
-            // Permanent fallback to CPU from this device session onward.
-            prefs.edit().putString(KEY_BACKEND, "CPU").apply()
-        }
-        return degraded
+        return next >= OVERTEMP_FALLBACK_THRESHOLD
     }
 
-    /** Reset overtemp counter after cooldown. */
+    /**
+     * Reset the overtemp counter after cooldown. Counter-only is COMPLETE
+     * (audit P3 #69): the fallback is enforced read-side from this
+     * counter, so clearing it re-arms hardware probing — no stuck verdict
+     * to clear anymore.
+     */
     fun resetOvertemp(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putInt(KEY_OVERTEMP_COUNT, 0).apply()
@@ -349,12 +369,30 @@ object VyzeAdaptiveBackend {
         return CPU_ONLY_SOC_FAMILIES.any { hw.contains(it) }
     }
 
-    /** Whether this device has any NPU-like API surface worth experimental probing. */
+    /**
+     * Whether this device has any NPU-like API surface worth experimental
+     * probing. The input is Build.HARDWARE — real chip ids ("mt6899",
+     * "sm8550"), only rarely a marketing string.
+     *
+     * Audit P3 #71: matching required literal "dimensity"/"snapdragon",
+     * so detect was dead on real hardware; matching is also Locale.US
+     * now (default-locale lowercase breaks Turkish). Known pinned gaps
+     * (follow-ups, not oversights): board codenames ("kona"), Exynos,
+     * and 7-series Snapdragon have real accelerators but no stable id
+     * pattern is claimed yet.
+     */
     fun deviceLooksLikeItHasNpu(hardware: String): Boolean {
-        val hw = hardware.lowercase()
-        return hw.contains("dimensity") && Regex("[9][0-9]{3}").containsMatchIn(hw) ||
-            hw.contains("snapdragon") && Regex("[89][0-9]{3}").containsMatchIn(hw) ||
-            hw.contains("tensor")
+        val hw = hardware.lowercase(java.util.Locale.US)
+        // Real chip-id forms: Dimensity mt68xx/mt69xx, flagship
+        // Snapdragon sm8xxx.
+        if (Regex("mt6[89]\\d\\d").containsMatchIn(hw)) return true
+        if (Regex("sm8\\d\\d\\d").containsMatchIn(hw)) return true
+        // Marketing-string forms (some devices report these instead) +
+        // Tensor (any generation).
+        if (hw.contains("tensor")) return true
+        if (hw.contains("dimensity")) return true
+        if (hw.contains("snapdragon")) return true
+        return false
     }
 
     /** Whether the device reports any NNAPI/NN runtime support. */
@@ -399,7 +437,6 @@ object VyzeAdaptiveBackend {
         dispatchCalibrationImage: suspend (EngineHandle) -> Long,
         measureRamDelta: () -> Long,
     ): CalibrationResult {
-        val startMs = System.currentTimeMillis()
         val ramBefore = measureRamDelta()
         val engine = try {
             buildEngine()

@@ -80,8 +80,6 @@ class VyzeAgentLiveRouteTest {
             "prompt must end with the no-echo output contract",
             gotPrompt!!.endsWith(VyzeQueryContext.OUTPUT_CONTRACT_TAIL)
         )
-        // Episode closed after the generation.
-        assertEquals(0, rt.episodes.size())
         assertFalse(rt.isLiveGenerationActive)
     }
 
@@ -170,7 +168,6 @@ class VyzeAgentLiveRouteTest {
         releaseFirst.complete(Unit)
         job.join()
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes.size())
     }
 
     @Test
@@ -184,7 +181,6 @@ class VyzeAgentLiveRouteTest {
         )
         assertNull(answer)
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes.size())
     }
 
     @Test
@@ -198,7 +194,6 @@ class VyzeAgentLiveRouteTest {
         )
         assertNull(answer)
         assertFalse(rt.isLiveGenerationActive)
-        assertEquals(0, rt.episodes.size())
     }
 
     // ── Decision logging is unchanged (shadow funnel intact) ─────

@@ -76,7 +76,6 @@
     <string name="color_blue">蓝色</string>
     <string name="color_purple">紫色</string>
     <string name="color_pink">粉色</string>
-    <string name="color_brown">棕色</string>
     <string name="color_dark_prefix">深色%1$s</string>
     <string name="color_bright_prefix">亮%1$s</string>
 
@@ -132,8 +131,6 @@
     <string name="color_unknown">未知</string>
 
     <!-- ── Reading Mode ──────────────────────────────────────────── -->
-    <string name="reading_mode_activated">阅读模式已激活。指向文字即可朗读。</string>
-    <string name="reading_mode_deactivated">阅读模式已停用。</string>
     <string name="reading_next_lines">正在朗读下几行。</string>
     <string name="reading_previous_lines">正在朗读前几行。</string>
     <string name="reading_bookmark">书签已保存在第%1$d行。</string>
@@ -143,8 +140,6 @@
     <string name="reading_end_of_page">已到达页面末尾。</string>
 
     <!-- ── Medicine Mode ─────────────────────────────────────────── -->
-    <string name="medicine_mode_activated">药品阅读器已激活。请指向处方标签。</string>
-    <string name="medicine_mode_deactivated">药品阅读器已停用。</string>
     <string name="medicine_drug_name">药品：%1$s</string>
     <string name="medicine_dosage">剂量：%1$s</string>
     <string name="medicine_frequency">用法：%1$s</string>
@@ -160,8 +155,6 @@
     <string name="night_mode_toggled">主题已更改为%1$s</string>
 
     <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
-    <string name="tutorial_title">手势教程</string>
-    <string name="tutorial_start">开始手势教程。请按照指示操作。</string>
     <string name="tutorial_step_single_tap">在圆圈内任意位置点击一次</string>
     <string name="tutorial_step_double_tap">快速点击两次</string>
     <string name="tutorial_step_long_press">按住2秒钟</string>
@@ -204,4 +197,10 @@
     <string name="loading_spoken_start_zh">正在启动Vyze。</string>
     <string name="loading_spoken_error_zh">Vyze无法启动。点按任意位置重试。</string>
     <string name="loading_still_working_zh">仍在工作——现在打开相机。</string>
+    <!-- Permission recovery screen (audit P2 #14) -->
+    <string name="perms_title">需要相机和麦克风</string>
+    <string name="perms_guidance_rationale">Vyze 需要相机来看，麦克风来听您说话。请授予这两项权限以继续。</string>
+    <string name="perms_guidance_permanent">权限已被拒绝。请打开设置，点击权限，并允许相机和麦克风。</string>
+    <string name="perms_retry">重试</string>
+    <string name="perms_open_settings">打开设置</string>
 </resources>

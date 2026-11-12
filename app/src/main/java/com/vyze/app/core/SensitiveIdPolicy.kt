@@ -50,7 +50,8 @@ object SensitiveIdPolicy {
     /**
      * Explicit NON-sensitive carve-outs. Banknote serial asks ("nombor
      * siri duit ini", "the serial on this note") stay allowed — checked
-     * FIRST so a money-serial ask never trips the sensitive keywords.
+     * AFTER the sensitive keywords, so a serial word never shields a
+     * query that also names an identity document (audit P2 #49).
      */
     val MONEY_SERIAL_KEYWORDS: List<String> = listOf(
         "serial", "nombor siri", "no siri", "siri duit",
@@ -65,8 +66,19 @@ object SensitiveIdPolicy {
     fun isSensitiveIdQuery(query: String?): Boolean {
         if (query.isNullOrBlank()) return false
         val lower = query.lowercase()
+        // Whole-app audit P2 #49: the sensitive-document mention wins.
+        // The carve-out used to be checked FIRST and unconditionally, so
+        // 'nombor siri kad pengenalan' bypassed the pinned refusal. A query
+        // that names an identity document refuses even when it also
+        // carries a serial word.
+        if (SENSITIVE_ID_KEYWORDS.any { lower.contains(it) }) return true
+        // Pure money-serial asks ("nombor siri duit ini") carry no
+        // sensitive keyword, so they fall through to allowed here; the
+        // explicit check pins the owner decision (2026-09-26) in code, and
+        // the carve-out tests trip if a future sensitive keyword ever
+        // overlaps a money term.
         if (MONEY_SERIAL_KEYWORDS.any { lower.contains(it) }) return false
-        return SENSITIVE_ID_KEYWORDS.any { lower.contains(it) }
+        return false
     }
 
     /**

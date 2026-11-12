@@ -1,5 +1,7 @@
 package com.vyze.app.performance
 
+import android.os.SystemClock
+
 /**
  * E0 PER-FRAME BUDGET PROBE (plan §E0, MNN steal-list) — the instrument
  * that unblocks the E2 (walking lane) vs E3 (tiny-model lane) fork.
@@ -51,16 +53,20 @@ package com.vyze.app.performance
  * speaking while a continuous frame is open would pair to that frame —
  * the metric stays honest as "first audio after capture".
  *
- * PURE: no Android, no I/O, no content — timings, counts and a thermal
- * tier label only (logcat is not a private channel). Thread-safe
- * (@Synchronized): called from the capture path, the controller's skip
- * callback, and the TTS progress listener.
+ * PURE: no I/O, no content — timings, counts and a thermal tier label
+ * only (logcat is not a private channel). The one Android touch is the
+ * DEFAULT clock: SystemClock.elapsedRealtime (monotonic) — the old
+ * wall-clock default let an NTP step-back record negative latency and
+ * fake an E2_VIABLE verdict (audit P2 #42). Tests inject a fake clock.
+ * Thread-safe (@Synchronized): called from the capture path, the
+ * controller's skip callback, and the TTS progress listener.
  *
  * Provenance of the thresholds: plan §E0 (2026-09-26). One open-frame
  * window at a time; ring-bounded like [com.vyze.app.agent.ShadowEvalRecorder].
  */
 class FrameBudgetProbe(
-    private val nowMs: () -> Long = System::currentTimeMillis,
+    // Monotonic: wall-clock NTP steps used to fake verdicts (P2 #42).
+    private val nowMs: () -> Long = SystemClock::elapsedRealtime,
     private val capacity: Int = DEFAULT_CAPACITY,
 ) {
 
@@ -192,14 +198,20 @@ class FrameBudgetProbe(
         val t0 = openT0Ms ?: return null
         val at = nowMs()
         openT0Ms = null
-        val answered = outcome == Outcome.ANSWERED
+        // Audit P2 #42: a stepped-back clock (or a bogus injected one)
+        // yields negative latency, which used to average straight into
+        // the verdict and fake E2_VIABLE. Corrupt samples close as
+        // ABANDONED — counted, never averaged (same rule as lost frames).
+        val effectiveOutcome =
+            if (outcome == Outcome.ANSWERED && at - t0 < 0L) Outcome.ABANDONED else outcome
+        val answered = effectiveOutcome == Outcome.ANSWERED
         val sample = FrameSample(
             index = frameCounter,
             t0Ms = t0,
             firstAudioAtMs = if (answered) at else null,
             frameToAudioMs = if (answered) at - t0 else null,
             thermalTier = openThermalTier,
-            outcome = outcome,
+            outcome = effectiveOutcome,
         )
         samples.addLast(sample)
         while (samples.size > capacity) samples.removeFirst()

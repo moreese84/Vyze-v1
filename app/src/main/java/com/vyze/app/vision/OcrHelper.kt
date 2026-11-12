@@ -84,11 +84,23 @@ class OcrHelper {
 
                 val latinResult = try {
                     latinRecognizer.process(inputImage).await()
-                } catch (e: Exception) { null }
+                } catch (e: Exception) {
+                    // Audit P3 #80: NEVER swallow silently — a missing or
+                    // broken recognizer model must be distinguishable from
+                    // "no text in this script" in logcat. The message is
+                    // SDK-side (never user content).
+                    Log.w(TAG, "OCR latin recognizer failed: ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
 
                 val chineseResult = try {
                     chineseRecognizer.process(inputImage).await()
-                } catch (e: Exception) { null }
+                } catch (e: Exception) {
+                    // Audit P3 #80: same — a missing Chinese model download
+                    // used to look exactly like a text-free frame.
+                    Log.w(TAG, "OCR chinese recognizer failed: ${e.javaClass.simpleName}: ${e.message}")
+                    null
+                }
 
                 val lines = mutableListOf<OcrLine>()
                 collectUsableLines(latinResult, isChinese = false, lines)
@@ -108,14 +120,20 @@ class OcrHelper {
                 var totalConf = 0f
                 var totalChars = 0
                 for (row in ordered) {
-                    val rowLines = row.sortedBy { it.left }
+                    // Both recognizers return the same printed line —
+                    // dedup before joining or the row speaks twice (#81).
+                    val rowLines = companionDedupRowLines(row.sortedBy { it.left })
                     val rowText = rowLines.joinToString(" ") { it.text }.trim()
                     if (rowText.isEmpty()) continue
                     if (sb.isNotEmpty()) sb.append('\n')
                     sb.append(rowText)
-                    val chars = rowLines.sumOf { it.text.length }
-                    totalConf += rowLines.fold(0f) { acc, l -> acc + l.confidence * l.text.length }
-                    totalChars += chars
+                    // Unknown-confidence lines keep their text but are
+                    // excluded from the average (#82).
+                    for (l in rowLines) {
+                        val c = l.confidence ?: continue
+                        totalConf += c * l.text.length
+                        totalChars += l.text.length
+                    }
                 }
 
                 val merged = sb.toString()
@@ -132,13 +150,18 @@ class OcrHelper {
             }
         }
 
-    /** One recognized text line with its visual band + average confidence. */
-    private class OcrLine(
+    /**
+     * One recognized text line with its visual band + average confidence.
+     * Null confidence = the line reported no usable value: its text is
+     * kept but it is excluded from the merge average (#82). Internal for
+     * the JVM-tested merge helpers.
+     */
+    internal class OcrLine(
         val top: Int,
         val left: Int,
         val bottom: Int,
         val text: String,
-        val confidence: Float
+        val confidence: Float?
     )
 
     /** Collect the lines of one recognizer that genuinely belong to its script. */
@@ -173,13 +196,17 @@ class OcrHelper {
                 (c in 0xF900..0xFAFF)     // Compatibility Ideographs
         }
 
-    /** Average confidence of a line's elements (neutral default when absent). */
-    private fun lineConfidence(line: com.google.mlkit.vision.text.Text.Line): Float {
-        val elements = line.elements
-        if (elements.isEmpty()) return 0.85f
-        var sum = 0f
-        for (e in elements) sum += e.confidence
-        return sum / elements.size
+    /**
+     * Average confidence of a line's usable elements, or null when the
+     * line reports none (#25/#82). Element confidence is a platform
+     * type — it is read as nullable so a missing value can never NPE
+     * the whole read into a silent (null, 0f) — and element-less lines
+     * no longer vote a confident 0.85 into the merge average that
+     * gates the 0.85 fast-path.
+     */
+    private fun lineConfidence(line: com.google.mlkit.vision.text.Text.Line): Float? {
+        val confidences: List<Float?> = line.elements.map { it.confidence }
+        return companionLineConfidence(confidences)
     }
 
     /**
@@ -220,5 +247,52 @@ class OcrHelper {
 
         /** Minimum characters for OCR result to be considered useful. */
         private const val MIN_TEXT_LENGTH = 3
+
+        /**
+         * Average of usable element confidences, or null when none
+         * report. Pure — JVM-tested in OcrHelperTest.
+         */
+        internal fun companionLineConfidence(confidences: List<Float?>): Float? {
+            val usable = confidences.filterNotNull()
+            if (usable.isEmpty()) return null
+            return usable.sum() / usable.size
+        }
+
+        /**
+         * Intra-row dedup (audit P2 #81): the Latin and Chinese
+         * recognizers both return the same printed line, and the row
+         * join would speak it twice. Exact dupes collapse (first kept);
+         * a line contained in a kept longer line is dropped; a longer
+         * arrival evicts the shorter it contains — longer wins
+         * regardless of order. Comparison is case/space-insensitive;
+         * containment needs [DEDUP_MIN_CONTAINED] chars so 1-2 char
+         * coincidences ("I" in "IN") survive. Complementary halves
+         * ("Monosodium" + "味精") never contain each other and are
+         * always kept. Pure — JVM-tested in OcrHelperTest.
+         */
+        internal fun companionDedupRowLines(lines: List<OcrLine>): List<OcrLine> {
+            if (lines.size < 2) return lines
+            val kept = mutableListOf<OcrLine>()
+            for (line in lines) {
+                val norm = normDedupText(line.text)
+                if (kept.any { normDedupText(it.text) == norm }) continue
+                if (kept.any {
+                        normDedupText(it.text).contains(norm) && norm.length >= DEDUP_MIN_CONTAINED
+                    }
+                ) continue
+                kept.removeAll {
+                    val k = normDedupText(it.text)
+                    norm.contains(k) && k.length >= DEDUP_MIN_CONTAINED && k.length < norm.length
+                }
+                kept.add(line)
+            }
+            return kept
+        }
+
+        private fun normDedupText(text: String): String =
+            text.lowercase().replace(Regex("\\s+"), " ").trim()
+
+        /** Min contained length for containment dedup (see above). */
+        private const val DEDUP_MIN_CONTAINED = 3
     }
 }

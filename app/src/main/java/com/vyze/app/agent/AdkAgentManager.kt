@@ -108,16 +108,17 @@ object AdkAgentManager {
             VyzeToolWiring::defaultGridSectorMapper,
         forceRebuild: Boolean = false,
     ) {
-        // Capture the LATEST provider each call: the bridge is resolved per
-        // turn, so engine rebinds reach the agent without a runner rebuild.
+        // The field always holds the LATEST provider (line below); the
+        // agent resolves it PER TURN, so engine rebinds reach it without
+        // a runner rebuild (audit P2 #38 — capturing this call's
+        // parameter here used to make rebindEngine a silent no-op).
         this.bridgeProvider = bridgeProvider
         if (runner == null || masterAgent == null || forceRebuild) {
             if (forceRebuild && runner != null) {
                 Log.i(TAG, "Rebuilding master-agent runner with PRODUCTION native bindings")
             }
-            val provider = bridgeProvider
             val agent = VyzeMasterAgent.create(
-                bridgeProvider = { provider() },
+                bridgeProvider = { this.bridgeProvider() },
                 frameProvider = frameProvider,
                 ocrFrame = ocrFrame,
                 speakImmediate = speakImmediate,
@@ -183,37 +184,57 @@ object AdkAgentManager {
      *   execution already in flight. Null ALWAYS means "fall back to the
      *   native legacy dispatch"; the fallback is never disabled here.
      */
+    /**
+     * One master-agent turn's outcome (audit P3 #65): a turn refused for
+     * a busy lane used to return the same null as a genuine failure, so
+     * the eval ring tallied it FAILED and DECLINED_BUSY was unreachable.
+     */
+    sealed interface TurnResult {
+        /** Executed; the engine returned this non-blank answer. */
+        data class Answered(val text: String) : TurnResult
+
+        /** Refused: another agent-path generation was in flight. */
+        object DeclinedBusy : TurnResult
+
+        /** Attempted but no answer came back (or never ran). */
+        object Failed : TurnResult
+    }
+
     suspend fun execute(
         query: String,
         imageFrame: Bitmap? = null,
         queryContext: VyzeQueryContext = VyzeQueryContext(),
-    ): String? {
+    ): TurnResult {
         val agent = masterAgent
         val execRunner = runner
         if (agent == null || execRunner == null) {
             Log.w(TAG, "execute before initialize — declining to legacy dispatch")
-            return null
+            return TurnResult.Failed
         }
-        if (query.isBlank()) return null
+        if (query.isBlank()) return TurnResult.Failed
 
         // One master-agent generation at a time (decline, never queue —
         // queuing would reorder answers against the legacy pipeline).
         if (!executionActive.compareAndSet(false, true)) {
             Log.d(TAG, "execute: another master turn in flight — declining")
-            return null
+            return TurnResult.DeclinedBusy
         }
 
         val sessionId = "adk_master_${sessionSeq.incrementAndGet()}"
         try {
-            return withTimeoutOrNull(EXECUTE_TIMEOUT_MS) {
+            val answer = withTimeoutOrNull(EXECUTE_TIMEOUT_MS) {
                 runMasterTurn(execRunner, sessionId, query, imageFrame, queryContext)
-            } ?: run {
-                Log.w(TAG, "Master-agent turn timed out after ${EXECUTE_TIMEOUT_MS}ms — legacy fallback")
-                null
             }
+            // Blank counts as failed too — the FAILED contract is "null/
+            // EMPTY or threw", and there is nothing to speak either way.
+            if (answer.isNullOrBlank()) {
+                if (answer == null) Log.w(TAG, "Master-agent turn timed out after ${EXECUTE_TIMEOUT_MS}ms — legacy fallback")
+                return TurnResult.Failed
+            }
+            return TurnResult.Answered(answer)
         } catch (t: Throwable) {
             Log.w(TAG, "Master-agent turn failed: ${t.javaClass.simpleName}: ${t.message}")
-            return null
+            return TurnResult.Failed
         } finally {
             // Session-per-turn hygiene: the ADK session is never reused;
             // delete it (NonCancellable so cleanup survives cancellation).
@@ -229,16 +250,16 @@ object AdkAgentManager {
     }
 
     /**
-     * Execute ONE query with an EXPLICIT per-call bridge. Guarantees the
-     * turn resolves the CURRENT engine op even under concurrent rebinds —
-     * the bridge closure is captured by the caller before the turn runs.
+     * Execute ONE query with an EXPLICIT per-call bridge: rebinds the
+     * shared provider first, so the turn resolves this bridge (the agent
+     * reads the current provider per turn — audit P2 #38).
      */
     suspend fun executeWithBridge(
         bridge: MasterModelBridge,
         query: String,
         imageFrame: Bitmap? = null,
         queryContext: VyzeQueryContext = VyzeQueryContext(),
-    ): String? {
+    ): TurnResult {
         rebindEngine(bridge)
         return execute(query, imageFrame, queryContext)
     }

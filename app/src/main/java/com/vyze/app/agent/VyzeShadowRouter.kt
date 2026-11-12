@@ -48,6 +48,11 @@ data class RouterDecision(
     val requiresVlm: Boolean,
     /** True when the answer should include the current camera frame. */
     val includeCameraFrame: Boolean,
+    /**
+     * Pre-gate family for IGNORE decisions (#75) — typed, so rewording
+     * [reason] can never silently drop a family back to PASS_THROUGH.
+     */
+    val ignoreFamily: IgnoreFamily = IgnoreFamily.NONE,
 ) {
     enum class Action {
         VLM_SCENE_DESCRIBE,   // single tap → "look"
@@ -57,6 +62,18 @@ data class RouterDecision(
         LIGHT_CHECK,          // long press
         SOS,                  // triple-tap-hold (reserved)
         IGNORE,               // empty/nonsensical input
+    }
+
+    /** IGNORE taxonomy shared by the student router and the pre-gate. */
+    enum class IgnoreFamily {
+        /** Not an IGNORE, or an unclassified one — passes through. */
+        NONE,
+        EMPTY_TRANSCRIPT,
+        APP_CUE_ECHO,
+        APP_CUE_HYBRID,
+        GREETING_GARBLE,
+        FILLER_ONLY,
+        OUT_OF_DOMAIN,
     }
 }
 
@@ -76,9 +93,16 @@ object VyzeShadowRouter {
     // Document terms (letter, surat, 信, 信件) keep the shadow taxonomy in
     // parity with the native TEXT_KEYWORDS list — a "read this letter" ask
     // is a reading intent, not a generic visual query.
-    private val READ_KEYWORDS =
-        listOf("read", "text", "label", "sign", "baca", "teks", "字", "读", "念",
-            "letter", "surat", "document", "信", "信件")
+    // Audit P2 #22: latin keywords are WORD-BOUNDARY matched — bare
+    // contains("read") stole bread/thread/already into the OCR-still
+    // lane. CJK stays substring (no word boundaries there). "reading"
+    // keeps its legacy routing explicitly.
+    private val READ_KEYWORDS_LATIN =
+        listOf("read", "reading", "text", "label", "sign", "baca", "teks",
+            "letter", "surat", "document")
+    private val READ_KEYWORDS_CJK = listOf("字", "读", "念", "信", "信件")
+    private val READ_LATIN_REGEX =
+        Regex("\\b(${READ_KEYWORDS_LATIN.joinToString("|")})\\b")
 
     /** Monotonic count of logged decisions (observability hook). */
     val decisionCount = AtomicLong(0)
@@ -131,7 +155,8 @@ object VyzeShadowRouter {
             )
         }
         val lower = text.lowercase()
-        val isReadIntent = READ_KEYWORDS.any { lower.contains(it) }
+        val isReadIntent = READ_LATIN_REGEX.containsMatchIn(lower) ||
+            READ_KEYWORDS_CJK.any { lower.contains(it) }
 
         val decision: RouterDecision = if (isReadIntent) {
             RouterDecision(
@@ -178,64 +203,10 @@ object VyzeShadowRouter {
     }
 }
 
-// ── Session episodes + idle eviction ─────────────────────────────────
-
-/**
- * One conversational episode = one ADK session, mirroring the native
- * pipeline's session-per-turn discipline. Episodes are reaped when idle,
- * and reaping is *accelerated* under thermal pressure by consulting the
- * existing [com.vyze.app.core.ThermalPowerController] status — the
- * controller remains the sole authority (its verdict is read, never
- * overridden).
- */
-class SessionEpisodeManager(
-    private val thermalStatusProvider: () -> String = { "unknown" },
-    private val nowMs: () -> Long = System::currentTimeMillis,
-    private val idleEvictMs: Long = 5 * 60_000L,
-    private val thermalEvictMs: Long = 90_000L,
-) {
-    data class Episode(val sessionId: String, val createdAt: Long, var lastUsedAt: Long)
-
-    private val episodes = LinkedHashMap<String, Episode>()
-
-    @Synchronized
-    fun openOrTouch(sessionId: String): Episode {
-        val now = nowMs()
-        return episodes.getOrPut(sessionId) { Episode(sessionId, now, now) }
-            .also { it.lastUsedAt = now }
-    }
-
-    @Synchronized
-    fun close(sessionId: String) {
-        episodes.remove(sessionId)
-    }
-
-    /** True when [sessionId] currently has an open episode. */
-    @Synchronized
-    fun exists(sessionId: String): Boolean = episodes.containsKey(sessionId)
-
-    /**
-     * Evict idle episodes. Under elevated thermal status the idle window
-     * shrinks from [idleEvictMs] to [thermalEvictMs] — fewer warm ADK
-     * sessions on device under thermal pressure.
-     *
-     * @param isThermallyConstrained true when ThermalPowerController
-     *   reports a throttled/limited state. Read-only consultation.
-     */
-    @Synchronized
-    fun evictIdle(isThermallyConstrained: Boolean): List<String> {
-        val now = nowMs()
-        val window = if (isThermallyConstrained) thermalEvictMs else idleEvictMs
-        val stale = episodes.values
-            .filter { now - it.lastUsedAt > window }
-            .map { it.sessionId }
-        stale.forEach { episodes.remove(it) }
-        return stale
-    }
-
-    @Synchronized
-    fun size(): Int = episodes.size
-}
+// NOTE (P4 #105, 2026-11-09): SessionEpisodeManager lived here —
+// production never opened an episode (the master lane deletes its ADK
+// session per turn, so orphans are impossible by construction) and the
+// thermalStatusProvider was never read. Deleted with its tick.
 
 // ── Shadow→live evaluation evidence ──────────────────────────────────
 

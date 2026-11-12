@@ -6,6 +6,7 @@ import com.vyze.app.util.CrashLogFile
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Looper
 import android.util.Log
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -128,6 +129,12 @@ object AudioCapture {
      * MUST be called off the main thread.
      */
     fun recordSpeech(maxDurationMs: Long = MAX_DURATION_MS): ByteArray? {
+        // Fail fast (P3 #89): the blocking capture MUST stay off-main.
+        // Callers treat null as failure, so refuse instead of ANR-ing.
+        if (Looper.getMainLooper()?.isCurrentThread == true) {
+            Log.e(TAG, "recordSpeech called on the main thread — refusing")
+            return null
+        }
         val minBuffer = try {
             AudioRecord.getMinBufferSize(
                 SAMPLE_RATE_HZ,

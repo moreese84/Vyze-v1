@@ -1,5 +1,7 @@
 package com.vyze.app.agent
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -10,8 +12,7 @@ import org.junit.Test
 
 /**
  * Phase 6 JVM tests: shadow→live evaluation evidence
- * ([ShadowEvalRecorder] + [VyzeAgentRuntime.shouldPromoteToLive]) and
- * session maintenance ([VyzeAgentRuntime.maintenanceTick]).
+ * ([ShadowEvalRecorder] + [VyzeAgentRuntime.shouldPromoteToLive]).
  *
  * The flip-predicate tests seed the window END-TO-END — by running real
  * (fast, fake-op) queries through [VyzeAgentRuntime.tryLiveRouteTextOnly]
@@ -39,11 +40,12 @@ class VyzeAgentEvalTest {
         query: String = "what is that",
         thermalAllowed: Boolean = true,
         answer: String? = "ok",
+        analyzeText: (suspend (String, String) -> String?)? = null,
     ): String? = rt.tryLiveRouteTextOnly(
         textOnlyQuery = query,
         snapshotProvider = { snapshot() },
         vlmInferenceAllowed = { thermalAllowed },
-        analyzeText = { _, _ -> answer },
+        analyzeText = analyzeText ?: { _, _ -> answer },
     )
 
     // ── Recorder math ─────────────────────────────────────────────
@@ -142,13 +144,34 @@ class VyzeAgentEvalTest {
         assertEquals(0, s.failed)
     }
 
-    // ── Maintenance tick ──────────────────────────────────────────
-
     @Test
-    fun `normal turn leaves no orphans and tick deletes nothing`() = runBlocking {
+    fun `a busy lane records DECLINED_BUSY, never FAILED`() = runBlocking {
+        // Whole-app audit P3 #65 (2026-11-09): a turn refused for a busy
+        // lane returned the same null as a genuine failure, so the eval
+        // ring tallied it FAILED and DECLINED_BUSY was unreachable.
         val rt = enabledRuntime()
-        assertEquals("ok", runQuery(rt))
-        assertEquals(0, rt.maintenanceTick { false })
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val slow: suspend (String, String) -> String? = { _, _ ->
+            entered.countDown()
+            release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+            "slow"
+        }
+        val first = async(Dispatchers.Default) {
+            runQuery(rt, query = "busy one", analyzeText = slow)
+        }
+        assertTrue(
+            "first turn never started",
+            entered.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        )
+        assertNull(runQuery(rt, query = "busy two"))
+        release.countDown()
+        assertEquals("slow", first.await())
+        val s = rt.evalSummary()
+        assertEquals(2, s.total)
+        assertEquals(1, s.answered)
+        assertEquals(1, s.declinedBusy)
+        assertEquals(0, s.failed)
     }
 
     @Test
@@ -166,30 +189,9 @@ class VyzeAgentEvalTest {
                 .filter { it.startsWith("adk_master_") }
             assertTrue("master lane must not leak sessions: $laneSessions", laneSessions.isEmpty())
         }
-        assertEquals(0, rt.maintenanceTick { false })
     }
 
-    @Test
-    fun `tick without a live runner is a no-op`() = runBlocking {
-        // No query ever ran → liveSessionService() is null.
-        assertEquals(0, VyzeAgentRuntime.maintenanceTick { false })
-    }
-
-    @Test
-    fun `tick is clean with an open fresh episode and thermal pressure`() = runBlocking {
-        val rt = enabledRuntime()
-        rt.episodes.openOrTouch("adk_text_probe")
-        // Fresh episode: nothing to evict even under thermal shrink.
-        assertEquals(0, rt.maintenanceTick { true })
-        rt.episodes.close("adk_text_probe")
-    }
-
-    @Test
-    fun `tick default-arg contract holds for the fragment ticker`() = runBlocking {
-        // The production ticker (CameraFragment, every 60s) calls
-        // maintenanceTick() with the default lambda, letting the runtime
-        // apply its NORMAL-window episode policy. Locks the signature so
-        // the no-arg call site keeps compiling.
-        assertEquals(0, VyzeAgentRuntime.maintenanceTick())
-    }
+    // NOTE (P4 #105, 2026-11-09): the maintenanceTick tests lived here —
+    // deleted with the tick (it only evicted from a store production
+    // never populated). The orphan-session assert above is the real net.
 }

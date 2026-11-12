@@ -6,6 +6,7 @@ import android.util.Log
 import com.vyze.app.data.InteractionDao
 import com.vyze.app.data.InteractionRecord
 import com.vyze.app.data.SuspectMarker
+import com.vyze.app.util.StorageRedaction
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -73,8 +74,8 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
             // 2. Persist to Room
             val record = InteractionRecord(
                 imageEmbedding = serializedEmbedding,
-                prompt = prompt,
-                output = output,
+                prompt = StorageRedaction.sanitizeForStorage(prompt, StorageRedaction.STORED_PROMPT_MAX_CHARS),
+                output = StorageRedaction.sanitizeForStorage(output, StorageRedaction.STORED_TEXT_MAX_CHARS),
                 feedback = feedback,
                 tags = tags
             )
@@ -187,12 +188,7 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
         limit: Int = 5
     ): List<InteractionRecord> = withContext(Dispatchers.IO) {
         try {
-            val terms = query
-                .trim()
-                .take(100)
-                .replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
+            val terms = companionEscapeLikeTerms(query)
             if (terms.isBlank()) {
                 emptyList()
             } else {
@@ -237,7 +233,11 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
             val poisoned = interactionDao.getAll()
                 .filter { AnchorEraParrot.isAnchorEraParrot(it.output) }
             if (poisoned.isNotEmpty()) {
-                interactionDao.deleteByIds(poisoned.map { it.id })
+                // Chunked: one IN() per 500 ids (P3 #92 — legacy SQLite
+                // caps variables at 999; the empty case yields no chunks).
+                for (chunk in companionDeleteIdChunks(poisoned.map { it.id })) {
+                    interactionDao.deleteByIds(chunk)
+                }
                 Log.d(tag, "Purged ${poisoned.size} anchor-era parrot records " +
                     "(ids ${poisoned.joinToString(",") { it.id.toString() }.take(120)})")
             }
@@ -277,6 +277,38 @@ class MemoryRepository(private val interactionDao: InteractionDao) {
     companion object {
         /** Maximum interaction records to keep in the database. */
         private const val MAX_INTERACTIONS = 1000
+
+        /**
+         * Prepare a raw recall query for the DAO's LIKE match (audit P2
+         * #19): trim, cap at 100 chars, backslash-escape LIKE wildcards
+         * (backslash FIRST so later passes keep it single). The DAO
+         * declares ESCAPE '\\' — the two halves only work together.
+         * Pure — JVM-tested in MemoryRepositoryTest.
+         */
+        internal fun companionEscapeLikeTerms(query: String): String =
+            query
+                .trim()
+                .take(100)
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+
+        /**
+         * IN-list chunk bound (audit P3 #92): legacy SQLite (API < 30,
+         * minSdk 26) allows 999 variables per statement; half that leaves
+         * headroom no matter what else shares the query.
+         */
+        private const val DELETE_IDS_CHUNK_SIZE = 500
+
+        /**
+         * Split [ids] into IN-safe chunks (audit P3 #92): empty in → no
+         * chunks (Room would emit `IN ()`, a SQLite syntax error); big
+         * purges in → 500-id chunks (the table holds 1000 rows, so one
+         * unchunked full-table purge dies on the legacy 999-variable
+         * limit). Pure — JVM-tested in MemoryRepositoryTest.
+         */
+        internal fun companionDeleteIdChunks(ids: List<Long>): List<List<Long>> =
+            if (ids.isEmpty()) emptyList() else ids.chunked(DELETE_IDS_CHUNK_SIZE)
     }
 }
 

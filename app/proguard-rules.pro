@@ -17,20 +17,30 @@
 -dontwarn com.google.ai.edge.litertlm.**
 
 # ── ML Kit Text Recognition ──────────────────────────────────────────────────
--keep class com.google.mlkit.** { *; }
+# No app keep (P3 #95): every ML Kit AAR ships its own consumer
+# proguard.txt, which R8 applies automatically — the old whole-tree
+# keep only pinned ~2000 classes unrenamed. Proven by
+# :app:minifyReleaseWithR8 + the mapping diff that removed it.
 -dontwarn com.google.mlkit.**
 
-# ── MediaPipe Vision / Tasks ─────────────────────────────────────────────────
--keep class com.google.mediapipe.** { *; }
--dontwarn com.google.mediapipe.**
-
 # ── TensorFlow Lite ──────────────────────────────────────────────────────────
+# STAYS whole-tree: JNI-backed like LiteRT above — the documented
+# GetMethodID-by-name failure class. Same rationale, same caution.
 -keep class org.tensorflow.lite.** { *; }
 -dontwarn org.tensorflow.lite.**
 
 # ── CameraX ──────────────────────────────────────────────────────────────────
--keep class androidx.camera.** { *; }
+# No app keep (P3 #95): camera-core ships its own consumer proguard.txt
+# (same proof as ML Kit above — ~11000 classes released to R8).
 -dontwarn androidx.camera.**
+
+# ── App entities + ADK tools: verified keep-free (P3 #95) ────────────────────
+# Room ships its own consumer rules and works through generated code
+# (no reflective entity access anywhere — export is manual JSON); the
+# ADK lane passes tools explicitly, feeds Map<String, Any> args, and
+# stores string-only session state, so neither needs app keeps. If a
+# release-only NoSuchMethodError ever points here, add the narrowest
+# rule that names it — never a whole tree.
 
 # ── Google Play Services (used by ML Kit) ────────────────────────────────────
 -keep class com.google.android.gms.** { *; }
@@ -54,7 +64,6 @@
 
 # ── Data binding / View binding ──────────────────────────────────────────────
 -keep class com.vyze.app.databinding.** { *; }
--keep class com.vyze.app.databinding.* { *; }
 
 # ── Annotation processing (AutoValue / JavaPoet) ────────────────────────────
 -dontwarn javax.lang.model.SourceVersion

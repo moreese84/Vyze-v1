@@ -83,7 +83,6 @@
     <string name="color_blue">Blue</string>
     <string name="color_purple">Purple</string>
     <string name="color_pink">Pink</string>
-    <string name="color_brown">Brown</string>
     <string name="color_dark_prefix">Dark %1$s</string>
     <string name="color_bright_prefix">Bright %1$s</string>
 
@@ -147,8 +146,6 @@
     <string name="color_unknown">Unknown</string>
 
     <!-- ── Reading Mode ──────────────────────────────────────────── -->
-    <string name="reading_mode_activated">Reading mode activated. Point at text to read.</string>
-    <string name="reading_mode_deactivated">Reading mode deactivated.</string>
     <string name="reading_next_lines">Reading next lines.</string>
     <string name="reading_previous_lines">Reading previous lines.</string>
     <string name="reading_bookmark">Bookmark saved at line %1$d.</string>
@@ -158,8 +155,6 @@
     <string name="reading_end_of_page">Reached end of page.</string>
 
     <!-- ── Medicine Mode ─────────────────────────────────────────── -->
-    <string name="medicine_mode_activated">Medicine reader activated. Point at a prescription label.</string>
-    <string name="medicine_mode_deactivated">Medicine reader deactivated.</string>
     <string name="medicine_drug_name">Medicine: %1$s</string>
     <string name="medicine_dosage">Dosage: %1$s</string>
     <string name="medicine_frequency">How to take: %1$s</string>
@@ -175,8 +170,6 @@
     <string name="night_mode_toggled">Theme changed to %1$s</string>
 
     <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
-    <string name="tutorial_title">Gesture Tutorial</string>
-    <string name="tutorial_start">Starting gesture tutorial. Follow the instructions.</string>
     <string name="tutorial_step_single_tap">Tap once anywhere on the circle</string>
     <string name="tutorial_step_double_tap">Tap twice quickly</string>
     <string name="tutorial_step_long_press">Press and hold for 2 seconds</string>
@@ -220,4 +213,10 @@
     <string name="loading_still_working">Still working — opening the camera anyway.</string>
     <string name="loading_still_working_ms">Masih beroperasi — membuka kamera juga.</string>
     <string name="loading_still_working_zh">仍在工作——现在打开相机。</string>
+    <!-- Permission recovery screen (audit P2 #14) -->
+    <string name="perms_title">Camera and microphone needed</string>
+    <string name="perms_guidance_rationale">Vyze needs the camera to see and the microphone to hear you. Grant both to continue.</string>
+    <string name="perms_guidance_permanent">Permissions were denied. Open Settings, tap Permissions, and allow Camera and Microphone.</string>
+    <string name="perms_retry">Try Again</string>
+    <string name="perms_open_settings">Open Settings</string>
 </resources>

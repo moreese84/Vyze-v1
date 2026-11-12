@@ -62,9 +62,6 @@ object VyzeAgentRuntime {
     @Volatile
     var gemmaAlwaysEnabled: Boolean = false
 
-    /** Session episode store (shared with the maintenance tick). */
-    val episodes = SessionEpisodeManager()
-
     /** Bounded shadow→live evaluation evidence for the flip review. */
     private val evalRecorder = ShadowEvalRecorder()
 
@@ -232,21 +229,45 @@ object VyzeAgentRuntime {
             hapticPattern = {},
         )
         val answer = try {
-            val result = AdkAgentManager.executeWithBridge(
+            // Audit P3 #65: the busy decline used to collapse into the
+            // same null as a genuine failure (always tallied FAILED).
+            when (val result = AdkAgentManager.executeWithBridge(
                 bridge = bridge,
                 query = textOnlyQuery,
                 queryContext = queryContext,
-            )
-            evalRecorder.record(
-                ShadowEvalRecord(
-                    query = textOnlyQuery,
-                    sessionId = if (result != null) "adk_master_direct" else null,
-                    outcome = if (result != null) ShadowEvalRecord.Outcome.ANSWERED
-                    else ShadowEvalRecord.Outcome.FAILED,
-                    latencyMs = if (result != null) startedAt.elapsedNow().inWholeMilliseconds else null,
-                )
-            )
-            result
+            )) {
+                is AdkAgentManager.TurnResult.Answered -> {
+                    evalRecorder.record(
+                        ShadowEvalRecord(
+                            query = textOnlyQuery,
+                            sessionId = "adk_master_direct",
+                            outcome = ShadowEvalRecord.Outcome.ANSWERED,
+                            latencyMs = startedAt.elapsedNow().inWholeMilliseconds,
+                        )
+                    )
+                    result.text
+                }
+                AdkAgentManager.TurnResult.DeclinedBusy -> {
+                    evalRecorder.record(
+                        ShadowEvalRecord(
+                            query = textOnlyQuery,
+                            sessionId = null,
+                            outcome = ShadowEvalRecord.Outcome.DECLINED_BUSY,
+                        )
+                    )
+                    null
+                }
+                AdkAgentManager.TurnResult.Failed -> {
+                    evalRecorder.record(
+                        ShadowEvalRecord(
+                            query = textOnlyQuery,
+                            sessionId = null,
+                            outcome = ShadowEvalRecord.Outcome.FAILED,
+                        )
+                    )
+                    null
+                }
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "Master-agent execution crashed: ${t.message}")
             evalRecorder.record(
@@ -308,25 +329,9 @@ object VyzeAgentRuntime {
         evalRecorder.clear()
     }
 
-    /**
-     * PERIODIC MAINTENANCE (call from a lifecycle-aware scope, e.g. every
-     * 60 s while the fragment is started): episode eviction with a
-     * thermal-shrunk window. The master lane deletes its ADK session in a
-     * `finally` on every turn, so no orphan sweep is needed anymore — the
-     * InMemory session store stays bounded by construction.
-     *
-     * No VLM/TTS/hardware interaction; safe to call at any time. Returns
-     * the number of idle episodes evicted (0 when none).
-     */
-    suspend fun maintenanceTick(
-        isThermallyConstrained: () -> Boolean = { false },
-    ): Int {
-        val evicted = episodes.evictIdle(isThermallyConstrained())
-        if (evicted.isNotEmpty()) {
-            Log.d(TAG, "Maintenance: evicted ${evicted.size} idle episode(s)")
-        }
-        return evicted.size
-    }
+    // NOTE (P4 #105, 2026-11-09): maintenanceTick lived here — it only
+    // evicted from an episode store production never populated. Deleted;
+    // the ticker keeps its shadow-eval logging half.
 
     // ── Test isolation hooks (same surface as the previous runtime) ──
 
@@ -343,5 +348,6 @@ object VyzeAgentRuntime {
         evalRecorder.clear()
         shadowEnabled = false
         preGateEnabled = false
+        gemmaAlwaysEnabled = false
     }
 }

@@ -75,4 +75,73 @@ class InferenceBreakdownTest {
             sample().formatText()
         )
     }
+
+    // ── Lane/prefill/decode split (audit P2 #67, 2026-11-09) ──
+    // The old math measured lane-wait and prefill as the SAME quantity
+    // (firstToken - stageStart) and printed it under both names, while
+    // the PIPELINE line's DECODE-so-far was the preprocess sum. The
+    // split below separates them off the generation-start instant.
+
+    @Test
+    fun `split separates lane prefill and decode`() {
+        val split = companionSplitInferenceTiming(
+            stageStartMs = 1_000L,
+            generationStartMs = 1_500L,
+            firstTokenAtMs = 6_500L,
+            endMs = 9_000L
+        )
+        assertEquals(500L, split.laneMs)
+        assertEquals(5_000L, split.prefillMs)
+        assertEquals(2_500L, split.decodeMs)
+    }
+
+    @Test
+    fun `split parts sum to the measured wall`() {
+        val split = companionSplitInferenceTiming(
+            stageStartMs = 1_000L,
+            generationStartMs = 1_500L,
+            firstTokenAtMs = 6_500L,
+            endMs = 9_000L
+        )
+        assertEquals(9_000L - 1_000L, split.laneMs + split.prefillMs + split.decodeMs)
+    }
+
+    @Test
+    fun `no streamed token keeps lane but zeroes prefill and decode`() {
+        val split = companionSplitInferenceTiming(
+            stageStartMs = 1_000L,
+            generationStartMs = 1_500L,
+            firstTokenAtMs = 0L,
+            endMs = 9_000L
+        )
+        assertEquals(500L, split.laneMs)
+        assertEquals(0L, split.prefillMs)
+        assertEquals(0L, split.decodeMs)
+    }
+
+    @Test
+    fun `generation never started zeroes everything`() {
+        val split = companionSplitInferenceTiming(
+            stageStartMs = 1_000L,
+            generationStartMs = 0L,
+            firstTokenAtMs = 0L,
+            endMs = 9_000L
+        )
+        assertEquals(0L, split.laneMs)
+        assertEquals(0L, split.prefillMs)
+        assertEquals(0L, split.decodeMs)
+    }
+
+    @Test
+    fun `same-millisecond boundaries collapse to zero`() {
+        val split = companionSplitInferenceTiming(
+            stageStartMs = 1_000L,
+            generationStartMs = 1_500L,
+            firstTokenAtMs = 1_500L,
+            endMs = 1_500L
+        )
+        assertEquals(500L, split.laneMs)
+        assertEquals(0L, split.prefillMs)
+        assertEquals(0L, split.decodeMs)
+    }
 }

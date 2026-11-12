@@ -179,10 +179,24 @@ object StudentRouter {
     )
 
     /**
+     * v3 fix (#74): first-person pronouns — a human speaking ("I'm
+     * analyzing this photo") is NEVER the app's own cue echo, even when
+     * the transcript carries the cue token. Matched token-exact on the
+     * normalized text (apostrophe-stripped, so "i'm" arrives as "im").
+     */
+    private val FIRST_PERSON_PRONOUNS = listOf(
+        "i", "im", "ive", "id", "ill", "my", "me", "mine",
+        "saya", "aku",
+    )
+    private const val FIRST_PERSON_CJK = "我"
+
+    /**
      * v3: app-cue garble hybrid test (pure). True when the cue token is
      * present and, after stripping the cue + deictic openers, NO question
      * marker survives — i.e. the utterance references nothing and asks
-     * nothing. See branch 7b for the device evidence.
+     * nothing. See branch 7b for the device evidence. A surviving
+     * first-person pronoun vetoes the match (#74): a speaker referring
+     * to themselves is a human turn, not recaptured TTS.
      */
     private fun isAppCueGarbleHybrid(normalized: String): Boolean {
         if (!normalized.contains(APP_CUE_HYBRID_TOKEN)) return false
@@ -193,6 +207,12 @@ object StudentRouter {
         }
         remainder = remainder.replace(Regex("\\s+"), " ").trim()
         if (remainder.isEmpty()) return true
+        // First-person veto (#74) — never swallow a human turn.
+        if (remainder.split(' ').any { it in FIRST_PERSON_PRONOUNS } ||
+            remainder.contains(FIRST_PERSON_CJK)
+        ) {
+            return false
+        }
         // Anything left must carry no question content to count as echo.
         return !QUESTION_MARKERS.anyIn(remainder)
     }
@@ -209,6 +229,7 @@ object StudentRouter {
                 reason = "empty transcript",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.EMPTY_TRANSCRIPT,
             )
         }
         val lower = text.lowercase(Locale.ROOT)
@@ -256,6 +277,7 @@ object StudentRouter {
                     "dev6 + 2026-09-24 session)",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.APP_CUE_HYBRID,
             )
         }
         // 2. Scene-describe openers.
@@ -302,6 +324,7 @@ object StudentRouter {
                 reason = "student: out-of-domain ask (distilled: phase0 jev labels)",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.OUT_OF_DOMAIN,
             )
         }
         // 7. v2: app-cue echo — Vyze's own spoken prompt re-captured as a
@@ -314,6 +337,7 @@ object StudentRouter {
                 reason = "student: app-cue echo (distilled: device corpus jev labels)",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.APP_CUE_ECHO,
             )
         }
         // 8. v2: greeting-only garble — starts with a greeting token, no
@@ -330,6 +354,7 @@ object StudentRouter {
                     "(distilled: device corpus jev labels)",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.GREETING_GARBLE,
             )
         }
         // 9. Filler-only transcripts are noise.
@@ -342,6 +367,7 @@ object StudentRouter {
                 reason = "student: filler-only transcript (distilled: phase0 jev labels)",
                 requiresVlm = false,
                 includeCameraFrame = false,
+                ignoreFamily = RouterDecision.IgnoreFamily.FILLER_ONLY,
             )
         }
         // 10. Catch-all — the exact legacy fallback.

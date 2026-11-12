@@ -76,7 +76,6 @@
     <string name="color_blue">Biru</string>
     <string name="color_purple">Ungu</string>
     <string name="color_pink">Merah jambu</string>
-    <string name="color_brown">Coklat</string>
     <string name="color_dark_prefix">%1$s gelap</string>
     <string name="color_bright_prefix">%1$s terang</string>
 
@@ -132,8 +131,6 @@
     <string name="color_unknown">Tidak diketahui</string>
 
     <!-- ── Reading Mode ──────────────────────────────────────────── -->
-    <string name="reading_mode_activated">Mod membaca diaktifkan. Tunjuk pada teks untuk membaca.</string>
-    <string name="reading_mode_deactivated">Mod membaca dinyahaktifkan.</string>
     <string name="reading_next_lines">Membaca baris seterusnya.</string>
     <string name="reading_previous_lines">Membaca baris sebelumnya.</string>
     <string name="reading_bookmark">Penanda disimpan pada baris %1$d.</string>
@@ -143,8 +140,6 @@
     <string name="reading_end_of_page">Mencapai penghujung halaman.</string>
 
     <!-- ── Medicine Mode ─────────────────────────────────────────── -->
-    <string name="medicine_mode_activated">Pembaca ubat diaktifkan. Tunjuk pada label preskripsi.</string>
-    <string name="medicine_mode_deactivated">Pembaca ubat dinyahaktifkan.</string>
     <string name="medicine_drug_name">Ubat: %1$s</string>
     <string name="medicine_dosage">Dos: %1$s</string>
     <string name="medicine_frequency">Cara mengambil: %1$s</string>
@@ -160,8 +155,6 @@
     <string name="night_mode_toggled">Tema ditukar kepada %1$s</string>
 
     <!-- ── Gesture Tutorial ──────────────────────────────────────── -->
-    <string name="tutorial_title">Tutorial Gestur</string>
-    <string name="tutorial_start">Memulakan tutorial gestur. Ikut arahan.</string>
     <string name="tutorial_step_single_tap">Sentuh sekali di mana-mana bulatan</string>
     <string name="tutorial_step_double_tap">Sentuh dua kali dengan pantas</string>
     <string name="tutorial_step_long_press">Tekan dan tahan selama 2 saat</string>
@@ -204,4 +197,10 @@
     <string name="loading_spoken_start_ms">Memulakan Vyze.</string>
     <string name="loading_spoken_error_ms">Vyze tidak dapat dimulakan. Sentuh di mana-mana untuk mencuba lagi.</string>
     <string name="loading_still_working_ms">Masih beroperasi — membuka kamera juga.</string>
+    <!-- Permission recovery screen (audit P2 #14) -->
+    <string name="perms_title">Kamera dan mikrofon diperlukan</string>
+    <string name="perms_guidance_rationale">Vyze memerlukan kamera untuk melihat dan mikrofon untuk mendengar anda. Benarkan kedua-duanya untuk meneruskan.</string>
+    <string name="perms_guidance_permanent">Kebenaran telah ditolak. Buka Tetapan, ketik Kebenaran, dan benarkan Kamera dan Mikrofon.</string>
+    <string name="perms_retry">Cuba Lagi</string>
+    <string name="perms_open_settings">Buka Tetapan</string>
 </resources>

@@ -27,9 +27,13 @@ android {
     namespace = "com.vyze.app"
 
     signingConfigs {
-        // Release signing — uses the debug keystore as a fallback
-        // so assembleRelease always produces an installable APK.
-        // Replace with a production keystore before publishing to Play Store.
+        // Release signing (audit P1 #7, 2026-11-09): NO debug-keystore
+        // fallback — a "release" signed with the debug key MUST NEVER
+        // EXIST, not even locally. Without app/release.keystore, any
+        // release-packaging task fails fast with the error below.
+        // Non-release invocations (debug builds, unit tests, manifest
+        // checks) configure normally — the gate only fires when a
+        // release artifact is actually requested.
         create("release") {
             val releaseKeystore = file("release.keystore")
             if (releaseKeystore.exists()) {
@@ -38,11 +42,20 @@ android {
                 keyAlias = System.getenv("RELEASE_KEY_ALIAS") ?: ""
                 keyPassword = System.getenv("RELEASE_KEY_PASSWORD") ?: ""
             } else {
-                // Fallback: sign release with debug keystore
-                storeFile = file("${System.getProperty("user.home")}/.android/debug.keystore")
-                storePassword = "android"
-                keyAlias = "androiddebugkey"
-                keyPassword = "android"
+                val wantsReleaseArtifact = gradle.startParameter.taskNames.any { task ->
+                    task.contains("Release", ignoreCase = true) &&
+                        (task.contains("assemble", ignoreCase = true) ||
+                            task.contains("bundle", ignoreCase = true) ||
+                            task.contains("package", ignoreCase = true))
+                }
+                if (wantsReleaseArtifact) {
+                    throw GradleException(
+                        "app/release.keystore is missing — refusing to sign a release build. " +
+                            "Create a production keystore at app/release.keystore and set " +
+                            "RELEASE_STORE_PASSWORD / RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD. " +
+                            "Signing a release with the debug key is not allowed."
+                    )
+                }
             }
         }
     }

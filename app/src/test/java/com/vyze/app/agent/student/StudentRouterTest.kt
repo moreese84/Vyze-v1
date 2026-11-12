@@ -341,4 +341,78 @@ class StudentRouterTest {
         val q = "apa warna baju ini?"
         assertEquals(StudentRouter.decide(q), StudentRouter.decide(q))
     }
+
+    // ── v3 fix #74: first-person veto — a human speaking is never echo ──
+
+    @Test
+    fun `first-person analyzing utterance stays routable`() {
+        // "I'm analyzing this photo" carried the cue token and was
+        // swallowed as self-talk; the speaker veto keeps it routable.
+        val d = StudentRouter.decide("I'm analyzing this photo")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+        assertTrue(d.requiresVlm)
+    }
+
+    @Test
+    fun `uncontracted first-person analyzing utterance stays routable`() {
+        val d = StudentRouter.decide("I am analyzing the box")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+    }
+
+    @Test
+    fun `malay first-person analyzing utterance stays routable`() {
+        val d = StudentRouter.decide("saya analyzing gambar ini")
+        assertEquals(RouterDecision.Action.VLM_VOICE_QUERY, d.action)
+    }
+
+    @Test
+    fun `cue echo without a speaker is still ignored`() {
+        // Veto guard: no first-person pronoun, no question marker.
+        assertEquals(
+            RouterDecision.Action.IGNORE,
+            StudentRouter.decide("analyzing").action,
+        )
+    }
+
+    // ── #75: pre-gate families are typed, not reason substrings ──
+
+    @Test
+    fun `ignore decisions carry their pre-gate family`() {
+        assertEquals(
+            RouterDecision.IgnoreFamily.APP_CUE_ECHO,
+            StudentRouter.decide("Please say that again").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.APP_CUE_HYBRID,
+            StudentRouter.decide("analyzing").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.APP_CUE_HYBRID,
+            StudentRouter.decide("is in front of me analyzing what is in front of me").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.GREETING_GARBLE,
+            StudentRouter.decide("hello hello").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.FILLER_ONLY,
+            StudentRouter.decide("um, uh, err...").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.OUT_OF_DOMAIN,
+            StudentRouter.decide("play some music").ignoreFamily,
+        )
+        assertEquals(
+            RouterDecision.IgnoreFamily.EMPTY_TRANSCRIPT,
+            StudentRouter.decide("   ").ignoreFamily,
+        )
+    }
+
+    @Test
+    fun `non-ignore decisions carry no family`() {
+        assertEquals(
+            RouterDecision.IgnoreFamily.NONE,
+            StudentRouter.decide("what is paracetamol used for").ignoreFamily,
+        )
+    }
 }

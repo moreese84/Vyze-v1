@@ -43,9 +43,6 @@ class GestureDetectorHelper(
     @Volatile
     private var isThirdTapHeld = false
 
-    /** Timestamp when the third tap went down. */
-    private var thirdTapDownTime = 0L
-
     /** Runnable that fires SOS after hold threshold is reached. */
     private val sosRunnable = Runnable {
         if (isThirdTapHeld) {
@@ -60,24 +57,14 @@ class GestureDetectorHelper(
 
         when {
             tapCount >= 3 -> {
-                // Third tap within the window: this is a triple-tap sequence.
-                // The gesture-map contract (v2) is: 3rd tap = color analysis
-                // (triple tap) and, with a hold, SOS. A plain third-tap
-                // release does NOT also suppress the single-tap action on the
-                // prior tap — the prior tap is a complete, handled gesture.
-                //
-                // If this third tap was a hold, the hold detection (started
-                // on ACTION_DOWN/ACTION_UP transitions elsewhere) fires SOS.
-                // We start the hold timer so the hold path is armed; the
-                // hold thread will fire after TRIPLE_TAP_HOLD_THRESHOLD_MS if
-                // the finger is still down. (Hold is wired via the onTouchEvent
-                // ACTION_DOWN track below.)
-                isThirdTapHeld = true
-                thirdTapDownTime = SystemClock.uptimeMillis()
-                handler.postDelayed(sosRunnable, TRIPLE_TAP_HOLD_THRESHOLD_MS)
-
-                // Fire triple-tap color analysis (this is the 3rd distinct
-                // release gesture).
+                // Third tap within the window: fire color analysis ONLY.
+                // SOS is NEVER armed here (audit P2 #12, 2026-11-09):
+                // onSingleTapConfirmed fires after the finger is already up
+                // (confirmed = completed tap + double-tap timeout), so arming
+                // a "still held" timer here could never observe a release —
+                // EVERY triple-tap opened the 999 dialer 500 ms later. The
+                // hold path arms on the third ACTION_DOWN instead (see
+                // onTouchEvent) and any UP/CANCEL disarms it.
                 onTripleTap()
                 return true
             }
@@ -131,11 +118,21 @@ class GestureDetectorHelper(
     }
 
     /**
-     * Call this from the touch listener when ACTION_UP or ACTION_CANCEL
-     * is received, to end the hold detection for triple-tap-hold (SOS).
+     * Call this from the touch listener for EVERY motion event (the
+     * router forwards the full stream). The third-tap hold arms HERE on
+     * ACTION_DOWN — never on tap-confirm, which fires after release:
+     * two recent taps plus this down inside the window means the third
+     * tap is going down; if the finger stays down past
+     * [TRIPLE_TAP_HOLD_THRESHOLD_MS], SOS fires. Any UP/CANCEL disarms.
      */
     fun onTouchEvent(event: MotionEvent) {
         when (event.action) {
+            MotionEvent.ACTION_DOWN -> {
+                if (!isThirdTapHeld && countRecentTaps() >= 2) {
+                    isThirdTapHeld = true
+                    handler.postDelayed(sosRunnable, TRIPLE_TAP_HOLD_THRESHOLD_MS)
+                }
+            }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 if (isThirdTapHeld) {
                     isThirdTapHeld = false

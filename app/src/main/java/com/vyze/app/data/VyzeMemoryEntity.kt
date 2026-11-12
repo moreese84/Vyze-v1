@@ -1,6 +1,7 @@
 package com.vyze.app.data
 
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
@@ -17,7 +18,14 @@ import androidx.room.PrimaryKey
  * - Preferences are read at VLM prompt construction time to personalize responses.
  * - Environment history accumulates scene context for richer, personalized descriptions.
  */
-@Entity(tableName = "vyze_memory")
+@Entity(
+    tableName = "vyze_memory",
+    // Audit P2 #18: upsert(REPLACE) conflicts only on the id PK — fixed-key
+    // writes (preferences) piled duplicates because no unique key existed.
+    // The (category, key) unique index makes REPLACE honor the KDoc's
+    // "replaces on category+key conflict" contract. Added in DB v7.
+    indices = [Index(value = ["category", "key"], unique = true)]
+)
 data class VyzeMemoryEntity(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,

@@ -51,6 +51,20 @@ class SensitiveIdPolicyTest {
         assertFalse(SensitiveIdPolicy.isSensitiveIdQuery("读一下这张钞票的序列号"))
     }
 
+    // ── Audit P2 #49: serial words must not shield a document ──
+
+    @Test
+    fun `serial words do not shield a named identity document`() {
+        // The money-serial carve-out was checked FIRST and unconditionally,
+        // so 'nombor siri kad pengenalan' bypassed the pinned refusal. A
+        // query that names a sensitive document refuses even when it also
+        // carries a serial word.
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("nombor siri kad pengenalan saya berapa"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("read the serial on my identity card"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("我的身份证序列号是多少"))
+        assertTrue(SensitiveIdPolicy.isSensitiveIdQuery("read the serial and card number"))
+    }
+
     // ── Ordinary money / scene asks never trip ───────────────────
 
     @Test

@@ -278,52 +278,8 @@
             android:background="#33FFFFFF"
             android:layout_marginBottom="24dp" />
 
-        <!-- Specialized Modes -->
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Specialized Modes"
-            android:textSize="22sp"
-            android:textStyle="bold"
-            android:textColor="@android:color/white"
-            android:layout_marginBottom="16dp" />
-
-        <Button
-            android:id="@+id/btn_reading_mode"
-            android:layout_width="match_parent"
-            android:layout_height="64dp"
-            android:text="Reading / Book Mode"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:backgroundTint="#FFD700"
-            android:textColor="@android:color/black"
-            android:contentDescription="Activate document reader mode for books and pages"
-            android:layout_marginBottom="12dp" />
-
-        <Button
-            android:id="@+id/btn_medicine_mode"
-            android:layout_width="match_parent"
-            android:layout_height="64dp"
-            android:text="Medicine / Prescription Mode"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:backgroundTint="#FF6B35"
-            android:textColor="@android:color/white"
-            android:contentDescription="Activate medicine label reader for prescriptions"
-            android:layout_marginBottom="12dp" />
-
-        <Button
-            android:id="@+id/btn_gesture_tutorial"
-            android:layout_width="match_parent"
-            android:layout_height="64dp"
-            android:text="@string/tutorial_title"
-            android:textSize="18sp"
-            android:textStyle="bold"
-            android:backgroundTint="#00AAFF"
-            android:textColor="@android:color/white"
-            android:contentDescription="Start interactive gesture tutorial"
-            android:layout_marginBottom="12dp" />
-
+        <!-- Diagnostics (placebo mode/tutorial buttons removed 2026-11-09,
+             audit #46: they announced modes that do not exist) -->
         <Button
             android:id="@+id/btn_error_log"
             android:layout_width="match_parent"

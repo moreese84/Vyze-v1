@@ -1,5 +1,4 @@
-package com.vyze.app
-import com.vyze.app.vision.ColorAnalyzer
+package com.vyze.app.vision
 
 import org.junit.Assert.*
 import org.junit.Test
@@ -13,34 +12,12 @@ import org.junit.Test
  */
 class ColorAnalyzerTest {
 
-    // Replicate the classifyColor logic for testing
+    // Invokes production code (audit #98, 2026-11-09): this helper used
+    // to REIMPLEMENT the classifier, so all 40+ tests passed against a
+    // copy while the real map drifted (including the 335-345 brown bug).
     private fun classifyColor(hue: Float, saturation: Float, value: Float): String {
-        if (saturation < ColorAnalyzer.SATURATION_THRESHOLD) {
-            return when {
-                value < ColorAnalyzer.BLACK_MAX_VALUE -> ColorAnalyzer.BLACK
-                value > ColorAnalyzer.WHITE_MIN_VALUE -> ColorAnalyzer.WHITE
-                else -> ColorAnalyzer.GREY
-            }
-        }
-
-        val baseColor = when (hue) {
-            in 0.0..15.0, in 345.0..360.0 -> ColorAnalyzer.RED
-            in 15.0..40.0 -> ColorAnalyzer.ORANGE
-            in 40.0..70.0 -> ColorAnalyzer.YELLOW
-            in 70.0..160.0 -> ColorAnalyzer.GREEN
-            in 160.0..195.0 -> ColorAnalyzer.CYAN
-            in 195.0..260.0 -> ColorAnalyzer.BLUE
-            in 260.0..300.0 -> ColorAnalyzer.PURPLE
-            in 300.0..335.0 -> ColorAnalyzer.PINK
-            in 335.0..345.0 -> ColorAnalyzer.BROWN
-            else -> ColorAnalyzer.RED
-        }
-
-        return when {
-            value < ColorAnalyzer.DARK_MAX_VALUE -> "Dark $baseColor"
-            value > ColorAnalyzer.BRIGHT_MIN_VALUE -> "Bright $baseColor"
-            else -> baseColor
-        }
+        val verdict = ColorAnalyzer.companionClassifyColor(hue, saturation, value)
+        return ColorAnalyzer.companionEnglishName(verdict)
     }
 
     // ── Achromatic Colors ────────────────────────────────────────────────
@@ -212,22 +189,25 @@ class ColorAnalyzerTest {
         assertEquals("Purple", classifyColor(300f, 1f, 0.5f))
     }
 
-    // ── Brown ────────────────────────────────────────────────────────────
+    // ── Magenta-pink band (audit P2 #27, 2026-11-09) ───────────────────
+    // Hues 335-345 are magenta-pink, not brown (brown is dark orange,
+    // ~15-40 at low value). The old map named them Brown — the old pin
+    // encoded the bug, corrected here.
 
     @Test
-    fun `brown at hue 340 classified as Brown`() {
-        assertEquals("Brown", classifyColor(340f, 1f, 0.5f))
+    fun `hue 340 classified as Pink`() {
+        assertEquals("Pink", classifyColor(340f, 1f, 0.5f))
     }
 
     @Test
     fun `hue 335 classified as Pink (first match wins)`() {
-        // Pink (300..335) includes 335, checked before Brown (335..345)
+        // Pink (300..335) includes 335, checked before the 335..345 band
         assertEquals("Pink", classifyColor(335f, 1f, 0.5f))
     }
 
     @Test
     fun `hue 345 classified as Red (first match wins)`() {
-        // Red (345..360) is checked before Brown (335..345)
+        // Red (345..360) is checked before the 335..345 band
         assertEquals("Red", classifyColor(345f, 1f, 0.5f))
     }
 
@@ -295,8 +275,6 @@ class ColorAnalyzerTest {
         assertNotNull(ColorAnalyzer.BLUE)
         assertNotNull(ColorAnalyzer.PURPLE)
         assertNotNull(ColorAnalyzer.PINK)
-        assertNotNull(ColorAnalyzer.BROWN)
-        assertNotNull(ColorAnalyzer.UNKNOWN_COLOR)
     }
 
     @Test

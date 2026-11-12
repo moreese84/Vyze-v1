@@ -451,8 +451,12 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                 com.vyze.app.data.VyzeMemoryEntity(
                     category = "interaction",
                     key = "query_${System.currentTimeMillis()}",
-                    value = response,
-                    metadata = query
+                    value = com.vyze.app.util.StorageRedaction.sanitizeForStorage(
+                        response, com.vyze.app.util.StorageRedaction.STORED_TEXT_MAX_CHARS
+                    ),
+                    metadata = com.vyze.app.util.StorageRedaction.sanitizeForStorage(
+                        query, com.vyze.app.util.StorageRedaction.STORED_SCAN_MAX_CHARS
+                    )
                 )
             )
         }

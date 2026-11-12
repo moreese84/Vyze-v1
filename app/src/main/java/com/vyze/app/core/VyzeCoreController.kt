@@ -131,6 +131,30 @@ class VyzeCoreController(
     private var textReadQueryActive = false
 
     /**
+     * Expansion-lane contract snapshot (audit P3 #72): a "tell me more"
+     * turn discusses the SAME frame+topic as the original turn, so it
+     * must inherit its prompt contracts (sensitive-ID refusal,
+     * medicine-miss provenance, date shown-work, read recital). Captured
+     * when the main-lane prompt is built — all flags are final there —
+     * because the completion handler clears the live flags before any
+     * expansion can run. Cleared with the anchor (same lifecycle:
+     * expansion is impossible without the anchor, so the snapshot can
+     * never outlive its turn).
+     */
+    private var expansionSensitiveId = false
+    private var expansionMedicineMiss = false
+    private var expansionDate = false
+    private var expansionReadRecital = false
+
+    /** Clear the expansion snapshot with the retained answer (see above). */
+    private fun clearExpansionSnapshot() {
+        expansionSensitiveId = false
+        expansionMedicineMiss = false
+        expansionDate = false
+        expansionReadRecital = false
+    }
+
+    /**
      * OCR text of the current turn (set at the OCR capture site, nulled for
      * non-read turns at trigger time). Read at completion by the CJK
      * coverage net. Cleared at completion (drop the big string ASAP) and at
@@ -242,8 +266,11 @@ class VyzeCoreController(
     // One row per completed/failed VLM inference: task-type bucket,
     // active backend, latency, failure kind. NO task text, NO image or
     // content of any kind leaves the device (see VyzeLocalTelemetry).
-    private var snapshotStartMs = 0L
-    private var snapshotTaskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.SCENE_DIRECT
+    // One-shot telemetry latch (audit #64): armed per turn by the
+    // image/text/expansion lanes, consumed by recordTelemetry. The latch —
+    // not two loose fields — keeps the consume atomic across the engine
+    // callback thread and the main-thread watchdog/cancel paths.
+    private val telemetryLatch = TurnTelemetryLatch()
 
     /**
      * Playback-aware batching gate (Phase 2): true once the most recently
@@ -291,6 +318,19 @@ class VyzeCoreController(
 
     /** True once the stream guard has tripped for this inference. */
     private var repetitionGuardTripped = false
+
+    /**
+     * True once an abort fallback (hedge or repetition) was delivered
+     * this turn (#33). Guards three defects: the repetition branch has
+     * no delivered-check so EVERY post-trip token re-posted the
+     * fallback; a confidence abort followed by a repetition trip
+     * delivered twice; and the null-response branch fired onError("No
+     * response from model") after the fallback. Also suppresses further
+     * token accumulation — interrupt() doesn't stop the native thread
+     * instantly, and aborted tokens must never reach TTS. Reset per
+     * turn in [resetSentenceBuffer].
+     */
+    private var abortFallbackDelivered = false
 
     /** Buffer for first N tokens to check for hedging language. */
     private val tokenConfidenceBuffer = StringBuilder()
@@ -455,7 +495,7 @@ class VyzeCoreController(
                 Log.e(TAG, "onError: session=$sessionId error=$error")
                 recordTelemetry(
                     success = false,
-                    failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN,
+                    failureKind = companionClassifyTelemetryFailure(error),
                 )
                 flushRemainingSentenceBuffer()
                 isInferring.set(false)
@@ -498,10 +538,14 @@ class VyzeCoreController(
                                 RepetitionLoopGuard.isDegenerate(repetitionWindow.toString())
                         }
                     }
-                    if (repetitionGuardTripped) {
+                    if (repetitionGuardTripped && !abortFallbackDelivered) {
                         Log.w(TAG, "Repetition-loop abort: degenerate repetition in stream")
                         CrashLogFile.log(TAG, "REPETITION ABORT: degenerate repetition detected")
                         confidenceCheckPassed = true  // stop hedge checks too
+                        abortFallbackDelivered = true
+                        synchronized(bufferLock) {
+                            sentenceBuffer.setLength(0)
+                        }
                         isInferring.set(false)
                         vlmEngine.interrupt()
                         mainHandler.post {
@@ -523,10 +567,14 @@ class VyzeCoreController(
                             val isHedging = HEDGING_PHRASES.any { phrase ->
                                 lowerAccumulated.contains(phrase)
                             }
-                            if (isHedging) {
+                            if (isHedging && !abortFallbackDelivered) {
                                 Log.w(TAG, "Confidence abort: model hedging on '$accumulated'")
                                 CrashLogFile.log(TAG, "CONFIDENCE ABORT: hedging detected")
                                 confidenceCheckPassed = true  // prevent re-entry
+                                abortFallbackDelivered = true
+                                synchronized(bufferLock) {
+                                    sentenceBuffer.setLength(0)
+                                }
                                 isInferring.set(false)
                                 vlmEngine.interrupt()
                                 mainHandler.post {
@@ -547,10 +595,15 @@ class VyzeCoreController(
                         }
                     }
 
-                        synchronized(bufferLock) {
-                            sentenceBuffer.append(token)
+                        // Post-abort tokens (the native thread outlives
+                        // interrupt()) are dropped — aborted output must
+                        // never accumulate or flush (#33).
+                        if (!abortFallbackDelivered) {
+                            synchronized(bufferLock) {
+                                sentenceBuffer.append(token)
+                            }
+                            flushSentenceBufferIfReady()
                         }
-                        flushSentenceBufferIfReady()
                     }
                 } catch (e: Throwable) {
                     Log.e(TAG, "onTokenGenerated error: ${e.javaClass.simpleName}: ${e.message}")
@@ -675,7 +728,8 @@ class VyzeCoreController(
                     )
                     val coverage = lastCoverage
                     if (coverage != null) {
-                        CrashLogFile.log(TAG, "CJK coverage: bridge='${coverage.bridge}' span='${coverage.span}' streaming=$firstChunkSent")
+                        CrashLogFile.log(TAG, "CJK coverage applied (streaming=$firstChunkSent)")
+                        CrashLogFile.logContent(TAG, "CJK coverage: bridge='${coverage.bridge}' span='${coverage.span}' streaming=$firstChunkSent")
                     }
                     flushRemainingSentenceBuffer()
                     scope.launch {
@@ -699,7 +753,8 @@ class VyzeCoreController(
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
                                     .saveCurrencyScan(cleanedResponse.take(120))
-                                CrashLogFile.log(TAG, "Currency scan saved: ${cleanedResponse.take(60)}")
+                                CrashLogFile.log(TAG, "Currency scan saved")
+                                CrashLogFile.logContent(TAG, "Currency scan saved: ${cleanedResponse.take(60)}")
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Currency scan save failed: ${e.message}", e)
                             }
@@ -713,7 +768,8 @@ class VyzeCoreController(
                             try {
                                 com.vyze.app.data.ScanRepository(context.applicationContext)
                                     .saveBankCardScan(cleanedResponse.take(120))
-                                CrashLogFile.log(TAG, "Bank card scan saved: ${fullResponse.take(60)}")
+                                CrashLogFile.log(TAG, "Bank card scan saved")
+                                CrashLogFile.logContent(TAG, "Bank card scan saved: ${fullResponse.take(60)}")
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Bank card scan save failed: ${e.message}", e)
                             }
@@ -808,13 +864,25 @@ class VyzeCoreController(
                     // infer before the user's first explicit trigger.
                 } else {
                     Log.e(TAG, "VLM engine failed to initialize")
+                    // P2 #34: a missing sideloaded model is NOT a connection
+                    // problem — speak + display the real fix (place the file
+                    // in Downloads). Other init failures keep the generic line.
+                    val modelMissing = vlmEngine.didLastInitMissModelFile()
                     mainHandler.post {
                     try {
-                        ttsManager.speakImmediate(
-                            "AI engine setup failed. Please check your connection and try again."
-                        )
+                        if (modelMissing) {
+                            val (en, ms, zh) = companionMissingModelSpeech()
+                            ttsManager.speakImmediate(ttsManager.localized(en, ms, zh))
+                        } else {
+                            ttsManager.speakImmediate(
+                                "AI engine setup failed. Please check your connection and try again."
+                            )
+                        }
                         } catch (_: Throwable) {}
-                        onStatusUpdate?.invoke("Error: Model failed to load")
+                        onStatusUpdate?.invoke(
+                            if (modelMissing) "Error: Model file not found"
+                            else "Error: Model failed to load"
+                        )
                     }
                 }
             } catch (e: CancellationException) {
@@ -912,8 +980,12 @@ class VyzeCoreController(
         }
         val formattedPrompt = buildPromptForAgent(prompt)
         CrashLogFile.log(TAG, "Agent-lane IMAGE prompt built: ${formattedPrompt.length} chars")
-        return try {
-            vlmEngine.analyzeImage(
+        // Agent-direct timing is LOCAL (#64): this op holds no isInferring
+        // CAS, so arming the shared latch could clobber a native turn.
+        val directStartMs = System.currentTimeMillis()
+        val result: String?
+        try {
+            result = vlmEngine.analyzeImage(
                 bitmap = frame,
                 prompt = formattedPrompt,
                 memoryContext = null,
@@ -923,8 +995,25 @@ class VyzeCoreController(
             )
         } catch (t: Throwable) {
             CrashLogFile.logError(TAG, "analyzeImageDirect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
-            null
+            writeTelemetryRow(
+                taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.VLM_IMAGE,
+                startMs = directStartMs,
+                success = false,
+                failureKind = companionClassifyTelemetryFailure(t.message),
+            )
+            return null
         }
+        writeTelemetryRow(
+            taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.VLM_IMAGE,
+            startMs = directStartMs,
+            success = !result.isNullOrBlank(),
+            failureKind = if (!result.isNullOrBlank()) {
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.NONE
+            } else {
+                com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+            },
+        )
+        return result
     }
 
     /**
@@ -1131,7 +1220,7 @@ class VyzeCoreController(
             // the session completes (no nagging on top).
             if (SelfTalkPolicy.isSelfTalk(text.toString())) {
                 Log.w(TAG, "Answer guard: SELF-TALK in answer buffer — suppressing remaining output")
-                CrashLogFile.log(TAG, "SELF-TALK GUARD: answer suppressed (${text.take(60)})")
+                CrashLogFile.logContent(TAG, "SELF-TALK GUARD: answer suppressed (${text.take(60)})")
                 sentenceBuffer.setLength(0)
                 return
             }
@@ -1281,7 +1370,7 @@ class VyzeCoreController(
                             onStart = onPlaying, onError = onPlaying
                         )
                     }
-                    CrashLogFile.log(TAG, "Sentence flush (id=$chunkId): ${chunk.take(60)}...")
+                    CrashLogFile.logContent(TAG, "Sentence flush (id=$chunkId): ${chunk.take(60)}...")
                 } catch (e: Throwable) {
                     Log.w(TAG, "TTS flush error: ${e.message}")
                     // Never wedge batching on a failed post.
@@ -1330,7 +1419,7 @@ class VyzeCoreController(
             try {
                 val finalChunkId = "${activeSessionId}_final_${chunkCounter.incrementAndGet()}"
                 ttsManager.speak(remaining, TextToSpeech.QUEUE_ADD, utteranceId = finalChunkId)
-                CrashLogFile.log(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
+                CrashLogFile.logContent(TAG, "Final flush (id=$finalChunkId): ${remaining.take(80)}...")
             } catch (e: Throwable) {
                 Log.w(TAG, "TTS final flush error: ${e.message}")
             }
@@ -1380,6 +1469,7 @@ class VyzeCoreController(
         confidenceCheckPassed = false
         repetitionWindow.setLength(0)
         repetitionGuardTripped = false
+        abortFallbackDelivered = false
         openerDedupeChecked = false
     }
 
@@ -1439,6 +1529,17 @@ class VyzeCoreController(
                 CrashLogFile.log(TAG, "Memory poisoning purge: removed $purged anchor-era parrot records")
             }
         }
+
+        // SCAN-HISTORY PRUNE (2026-11-09, audit P1 #3): pruneOldScans
+        // existed but was never called — scan rows grew unbounded. Runs
+        // once per process start next to the parrot purge above.
+        scope.launch {
+            try {
+                scanRepository.pruneOldScans()
+            } catch (e: Throwable) {
+                CrashLogFile.logError(TAG, "Scan-history prune failed: ${e.message}", e)
+            }
+        }
     }
 
     fun resetForNewCapture() {
@@ -1471,6 +1572,7 @@ class VyzeCoreController(
         resetSentenceBuffer()
         lastDescribedObject = ""
         lastDescribedTime = 0L
+        clearExpansionSnapshot()
         currencyModeActive = false
         bankCardModeActive = false
         sensitiveIdModeActive = false
@@ -1559,8 +1661,7 @@ class VyzeCoreController(
         resetSentenceBuffer()
 
         // ── TELEMETRY ARM: task bucket + latency clock start ──────
-        snapshotTaskType = taskTypeForTelemetry(query)
-        snapshotStartMs = System.currentTimeMillis()
+        telemetryLatch.arm(taskTypeForTelemetry(query), System.currentTimeMillis())
 
         // ── Dynamic Resolution Scaling ──────────────────────────
         // Text-extraction queries ("read", "label", etc.) and tap queries
@@ -1607,6 +1708,30 @@ class VyzeCoreController(
         // CJK coverage net: nulled per trigger; the OCR stage sets it only
         // when this turn actually runs OCR (non-read lanes keep null).
         activeOcrText = null
+
+        // ── SENSITIVE-ID DETERMINISTIC REFUSAL (privacy branch) ───
+        // Identity-card / account-number asks NEVER reach inference: the
+        // pinned per-language refusal is delivered directly — no verbatim
+        // lane (fast-path, direct-read, recital, thermal, OCR fallback)
+        // can speak the number, the VLM never runs so it cannot disobey
+        // the prompt clause (audit P2 #10), and no scan-history row
+        // persists the capture. Placed before capture work so the refusal
+        // is instant. Deliberately unrecorded: the dialogue exclusion
+        // below keeps sensitive turns out of future prompts anyway, and a
+        // canned refusal carries no follow-up context.
+        if (sensitiveIdModeActive) {
+            CrashLogFile.log(TAG, "SENSITIVE-ID: pinned refusal delivered — inference skipped")
+            isInferring.set(false)
+            // The pinned refusal is the designed terminal output — the turn
+            // completed as specified, so success (#64).
+            recordTelemetry(success = true)
+            val refusal = SensitiveIdPolicy.refusalPhrase(activeUserLocale.language)
+            mainHandler.post {
+                onInferenceComplete?.invoke(refusal)
+                onStatusUpdate?.invoke("Ready [sensitive-id refusal]")
+            }
+            return
+        }
 
         // ── RECOVERY-CUE ARMING (implicit failure detection) ──────
         // A spoken recovery cue ("please say that again") means the
@@ -1665,6 +1790,9 @@ class VyzeCoreController(
                         onContinuousSkip?.invoke()
                         onStatusUpdate?.invoke("Ready [scene unchanged]")
                     }
+                    // Suppressed turns never started — release the arm so no
+                    // row (and no stale arm for the next turn) exists (#64).
+                    telemetryLatch.disarm()
                     return
                 }
             }
@@ -1694,6 +1822,10 @@ class VyzeCoreController(
                     )
                 )
             }
+            recordTelemetry(
+                success = false,
+                failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.THERMAL_BLOCK,
+            )
             return
         }
 
@@ -1726,6 +1858,10 @@ class VyzeCoreController(
                         Log.e(TAG, "Watchdog: no output for ${watchdogBudgetMs}ms — force resetting")
                         CrashLogFile.log(TAG, "WATCHDOG FIRED — forcing pipeline reset")
                         isInferring.set(false)
+                        recordTelemetry(
+                            success = false,
+                            failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.TIMEOUT,
+                        )
                         cancelInference()
                         resetSentenceBuffer()
                         mainHandler.post {
@@ -1894,7 +2030,8 @@ class VyzeCoreController(
                     ocrText = ocrResult.first
                     activeOcrText = ocrText
                     ocrConfidence = ocrResult.second
-                    CrashLogFile.log(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
+                    CrashLogFile.log(TAG, "OCR done: ${ocrText?.length ?: 0} chars, confidence=$ocrConfidence")
+                    CrashLogFile.logContent(TAG, "OCR result: ${ocrText?.take(100) ?: "(none)"} confidence=$ocrConfidence")
 
                     // ── BARCODE PRE-PASS (runs alongside OCR) ─────────
                     // ~50-120ms. Runs on every text/tap query so retail
@@ -1903,7 +2040,8 @@ class VyzeCoreController(
                     try {
                         barcodeResult = barcodeHelper.scan(inferenceBitmap)
                         if (barcodeResult != null) {
-                            CrashLogFile.log(TAG, "Barcode detected: ${barcodeResult?.second} — ${barcodeResult?.first?.take(60)}")
+                            CrashLogFile.log(TAG, "Barcode detected: ${barcodeResult?.second}")
+                            CrashLogFile.logContent(TAG, "Barcode detected: ${barcodeResult?.second} — ${barcodeResult?.first?.take(60)}")
                         }
                     } catch (e: Throwable) {
                         CrashLogFile.logError(TAG, "Barcode pre-pass failed: ${e.message}", e)
@@ -1922,11 +2060,13 @@ class VyzeCoreController(
                             try {
                                 ocrToPersist?.let {
                                     scanRepository.saveOcrScan(it)
-                                    CrashLogFile.log(TAG, "OCR scan saved: ${it.take(60)}")
+                                    CrashLogFile.log(TAG, "OCR scan saved")
+                                    CrashLogFile.logContent(TAG, "OCR scan saved: ${it.take(60)}")
                                 }
                                 barcodeToPersist?.let { (rawValue, format) ->
                                     scanRepository.saveBarcodeScan(rawValue, format)
-                                    CrashLogFile.log(TAG, "Barcode scan saved: $format — ${rawValue.take(60)}")
+                                    CrashLogFile.log(TAG, "Barcode scan saved: $format")
+                                    CrashLogFile.logContent(TAG, "Barcode scan saved: $format — ${rawValue.take(60)}")
                                 }
                             } catch (e: Throwable) {
                                 CrashLogFile.logError(TAG, "Scan history save failed: ${e.message}", e)
@@ -1942,7 +2082,8 @@ class VyzeCoreController(
                         try {
                             val medicineInfo = lookupMedicine(ocrText)
                             if (medicineInfo != null) {
-                                CrashLogFile.log(TAG, "Medicine match: ${medicineInfo.name}")
+                                CrashLogFile.log(TAG, "Medicine match found")
+                                CrashLogFile.logContent(TAG, "Medicine match: ${medicineInfo.name}")
                                 ocrText = "$ocrText\n$MEDICINE_INFO_MARKER ${medicineInfo.name}, ${medicineInfo.genericName}, ${medicineInfo.dosage}. ${medicineInfo.frequency}. WARNING: ${medicineInfo.warnings}]"
                             } else {
                                 // P1b EXPLICIT MISS (AI Edge Gallery mood-tracker
@@ -2007,7 +2148,12 @@ class VyzeCoreController(
                 if (ocrLooksIncomplete) {
                     CrashLogFile.log(TAG, "OCR fast-path suppressed: dense-doc sanity gate (len=${ocrTextForGate?.length}, single line, high-res capture)")
                 }
-                if (!isTapQuery && isTextExtractionQuery(query) &&
+                if (companionVerbatimReadAllowed(
+                        textReadActive = isTextExtractionQuery(query),
+                        isTap = isTapQuery,
+                        isPreciseRead = isPreciseRead,
+                        sensitiveIdActive = sensitiveIdModeActive
+                    ) &&
                     !ocrText.isNullOrBlank() && ocrConfidence >= OCR_FAST_PATH_CONFIDENCE &&
                     !ocrLooksIncomplete
                 ) {
@@ -2027,6 +2173,8 @@ class VyzeCoreController(
                             onStatusUpdate?.invoke("Ready [OCR fast-path]")
                         }
                     }
+                    // Spoken fast-path read — the designed terminal output (#64).
+                    recordTelemetry(success = true)
                     return@launch
                 }
 
@@ -2051,7 +2199,12 @@ class VyzeCoreController(
                 // Precise-read modes (currency/bank card) are excluded — their
                 // captures are short and their no-guess rules need the VLM.
                 val directReadOcr = ocrText
-                if (!isTapQuery && !isPreciseRead && isTextExtractionQuery(query) &&
+                if (companionVerbatimReadAllowed(
+                        textReadActive = isTextExtractionQuery(query),
+                        isTap = isTapQuery,
+                        isPreciseRead = isPreciseRead,
+                        sensitiveIdActive = sensitiveIdModeActive
+                    ) &&
                     !directReadOcr.isNullOrBlank() &&
                     shouldReadDirectly(directReadOcr, ocrConfidence)
                 ) {
@@ -2087,6 +2240,8 @@ class VyzeCoreController(
                             onStatusUpdate?.invoke("Ready [direct read]")
                         }
                     }
+                    // Verbatim document read — the designed terminal output (#64).
+                    recordTelemetry(success = true)
                     return@launch
                 }
 
@@ -2128,6 +2283,9 @@ class VyzeCoreController(
                             recordDialogueTurn(query ?: "", recitalOcr)
                         }
                         firstChunkSent = true
+                        // The manual onComplete below records the row — retag
+                        // first so it lands in the degradation bucket (#64).
+                        telemetryLatch.retag(com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.OCR_FAST_PATH_DEGRADATION)
                         speakRecitalChain(spans, ttsManager.zhVoiceOrNull(), activeSessionId)
                         vlmEngine.onComplete?.invoke(recitalOcr, activeSessionId)
                         return@launch
@@ -2159,7 +2317,7 @@ class VyzeCoreController(
                     buildMemoryContext(similarInteractions)
                 }
                 if (memoryContext != null) {
-                    CrashLogFile.log(TAG, "Memory context injected: ${memoryContext.take(80)}...")
+                    CrashLogFile.logContent(TAG, "Memory context injected: ${memoryContext.take(80)}...")
                 }
 
                 val brevityLevel = preferenceLearner.getBrevityLevel()
@@ -2205,6 +2363,13 @@ class VyzeCoreController(
                     dialogueContext = if (cpuVisionPromptLean) null else dialogueContext,
                     leanMode = cpuVisionPromptLean
                 )
+                // P3 #72: snapshot the prompt contracts for a later "tell
+                // me more" — the completion handler clears the live flags,
+                // so the expansion turn inherits instead of re-deriving.
+                expansionSensitiveId = sensitiveIdModeActive
+                expansionMedicineMiss = medicineMissModeActive
+                expansionDate = dateModeActive
+                expansionReadRecital = textReadQueryActive
                 CrashLogFile.log(TAG, "Base prompt built: ${basePrompt.length} chars")
 
                 // ── CANCELLATION CHECK: bail out before VLM call ──
@@ -2254,27 +2419,15 @@ class VyzeCoreController(
                         PreferenceLearner.BrevityLevel.BRIEF -> (SCENE_QUERY_MAX_TOKENS * 4) / 5
                         PreferenceLearner.BrevityLevel.TERSE -> (SCENE_QUERY_MAX_TOKENS * 3) / 5
                     }.let { base ->
-                        // Thermal cap (Phase 2 Step B): MODERATE+ tightens the
-                        // scene-token budget (96 → 64) so generation — the
-                        // hottest phase of inference — ends sooner.
-                        if (thermalPolicy.sceneTokenCap in 1 until base) {
-                            thermalPolicy.sceneTokenCap
-                        } else {
-                            base
-                        }
+                        // Thermal cap via the shared rule (P3 #72).
+                        companionThermalCappedTokens(base, thermalPolicy.sceneTokenCap)
                     }
                 }
-                // Phase 4: locale-aware output budget. Malay morphology runs
-                // ~30% more tokens for the same sentence — an English-sized
-                // budget truncated Malay answers mid-word, and sanitizeForTts
-                // then stamped a period onto the fragment. Chinese is denser
-                // per glyph and needs no headroom. Applied to reads too: a
+                // Phase 4: locale-aware output budget (shared rule —
+                // companionLocaleTokenHeadroom). Applied to reads too: a
                 // Malay back-panel read is the most truncation-prone case.
-                val localeMaxTokens = if (activeUserLocale.language == "ms") {
-                    (inferenceMaxTokens * 4) / 3
-                } else {
-                    inferenceMaxTokens
-                }
+                val localeMaxTokens =
+                    companionLocaleTokenHeadroom(inferenceMaxTokens, activeUserLocale.language)
                 val response = vlmEngine.analyzeImage(
                     bitmap = inferenceBitmap,
                     prompt = basePrompt,
@@ -2314,7 +2467,9 @@ class VyzeCoreController(
                     // ALWAYS reset isInferring — prevents stuck ANALYZING state
                     isInferring.set(false)
                     flushRemainingSentenceBuffer()
-                    if (currentSessionId == activeSessionId) {
+                    // An abort fallback already delivered IS the terminal —
+                    // never follow it with onError (#33).
+                    if (currentSessionId == activeSessionId && !abortFallbackDelivered) {
                         mainHandler.post {
                             onStatusUpdate?.invoke("Inference returned empty response")
                             onError?.invoke("No response from model")
@@ -2463,11 +2618,10 @@ class VyzeCoreController(
                 // and downsampled bitmaps are recycled below — the retained
                 // frame must be a separate instance.
                 try {
-                    val keep = if (inferenceBitmap !== bitmap && !inferenceBitmap.isRecycled) {
-                        inferenceBitmap
-                    } else {
-                        downscaleForRetention(bitmap)
-                    }
+                    // The inference bitmap is always recycled (or aliased)
+                    // by now, so retention always re-downscales the live
+                    // frame (P4 #104 removed the unreachable reuse arm).
+                    val keep = downscaleForRetention(bitmap)
                     if (keep != null) {
                         val old = lastSnapshotBitmap
                         lastSnapshotBitmap = keep
@@ -2627,8 +2781,10 @@ class VyzeCoreController(
     /** Speak the instant answer immediately — no capture, no inference. */
     fun triggerInstantAnswer(query: String) {
         val answer = instantAnswerFor(query) ?: return
-        CrashLogFile.log(TAG, "Instant answer — inference skipped: \"${answer.take(60)}\"")
-        ttsManager.speakQueued(answer)
+        CrashLogFile.logContent(TAG, "Instant answer — inference skipped: \"${answer.take(60)}\"")
+        // Barge-in: a fresh instant answer interrupts anything playing
+        // (speakQueued appends since #28).
+        ttsManager.speakImmediate(answer)
         onStatusUpdate?.invoke("Ready [instant]")
     }
 
@@ -2686,9 +2842,17 @@ class VyzeCoreController(
             Log.d(TAG, "Expanded answer: inference already in progress — ignoring")
             return
         }
+        // ── TELEMETRY ARM (#64): expansions describe the last image — the
+        // scene bucket — armed before the thermal halt below consumes it.
+        telemetryLatch.arm(
+            com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.SCENE_DIRECT,
+            System.currentTimeMillis()
+        )
         activeSessionId = UUID.randomUUID().toString()
         val currentSessionId = activeSessionId
         resetSentenceBuffer()
+
+        if (checkThermalHalt()) return
 
         lastInferenceActivityMs = System.currentTimeMillis()
         val watchdogBudgetMs = vlmEngine.firstTokenWatchdogBudgetMs()
@@ -2701,6 +2865,10 @@ class VyzeCoreController(
                     } else {
                         Log.e(TAG, "Watchdog: no expanded output for ${watchdogBudgetMs}ms — force resetting")
                         isInferring.set(false)
+                        recordTelemetry(
+                            success = false,
+                            failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.TIMEOUT,
+                        )
                         cancelInference()
                         resetSentenceBuffer()
                         mainHandler.post {
@@ -2745,6 +2913,13 @@ class VyzeCoreController(
                     ocrText = null,
                     currencyMode = false,
                     bankCardMode = false,
+                    // P3 #72: inherit the original turn's contracts — a
+                    // "tell me more" about a refused/medicine/date/read
+                    // answer must carry the same pinned rules.
+                    sensitiveIdMode = expansionSensitiveId,
+                    medicineMissMode = expansionMedicineMiss,
+                    dateRulesMode = expansionDate,
+                    readRecitalMode = expansionReadRecital,
                     memoryContext = null,
                     brevityLevel = PreferenceLearner.BrevityLevel.NORMAL,
                     dialogueContext = dialogueContextForPrompt(),
@@ -2752,6 +2927,10 @@ class VyzeCoreController(
                 )
                 if (!isActive) return@launch
                 CrashLogFile.log(TAG, "Expansion prompt built: ${basePrompt.length} chars")
+                // P3 #72: resolve the CURRENT thermal policy for the token
+                // cap (same per-trigger read the snapshot lane does).
+                val expansionPolicy = (context.applicationContext as? VyzeApplication)
+                    ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
                 val response = vlmEngine.analyzeImage(
                     bitmap = frame,
                     prompt = basePrompt,
@@ -2759,7 +2938,17 @@ class VyzeCoreController(
                     similarInteractions = emptyList(),
                     sessionId = currentSessionId,
                     targetDimension = 512,
-                    maxTokens = SCENE_QUERY_MAX_TOKENS
+                    // P3 #72: thermal cap + locale headroom via the shared
+                    // rules (was the raw 128 — Malay expansions truncated
+                    // mid-word and hot SoCs ran unthrottled). Brevity is
+                    // still overridden: the user asked for MORE. No
+                    // adaptive OCR budget: this lane runs no OCR pre-pass.
+                    maxTokens = companionLocaleTokenHeadroom(
+                        companionThermalCappedTokens(
+                            SCENE_QUERY_MAX_TOKENS, expansionPolicy.sceneTokenCap
+                        ),
+                        activeUserLocale.language
+                    )
                 )
                 if (!isActive) {
                     Log.d(TAG, "Expansion job cancelled after VLM call — discarding")
@@ -2767,7 +2956,9 @@ class VyzeCoreController(
                 }
                 if (response.isNullOrBlank()) {
                     flushRemainingSentenceBuffer()
-                    if (currentSessionId == activeSessionId) {
+                    // An abort fallback already delivered IS the terminal —
+                    // never follow it with onError (#33).
+                    if (currentSessionId == activeSessionId && !abortFallbackDelivered) {
                         mainHandler.post {
                             onStatusUpdate?.invoke("Inference returned empty response")
                             onError?.invoke("No response from model")
@@ -2825,6 +3016,40 @@ class VyzeCoreController(
     fun isTextOnlyQuery(query: String?): Boolean = companionIsTextOnlyQuery(query)
 
     /**
+     * CRITICAL-tier halt for the text/expansion lanes (audit #48): the
+     * image lane gates in triggerSnapshot and the agent lane consults
+     * the policy per dispatch — these two ran LLM inference into an
+     * overheating SoC. Posts status/error, speaks the hold notice, and
+     * returns true when the caller must abort. Text inference still
+     * burns the decoder, so "text tasks" in the policy means OCR reads,
+     * not text turns.
+     */
+    private fun checkThermalHalt(): Boolean {
+        val policy = (context.applicationContext as? VyzeApplication)
+            ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
+        if (policy.vlmInferenceAllowed) return false
+        isInferring.set(false)
+        // Text/expansion thermal abort (#64): the engine is never touched,
+        // so this helper is the only completion path that can record it.
+        recordTelemetry(
+            success = false,
+            failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.THERMAL_BLOCK,
+        )
+        mainHandler.post {
+            onStatusUpdate?.invoke("Too hot")
+            onError?.invoke("Device is too hot")
+            ttsManager.speakImmediate(
+                ttsManager.localized(
+                    "Device is too hot right now. Please wait for it to cool down.",
+                    "Peranti terlalu panas sekarang. Sila tunggu sehingga ia sejuk.",
+                    "设备现在过热，请稍等，待冷却后再试。"
+                )
+            )
+        }
+        return true
+    }
+
+    /**
      * Run a text-only inference — no bitmap, no OCR, no memory fingerprint.
      * Uses the model's text decoder directly for general-knowledge answers.
      *
@@ -2842,10 +3067,17 @@ class VyzeCoreController(
             return
         }
 
+        // ── TELEMETRY ARM (#64): the text lane never armed, so its rows
+        // never existed. Armed before the thermal/refusal exits below —
+        // both consume the latch.
+        telemetryLatch.arm(taskTypeForTelemetry(query), System.currentTimeMillis())
+
         // Fresh session — stale callbacks from a previous inference are dropped
         activeSessionId = UUID.randomUUID().toString()
         val currentSessionId = activeSessionId
         resetSentenceBuffer()
+
+        if (checkThermalHalt()) return
 
         // Progress-aware watchdog — same protection as image inference
         lastInferenceActivityMs = System.currentTimeMillis()
@@ -2859,6 +3091,10 @@ class VyzeCoreController(
                     } else {
                         Log.e(TAG, "Watchdog: no text output for ${watchdogBudgetMs}ms — force resetting")
                         isInferring.set(false)
+                        recordTelemetry(
+                            success = false,
+                            failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.TIMEOUT,
+                        )
                         cancelInference()
                         resetSentenceBuffer()
                         mainHandler.post {
@@ -2876,6 +3112,26 @@ class VyzeCoreController(
                 // ── CANCELLATION CHECK ──────────────────────────
                 if (!isActive) {
                     Log.d(TAG, "Text job cancelled before start — aborting")
+                    return@launch
+                }
+
+                // ── SENSITIVE-ID DETERMINISTIC REFUSAL (privacy branch) ──
+                // Same contract as the image lane: a number-ask with no
+                // camera frame can only harvest digits from recall or
+                // dialogue context — deliver the pinned refusal instead
+                // of running inference. The finally below resets
+                // isInferring and the watchdog.
+                if (SensitiveIdPolicy.isSensitiveIdQuery(query)) {
+                    CrashLogFile.log(TAG, "SENSITIVE-ID: pinned refusal delivered (text lane) — inference skipped")
+                    if (currentSessionId == activeSessionId) {
+                        val refusal = SensitiveIdPolicy.refusalPhrase(activeUserLocale.language)
+                        mainHandler.post {
+                            onInferenceComplete?.invoke(refusal)
+                            onStatusUpdate?.invoke("Ready [sensitive-id refusal]")
+                        }
+                    }
+                    // The pinned refusal is the designed terminal output (#64).
+                    recordTelemetry(success = true)
                     return@launch
                 }
 
@@ -2919,7 +3175,7 @@ class VyzeCoreController(
                 }
                 val recallContext = buildTextRecallContext(recallRecords)
                 if (recallContext != null) {
-                    CrashLogFile.log(TAG, "Text recall injected: ${recallContext.take(80)}...")
+                    CrashLogFile.logContent(TAG, "Text recall injected: ${recallContext.take(80)}...")
                 }
                 val basePrompt = promptBuilder.buildPrompt(
                     snapshotDescription = query,
@@ -2965,7 +3221,9 @@ class VyzeCoreController(
                 val response = vlmEngine.analyzeText(
                     prompt = basePrompt,
                     sessionId = currentSessionId,
-                    maxTokens = TEXT_ONLY_MAX_TOKENS
+                    maxTokens = companionLocaleTokenHeadroom(
+                        TEXT_ONLY_MAX_TOKENS, activeUserLocale.language
+                    )
                 )
 
                 if (!isActive) {
@@ -2978,7 +3236,9 @@ class VyzeCoreController(
                 if (response == null) {
                     isInferring.set(false)
                     flushRemainingSentenceBuffer()
-                    if (currentSessionId == activeSessionId) {
+                    // An abort fallback already delivered IS the terminal —
+                    // never follow it with onError (#33).
+                    if (currentSessionId == activeSessionId && !abortFallbackDelivered) {
                         mainHandler.post {
                             onStatusUpdate?.invoke("Inference returned empty response")
                             onError?.invoke("No response from model")
@@ -3048,6 +3308,8 @@ class VyzeCoreController(
             Log.d(TAG, "analyzeTextDirect: native generation in flight — declining")
             return null
         }
+        // Agent-direct timing is LOCAL (#64): never the shared latch.
+        val directStartMs = System.currentTimeMillis()
         try {
             // Timeout parity with the native watchdog: a wedged native call
             // must not hold the inference lane forever.
@@ -3060,11 +3322,41 @@ class VyzeCoreController(
             }
             if (answer == null) {
                 Log.w(TAG, "analyzeTextDirect timed out or returned null — cancelling inference")
+                // withTimeoutOrNull nulls both outcomes — the elapsed clock
+                // tells a timeout from a blank engine result.
+                val timedOut = System.currentTimeMillis() - directStartMs >= TEXT_QUERY_TIMEOUT_MS
+                writeTelemetryRow(
+                    taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.TEXT_ONLY,
+                    startMs = directStartMs,
+                    success = false,
+                    failureKind = if (timedOut) {
+                        com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.TIMEOUT
+                    } else {
+                        com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+                    },
+                )
                 cancelInference()
+            } else {
+                writeTelemetryRow(
+                    taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.TEXT_ONLY,
+                    startMs = directStartMs,
+                    success = answer.isNotBlank(),
+                    failureKind = if (answer.isNotBlank()) {
+                        com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.NONE
+                    } else {
+                        com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+                    },
+                )
             }
             return answer
         } catch (t: Throwable) {
             CrashLogFile.logError(TAG, "analyzeTextDirect FAILED: ${t.javaClass.simpleName}: ${t.message}", t)
+            writeTelemetryRow(
+                taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.TEXT_ONLY,
+                startMs = directStartMs,
+                success = false,
+                failureKind = companionClassifyTelemetryFailure(t.message),
+            )
             return null
         } finally {
             isInferring.set(false)
@@ -3116,6 +3408,14 @@ class VyzeCoreController(
     }
 
     fun cancelInference() {
+        // ABORT CHOKE-POINT (#64): any armed-but-unconsumed turn dies here —
+        // user barge-in, cancelAndReset, language switch, session reset. A
+        // no-op when idle (latch empty) or when a watchdog already recorded
+        // TIMEOUT for this turn.
+        recordTelemetry(
+            success = false,
+            failureKind = com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.USER_CANCEL,
+        )
         inferenceJob?.let { job ->
             if (job.isActive) {
                 Log.d(TAG, "Cancelling in-flight inference job")
@@ -3140,6 +3440,7 @@ class VyzeCoreController(
         cancelInference()
         lastDescribedObject = ""
         lastDescribedTime = 0L
+        clearExpansionSnapshot()
         resetSentenceBuffer()
         Log.d(TAG, "cancelAndReset: pipeline fully reset")
     }
@@ -3174,20 +3475,30 @@ class VyzeCoreController(
      * One innocent CSV row (local-only, no network — VyzeLocalTelemetry is
      * the same guarantee as ReportManager: OS share sheet or nothing).
      *
-     * One-shot guard: [snapshotStartMs] is armed ONLY by the image lane
-     * [triggerSnapshot]; it is cleared as it is consumed, so text-only and
-     * other lanes (which never arm it) can never emit rows with a stale
-     * task type or a bogus latency.
+     * One-shot latch: armed per turn by the image/text/expansion lanes and
+     * consumed here, so exactly one row exists per turn no matter which
+     * completion path wins (engine callback, watchdog, fast exit, cancel).
+     * Triggers that never arm (declined/invalid) emit nothing — no stale
+     * task type, no bogus latency. The agent-direct ops bypass the latch
+     * with caller-owned timing ([writeTelemetryRow]) because image-direct
+     * holds no isInferring CAS and could otherwise clobber a native arm.
      */
     private fun recordTelemetry(success: Boolean, failureKind: String = "") {
-        val startMs = snapshotStartMs
-        snapshotStartMs = 0L
+        val snap = telemetryLatch.consume() ?: return
+        writeTelemetryRow(snap.taskType, snap.startMs, success, failureKind)
+    }
+
+    /**
+     * Direct row write with caller-owned timing (audit #64): the agent
+     * text/image-direct ops, which never touch the shared latch.
+     */
+    private fun writeTelemetryRow(taskType: String, startMs: Long, success: Boolean, failureKind: String = "") {
         if (startMs <= 0L) return
         try {
             val latencyMs = (System.currentTimeMillis() - startMs).coerceAtLeast(0L)
             com.vyze.app.performance.VyzeLocalTelemetry.record(
                 context = context,
-                taskType = snapshotTaskType,
+                taskType = taskType,
                 backend = getEngineBackend().lowercase().ifBlank {
                     com.vyze.app.performance.VyzePerformanceConfig.TelemetryBackend.NONE
                 },
@@ -3315,6 +3626,7 @@ class VyzeCoreController(
         Log.d(TAG, "resetSessionState: clearing debounce + pending (engine session KEPT)")
         lastDescribedObject = ""
         lastDescribedTime = 0L
+        clearExpansionSnapshot()
         resetSentenceBuffer()
         // DO NOT call vlmEngine.resetSession() here. Measured on-device
         // (2026-10-17): that full engine teardown+reinit costs ~20-25 s on the
@@ -3396,22 +3708,14 @@ class VyzeCoreController(
      * "berapa nilai duit ini"). These route through the high-resolution
      * text path and add no-guessing money rules to the prompt.
      */
-    private fun isCurrencyQuery(query: String?): Boolean {
-        if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
-        return CURRENCY_KEYWORDS.any { keyword -> lower.contains(keyword) }
-    }
+    private fun isCurrencyQuery(query: String?): Boolean = companionIsCurrencyQuery(query)
 
     /**
      * Detect if the query is asking to identify a bank card.
      * Returns true for queries containing bank-card-related keywords
      * in English, Malay, or Chinese.
      */
-    private fun isBankCardQuery(query: String?): Boolean {
-        if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
-        return BANK_CARD_KEYWORDS.any { keyword -> lower.contains(keyword) }
-    }
+    private fun isBankCardQuery(query: String?): Boolean = companionIsBankCardQuery(query)
 
     // ── Medicine Knowledge Base ──────────────────────────────────
 
@@ -3420,11 +3724,7 @@ class VyzeCoreController(
      * Returns true for queries containing medicine-related keywords
      * in English or Malay.
      */
-    private fun isMedicineQuery(query: String?): Boolean {
-        if (query.isNullOrBlank()) return false
-        val lower = query.lowercase()
-        return MEDICINE_KEYWORDS.any { keyword -> lower.contains(keyword) }
-    }
+    private fun isMedicineQuery(query: String?): Boolean = companionIsMedicineQuery(query)
 
     /**
      * P1a: true when the query asks about dates, days, or relative time
@@ -3485,12 +3785,8 @@ class VyzeCoreController(
      * keep the VLM in the loop — its scene framing and brand-first naming are
      * the value there, and its grounding handles doubtful short text.
      */
-    internal fun shouldReadDirectly(ocrText: String?, ocrConfidence: Float): Boolean {
-        if (ocrText.isNullOrBlank()) return false
-        if (ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) return true
-        return ocrText.length >= DIRECT_READ_CHAR_THRESHOLD &&
-            ocrConfidence >= DIRECT_READ_MIN_CONFIDENCE
-    }
+    internal fun shouldReadDirectly(ocrText: String?, ocrConfidence: Float): Boolean =
+        companionShouldReadDirectly(ocrText, ocrConfidence)
 
     /**
      * Speaks recital spans strictly one-at-a-time: each span submits on
@@ -4111,6 +4407,118 @@ class VyzeCoreController(
         }
 
         /**
+         * Precise-mode detectors (currency / bank card / medicine) with
+         * word boundaries (audit P2 #21, 2026-11-09). Bare-substring
+         * banks misfired on food labels — "wang" in "bawang" armed
+         * currency on onions, "kad" in "kadar" armed bank-card on sugar
+         * levels, "card" in "cardboard", "pill" in "spill", "dos" in
+         * "dosa", "cash" in "cashew". Latin keywords now match whole
+         * words (trailing English -s and Malay -nya/-ku/-mu allowed);
+         * CJK keywords stay substring (Chinese has no word breaks).
+         * Pure — JVM-tested in VyzeCoreControllerRouteTest.
+         */
+        fun companionIsCurrencyQuery(query: String?): Boolean =
+            companionBankHit(query, CURRENCY_KEYWORDS)
+
+        fun companionIsBankCardQuery(query: String?): Boolean =
+            companionBankHit(query, BANK_CARD_KEYWORDS)
+
+        fun companionIsMedicineQuery(query: String?): Boolean =
+            companionBankHit(query, MEDICINE_KEYWORDS)
+
+        private fun companionBankHit(query: String?, keywords: List<String>): Boolean {
+            if (query.isNullOrBlank()) return false
+            val lower = query.lowercase()
+            return keywords.any { keyword ->
+                if (keyword.all { it == ' ' || it in 'a'..'z' }) {
+                    Regex("(?<!\\p{L})${Regex.escape(keyword)}(?:s|nya|ku|mu)?(?!\\p{L})")
+                        .containsMatchIn(lower)
+                } else {
+                    lower.contains(keyword)
+                }
+            }
+        }
+
+        /**
+         * Locale-aware output budget (audit P2 #35, 2026-11-09): Malay
+         * morphology runs ~30% more tokens for the same sentence, so
+         * Malay turns get x4/3 headroom — an English-sized budget
+         * truncated Malay answers mid-word. Shared by the image and
+         * text lanes (the text lane omitted it). Chinese is denser per
+         * glyph and needs none. Pure — JVM-tested in
+         * VyzeCoreControllerRouteTest.
+         */
+        fun companionLocaleTokenHeadroom(baseTokens: Int, language: String): Int =
+            if (language == "ms") (baseTokens * 4) / 3 else baseTokens
+
+        /**
+         * Thermal token cap (audit P3 #72, 2026-11-09): MODERATE+ heat
+         * tightens the scene-token budget (96 → 64) so generation — the
+         * hottest phase of inference — ends sooner. Extracted verbatim
+         * from the image lane (`cap in 1 until base`) so the expansion
+         * lane shares the rule instead of running the raw cap into an
+         * overheating SoC. Pure — JVM-tested in
+         * VyzeCoreControllerRouteTest.
+         */
+        fun companionThermalCappedTokens(baseTokens: Int, sceneTokenCap: Int): Int =
+            if (sceneTokenCap in 1 until baseTokens) sceneTokenCap else baseTokens
+
+        /**
+         * Document-lane gate (audit P2 #23, 2026-11-09): the lane
+         * announces "Long document. Reading now.", so it needs bulk —
+         * 300+ chars at 0.65+. The old conf>=0.85 shortcut bypassed the
+         * length gate and announced confident fragments ("150g",
+         * partial OCR) as documents; those belong to the fast-path
+         * (complete) or the VLM (fragment). Pure — JVM-tested in
+         * VyzeCoreControllerRouteTest.
+         */
+        fun companionShouldReadDirectly(ocrText: String?, ocrConfidence: Float): Boolean {
+            if (ocrText.isNullOrBlank()) return false
+            return ocrText.length >= DIRECT_READ_CHAR_THRESHOLD &&
+                ocrConfidence >= DIRECT_READ_MIN_CONFIDENCE
+        }
+
+        /**
+         * Map an engine onError string to a [TelemetryFailureKind] bucket
+         * (audit #64 — every failure used to collapse to UNKNOWN).
+         *
+         * Markers are device/codebase-evidenced: "m0 was canceled" and the
+         * coroutine-cancellation texts, "Inference timed out", OOM
+         * allocation failures, the thermal hold notice, OpenCL/GPU and NPU
+         * init failures. Order is deliberate — a timeout's trailing
+         * cancelProcess and a thermal abort must not read as a plain user
+         * cancel, and an OOM during a GPU build is still an OOM. Anything
+         * unrecognized stays UNKNOWN: honest, not a guess.
+         */
+        fun companionClassifyTelemetryFailure(error: String?): String {
+            val msg = error?.lowercase(java.util.Locale.ROOT) ?: return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+            if (msg.isBlank()) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+            if (msg.contains("outofmemory") || msg.contains("out of memory") ||
+                msg.contains("failed to allocate")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.OOM
+            if (msg.contains("thermal") || msg.contains("too hot") ||
+                msg.contains("overheat")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.THERMAL_BLOCK
+            if (msg.contains("timed out") || msg.contains("timeout") ||
+                msg.contains("exceeded") || msg.contains("deadline")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.TIMEOUT
+            if (msg.contains("cancel") || msg.contains("interrupt") ||
+                msg.contains("abort")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.USER_CANCEL
+            if (msg.contains("opencl") || msg.contains("gpu") ||
+                msg.contains("delegate") || msg.contains("egl")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.GPU_INIT_FAILED
+            if (msg.contains("npu")) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.NPU_INIT_FAILED
+            if (msg.contains("low ram") || msg.contains("low memory") ||
+                msg.contains("low-memory")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.LOW_RAM
+            if (msg.contains("warmup") || msg.contains("warm-up") ||
+                msg.contains("warm up")
+            ) return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.WARMUP_FAILED
+            return com.vyze.app.performance.VyzePerformanceConfig.TelemetryFailureKind.UNKNOWN
+        }
+
+        /**
          * Text-vs-object refusal swap decision (live 2026-11-07): a text
          * refusal ("Text is unclear.") is honest for READ questions but a
          * wrong answer for object/scene questions — the ear must hear the
@@ -4184,6 +4592,23 @@ class VyzeCoreController(
         }
 
         /**
+         * Shared intent gate for every lane that speaks OCR text VERBATIM
+         * (OCR fast-path, direct-read, label recital — 2026-11-09, audit
+         * P1 #2): explicit read asks only. Taps keep the model in the
+         * loop for scene framing; precise-read modes (currency/bank card)
+         * keep the VLM's never-guess contracts; sensitive-ID asks never
+         * reach a verbatim lane — the deterministic refusal owns them
+         * (trigger-top branch + this belt-and-braces exclusion). Pure —
+         * JVM-tested in VyzeCoreControllerRouteTest.
+         */
+        fun companionVerbatimReadAllowed(
+            textReadActive: Boolean,
+            isTap: Boolean,
+            isPreciseRead: Boolean,
+            sensitiveIdActive: Boolean,
+        ): Boolean = textReadActive && !isTap && !isPreciseRead && !sensitiveIdActive
+
+        /**
          * Label-recital lane gate (device 2026-11-08): mid-length label
          * reads (the fast-path/direct-read dead zone — below 0.85
          * confidence AND below 300 chars) recite deterministically instead
@@ -4205,8 +4630,8 @@ class VyzeCoreController(
             dateActive: Boolean,
             ocrLooksIncomplete: Boolean,
         ): Boolean {
-            if (!textReadActive || isTap || isPreciseRead) return false
-            if (sensitiveIdActive || medicineMissActive || dateActive) return false
+            if (!companionVerbatimReadAllowed(textReadActive, isTap, isPreciseRead, sensitiveIdActive)) return false
+            if (medicineMissActive || dateActive) return false
             if (ocrText.isNullOrBlank() || ocrLooksIncomplete) return false
             if (ocrText.contains(MEDICINE_INFO_MARKER)) return false
             if (DynamicPromptBuilder.companionShouldGroundOcr(ocrText)) return false
@@ -4479,6 +4904,19 @@ class VyzeCoreController(
          * The date branch runs BEFORE the knowledge-marker gate because
          * date asks rarely carry those markers ("next friday" has none).
          */
+        /**
+         * Trilingual spoken prompt for a missing sideloaded model file
+         * (whole-app audit P2 #34): (english, malay, chinese), pinned exact
+         * strings in the refusal-phrase discipline. Names the real fix
+         * (place the file in Downloads) — never paths, adb, or filenames,
+         * so TTS reads it cleanly. Companion so JVM unit tests pin it.
+         */
+        fun companionMissingModelSpeech(): Triple<String, String, String> = Triple(
+            "AI model file not found. Please place the model file in Downloads and try again.",
+            "Fail model AI tidak dijumpai. Sila letakkan fail model dalam folder Downloads dan cuba lagi.",
+            "找不到AI模型文件。请把模型文件放入下载文件夹，然后重试。"
+        )
+
         fun companionIsTextOnlyQuery(query: String?): Boolean {
             if (query.isNullOrBlank()) return false
             val lower = query.lowercase().trim()

@@ -4,7 +4,6 @@ import com.vyze.app.util.CrashLogFile
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import android.os.Environment
 import android.util.Log
 import java.io.File
 import java.text.SimpleDateFormat
@@ -34,21 +33,61 @@ class ReportManager(private val context: Context) {
         /** Official email address for bug reports. */
         const val REPORTS_EMAIL = "mauricedavidalam@gmail.com"
 
-        /** Multilingual trigger keywords (lowercase). */
-        private val TRIGGER_KEYWORDS = listOf(
+        /**
+         * App-private reports directory (audit P1 #5, 2026-11-09): reports
+         * used to land in public Downloads/Vyze_Reports, world-readable.
+         * Pure java.io — JVM-tested in ReportManagerTest.
+         */
+        fun reportsDirectory(filesDir: File): File {
+            val dir = File(filesDir, "reports")
+            if (!dir.exists()) {
+                dir.mkdirs()
+            }
+            return dir
+        }
+
+        /**
+         * Latin trigger phrases — WORD-BOUNDARY matched (audit P3 #86).
+         * Bare contains() stole reporter-class embeddings ("reporter",
+         * "unreported") into report mode. Inflections and Malay affixed
+         * forms are explicit: boundary matching no longer catches
+         * "reporting" as a substring of "report", nor "laporan"/"melapor"
+         * as substrings of "lapor".
+         */
+        private val TRIGGER_KEYWORDS_LATIN = listOf(
             // English
-            "report", "bug report", "make a report", "file a report",
+            "report", "reports", "reported", "reporting",
+            "bug report", "make a report", "file a report",
             "report a bug", "report an issue", "report a problem",
             "i want to report", "i want to make a report",
             "i need to report", "i need to make a report",
             // Malay
-            "lapor", "laporkan", "buat laporan", "nak lapor",
+            "lapor", "laporkan", "laporan", "melapor", "melaporkan",
+            "buat laporan", "nak lapor",
             "saya nak buat laporan", "saya ingin melapor",
             "lapor bug", "lapor masalah", "aduan",
-            // Chinese
+        )
+
+        /** Chinese triggers — substring matched (no word boundaries). */
+        private val TRIGGER_KEYWORDS_CJK = listOf(
             "报告", "提交报告", "我要报告", "我想报告",
             "反馈", "问题反馈", "提交反馈"
         )
+
+        private val TRIGGER_LATIN_REGEX =
+            Regex("\\b(${TRIGGER_KEYWORDS_LATIN.joinToString("|")})\\b")
+
+        /**
+         * Pure trigger check (audit P3 #86): latin phrases are
+         * word-boundary matched, Chinese substring matched. JVM-tested in
+         * ReportManagerTest (the instance method delegates here so the
+         * rule pins without a Context).
+         */
+        internal fun companionIsReportTrigger(spokenText: String): Boolean {
+            val lower = spokenText.lowercase().trim()
+            return TRIGGER_LATIN_REGEX.containsMatchIn(lower) ||
+                TRIGGER_KEYWORDS_CJK.any { lower.contains(it) }
+        }
     }
 
     /**
@@ -58,15 +97,15 @@ class ReportManager(private val context: Context) {
      * @param spokenText The transcribed speech from SpeechRecognizer
      * @return true if the text contains a report trigger keyword
      */
-    fun isReportTrigger(spokenText: String): Boolean {
-        val lower = spokenText.lowercase().trim()
-        return TRIGGER_KEYWORDS.any { keyword -> lower.contains(keyword) }
-    }
+    fun isReportTrigger(spokenText: String): Boolean =
+        companionIsReportTrigger(spokenText)
 
     /**
      * Save a bug report to a local text file.
      *
-     * File location: /storage/emulated/0/Download/Vyze_Reports/
+     * File location: app-private files/reports/ (moved out of public
+     * Downloads/Vyze_Reports in 2026-11-09, audit P1 #5 — dictated
+     * report text is user content and must not be world-readable).
      * File name: vyze_report_YYYY-MM-DD_HH-mm-ss.txt
      *
      * The file contains:
@@ -80,14 +119,7 @@ class ReportManager(private val context: Context) {
      */
     fun saveReport(reportText: String): File? {
         return try {
-            // Create reports directory in Downloads
-            val reportsDir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
-                "Vyze_Reports"
-            )
-            if (!reportsDir.exists()) {
-                reportsDir.mkdirs()
-            }
+            val reportsDir = reportsDirectory(context.filesDir)
 
             // Generate timestamped filename
             val timestamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())

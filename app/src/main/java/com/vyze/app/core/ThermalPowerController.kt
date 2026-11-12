@@ -262,16 +262,7 @@ class ThermalPowerController(context: Context) {
     }
 
     /** Map an OS thermal status to the policy tier. */
-    private fun tierOf(status: Int): ThermalPolicy = when (status) {
-        PowerManager.THERMAL_STATUS_NONE,
-        PowerManager.THERMAL_STATUS_LIGHT -> ThermalPolicy.NORMAL
-        PowerManager.THERMAL_STATUS_MODERATE -> ThermalPolicy.MODERATE
-        PowerManager.THERMAL_STATUS_SEVERE -> ThermalPolicy.SEVERE
-        PowerManager.THERMAL_STATUS_CRITICAL,
-        PowerManager.THERMAL_STATUS_EMERGENCY,
-        PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalPolicy.CRITICAL
-        else -> ThermalPolicy.NORMAL   // unknown future status — stay permissive
-    }
+    private fun tierOf(status: Int): ThermalPolicy = companionPolicyFor(status)
 
     private fun tierName(status: Int): String = when (status) {
         PowerManager.THERMAL_STATUS_NONE -> "NONE"
@@ -291,5 +282,21 @@ class ThermalPowerController(context: Context) {
          * escalation by design — prevents flap at a boundary.
          */
         private const val DOWNGRADE_HOLD_MS = 60_000L
+
+        /**
+         * Map an OS thermal status to the policy tier. Pure — JVM-pinned
+         * (ThermalPowerControllerTest); the OS integers are compile-time
+         * constants, so no device is needed.
+         */
+        internal fun companionPolicyFor(status: Int): ThermalPolicy = when (status) {
+            PowerManager.THERMAL_STATUS_NONE,
+            PowerManager.THERMAL_STATUS_LIGHT -> ThermalPolicy.NORMAL
+            PowerManager.THERMAL_STATUS_MODERATE -> ThermalPolicy.MODERATE
+            PowerManager.THERMAL_STATUS_SEVERE -> ThermalPolicy.SEVERE
+            PowerManager.THERMAL_STATUS_CRITICAL,
+            PowerManager.THERMAL_STATUS_EMERGENCY,
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> ThermalPolicy.CRITICAL
+            else -> ThermalPolicy.NORMAL   // unknown future status — stay permissive
+        }
     }
 }

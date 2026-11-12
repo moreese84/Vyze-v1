@@ -1,5 +1,6 @@
 package com.vyze.app.ui.delegates
 import com.vyze.app.device.FlashlightManager
+import com.vyze.app.util.CrashLogFile
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -30,6 +31,7 @@ import java.io.ByteArrayOutputStream
 import java.util.ArrayDeque
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Handles all CameraX lifecycle and setup operations.
@@ -123,7 +125,7 @@ class CameraSetupDelegate {
 
     // ── High-Resolution Still Capture (OCR) ────────────────────────
     // A bound ImageCapture use case gives text queries a full-resolution
-    // JPEG still (~2400x1350 vs the 960x720 analyzer stream). The analyzer
+    // JPEG still (~2400x1800 4:3 vs the 960x720 analyzer stream). The analyzer
     // stream physically cannot hold a page of A4 text — at reading distance
     // its glyphs fall below ML Kit's reliable detection floor, which is why
     // long letters/documents read back garbled or empty. Scene, tap and
@@ -168,6 +170,27 @@ class CameraSetupDelegate {
          */
         private const val DECODE_ATTEMPTS = 3
 
+        /**
+         * High-res still timeout (audit P2 #52): the still pipeline has
+         * no waiter, so a stuck HAL that never calls back used to leave
+         * the caller wedged (isCapturing stuck, later captures dropped).
+         * Generous vs the 1-3 s a still normally takes on low-tier SoCs.
+         */
+        private const val HIGH_RES_CAPTURE_TIMEOUT_MS = 5000L
+
+        /**
+         * High-res still target (audit P2 #26): EXACTLY 4:3. The builder
+         * used to set 2400x1350 (16:9) under a comment promising 4:3
+         * full-sensor field of view — document tops and bottoms were
+         * cropped out of text reads. 2400 wide keeps today's horizontal
+         * glyph detail; 1800 tall restores the cropped rows. Internal so
+         * JVM tests pin the aspect (CameraX resolves the target to the
+         * nearest supported size, so the contract is the RATIO, not the
+         * exact pixels).
+         */
+        internal const val HIGH_RES_STILL_WIDTH = 2400
+        internal const val HIGH_RES_STILL_HEIGHT = 1800
+
         // ── Auto-Torch Luminance Thresholds ─────────────────────
         /** Average Y-plane brightness below this → torch ON (0-255). */
         private const val DARK_THRESHOLD = 35
@@ -210,6 +233,45 @@ class CameraSetupDelegate {
             variance <= UNIFORM_VARIANCE_MAX -> FrameReadiness.UNIFORM
             meanLuma < READINESS_DARK_MEAN -> FrameReadiness.TOO_DARK
             else -> FrameReadiness.READY
+        }
+
+        /**
+         * Pack YUV_420_888 planes into NV21, honoring rowStride and
+         * pixelStride (audit P2 #24, 2026-11-09). The old pack copied
+         * plane buffers wholesale: padded-stride devices produced
+         * sheared frames, and pixelStride-1 chroma was concatenated
+         * V-then-U instead of interleaved VU. Luma copies row-by-row;
+         * chroma is always sampled at its pixel stride and interleaved
+         * V,U — correct whether the HAL exposes planar or interleaved
+         * planes. Out-of-range reads clamp to zero (malformed strides
+         * degrade to black, never throw on the analysis thread).
+         * PURE — JVM-tested in CameraSetupDelegateTest.
+         */
+        internal fun companionYuv420888ToNv21(
+            yBytes: ByteArray, yRowStride: Int,
+            uBytes: ByteArray, uRowStride: Int, uPixelStride: Int,
+            vBytes: ByteArray, vRowStride: Int, vPixelStride: Int,
+            width: Int, height: Int
+        ): ByteArray {
+            val out = ByteArray(width * height * 3 / 2)
+            var dst = 0
+            for (row in 0 until height) {
+                val srcRow = row * yRowStride
+                for (col in 0 until width) {
+                    out[dst++] = yBytes.getOrElse(srcRow + col) { 0 }
+                }
+            }
+            val uvWidth = width / 2
+            val uvHeight = height / 2
+            for (row in 0 until uvHeight) {
+                val uRow = row * uRowStride
+                val vRow = row * vRowStride
+                for (col in 0 until uvWidth) {
+                    out[dst++] = vBytes.getOrElse(vRow + col * vPixelStride) { 0 }
+                    out[dst++] = uBytes.getOrElse(uRow + col * uPixelStride) { 0 }
+                }
+            }
+            return out
         }
     }
 
@@ -282,10 +344,11 @@ class CameraSetupDelegate {
         // supported use-case level), while re-binding later to add it would
         // race the analyzer and risk dropping frames mid-capture. 4:3 keeps
         // the full sensor field of view (16:9 crops it), so nothing at the
-        // top or bottom of a document page is lost.
+        // top or bottom of a document page is lost — the target below is
+        // exactly 4:3 (HIGH_RES_STILL_WIDTH/HEIGHT, aspect pinned by test).
         val imageCaptureUseCase = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-            .setTargetResolution(Size(2400, 1350))
+            .setTargetResolution(Size(HIGH_RES_STILL_WIDTH, HIGH_RES_STILL_HEIGHT))
             .setTargetRotation(previewView.display.rotation)
             .build()
         this.imageCapture = imageCaptureUseCase
@@ -560,10 +623,36 @@ class CameraSetupDelegate {
             return
         }
 
+        // Timeout: a stuck HAL that never calls back must fail the
+        // capture instead of wedging the caller (#52). The completed
+        // flag makes success/error/timeout mutually exclusive.
+        val completed = AtomicBoolean(false)
+        val timeoutRunnable = Runnable {
+            if (completed.compareAndSet(false, true)) {
+                Log.w(TAG, "High-res capture timed out after ${HIGH_RES_CAPTURE_TIMEOUT_MS}ms")
+                CrashLogFile.log(TAG, "High-res capture timed out — failing open")
+                onError("High-res capture timed out")
+            }
+        }
+        val ctx = context
+        if (ctx == null) {
+            // Fail fast instead of stranding the caller on the capture
+            // timeout: without a context no picture can ever start (#107).
+            // (The timeout is not posted yet — nothing to remove.)
+            onError("High-res capture unavailable (no context)")
+            return
+        }
+        mainHandler.postDelayed(timeoutRunnable, HIGH_RES_CAPTURE_TIMEOUT_MS)
+
         capture.takePicture(
-            ContextCompat.getMainExecutor(context ?: return),
+            ContextCompat.getMainExecutor(ctx),
             object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
+                    if (!completed.compareAndSet(false, true)) {
+                        image.close()
+                        return
+                    }
+                    mainHandler.removeCallbacks(timeoutRunnable)
                     // Rotation is applied here so ML Kit sees upright text.
                     val bitmap = image.toBitmap()
                     val rotation = image.imageInfo.rotationDegrees
@@ -587,6 +676,8 @@ class CameraSetupDelegate {
                 }
 
                 override fun onError(exception: ImageCaptureException) {
+                    if (!completed.compareAndSet(false, true)) return
+                    mainHandler.removeCallbacks(timeoutRunnable)
                     Log.w(TAG, "High-res capture failed: ${exception.message}")
                     onError("High-res capture failed")
                 }
@@ -605,20 +696,23 @@ class CameraSetupDelegate {
      */
     private fun doDecodeFrame(imageProxy: ImageProxy): Bitmap? {
         return try {
-            val yBuffer = imageProxy.planes[0].buffer
-            val uBuffer = imageProxy.planes[1].buffer
-            val vBuffer = imageProxy.planes[2].buffer
-
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            // Y plane
-            yBuffer.get(nv21, 0, ySize)
-            // VU plane (interleaved for NV21)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
+            // Stride-aware pack (#24): duplicates leave the proxy's own
+            // buffer positions untouched for downstream consumers.
+            val yPlane = imageProxy.planes[0]
+            val uPlane = imageProxy.planes[1]
+            val vPlane = imageProxy.planes[2]
+            val yBytes = ByteArray(yPlane.buffer.remaining())
+            yPlane.buffer.duplicate().get(yBytes)
+            val uBytes = ByteArray(uPlane.buffer.remaining())
+            uPlane.buffer.duplicate().get(uBytes)
+            val vBytes = ByteArray(vPlane.buffer.remaining())
+            vPlane.buffer.duplicate().get(vBytes)
+            val nv21 = companionYuv420888ToNv21(
+                yBytes, yPlane.rowStride,
+                uBytes, uPlane.rowStride, uPlane.pixelStride,
+                vBytes, vPlane.rowStride, vPlane.pixelStride,
+                imageProxy.width, imageProxy.height
+            )
 
             val yuvImage = YuvImage(nv21, ImageFormat.NV21, imageProxy.width, imageProxy.height, null)
             val out = ByteArrayOutputStream()
