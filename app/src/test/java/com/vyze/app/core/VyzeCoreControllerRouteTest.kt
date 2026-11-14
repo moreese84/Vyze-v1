@@ -823,4 +823,52 @@ class VyzeCoreControllerRouteTest {
         assertFalse(VyzeCoreController.companionShouldReadDirectly("", 0.95f))
         assertFalse(VyzeCoreController.companionShouldReadDirectly(null, 0.95f))
     }
+
+    // ── Interim-progress guard (latency round, 2026-11-14) ──
+    // Long CPU prefills speak a "still working" cue past the first-token
+    // grace — but only while the armed turn is still the live inferring
+    // turn with no token yet. Stale timers self-skip, so completion,
+    // cancel and error paths need no explicit disarm.
+
+    @Test
+    fun `live tokenless inferring turn speaks interim`() {
+        assertTrue(
+            VyzeCoreController.companionShouldSpeakInterim(
+                liveSessionId = "s1", armedSessionId = "s1",
+                tokenArrived = false, inferring = true
+            )
+        )
+    }
+
+    @Test
+    fun `stale moved-on or idle timers stay silent`() {
+        // Session moved on (new turn armed its own timer).
+        assertFalse(
+            VyzeCoreController.companionShouldSpeakInterim(
+                liveSessionId = "s2", armedSessionId = "s1",
+                tokenArrived = false, inferring = true
+            )
+        )
+        // First token already flowed — the answer exists.
+        assertFalse(
+            VyzeCoreController.companionShouldSpeakInterim(
+                liveSessionId = "s1", armedSessionId = "s1",
+                tokenArrived = true, inferring = true
+            )
+        )
+        // Inference ended (completed, cancelled, errored).
+        assertFalse(
+            VyzeCoreController.companionShouldSpeakInterim(
+                liveSessionId = "s1", armedSessionId = "s1",
+                tokenArrived = false, inferring = false
+            )
+        )
+        // No live session at all.
+        assertFalse(
+            VyzeCoreController.companionShouldSpeakInterim(
+                liveSessionId = "", armedSessionId = "s1",
+                tokenArrived = false, inferring = true
+            )
+        )
+    }
 }

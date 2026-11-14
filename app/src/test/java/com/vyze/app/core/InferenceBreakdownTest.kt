@@ -1,6 +1,7 @@
 package com.vyze.app.core
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -10,14 +11,16 @@ import org.junit.Test
  * crash-log lines are the Tier-3 latency investigation surface: every
  * prefill-vs-decode claim is read off them with grep, so their field
  * order and spelling are a contract. In particular each line must carry
- * the serving backend (CPU vs GPU swap landed?) and the device tier —
- * without those, a 38 s prefill cannot be attributed to a cause.
+ * the serving backend (CPU vs GPU swap landed?), the device tier, and
+ * the thermal policy — without those, a 38 s prefill cannot be
+ * attributed to a cause.
  */
 class InferenceBreakdownTest {
 
     private fun sample() = InferenceBreakdown(
         backend = "CPU",
         tier = "TIER_3",
+        thermal = "MODERATE",
         threads = 4,
         totalMs = 40_180L,
         tPreprocess = 12L,
@@ -35,7 +38,7 @@ class InferenceBreakdownTest {
     @Test
     fun `pipeline line carries backend tier and every stage timing`() {
         assertEquals(
-            "[PIPELINE-BREAKDOWN] backend=CPU tier=TIER_3 threads=4 " +
+            "[PIPELINE-BREAKDOWN] backend=CPU tier=TIER_3 thermal=MODERATE threads=4 " +
                 "preprocess=12ms jpeg=34ms payload=5ms lane-wait=6ms " +
                 "PREFILL=38123ms DECODE=2000ms-so-far",
             sample().formatPipeline()
@@ -45,7 +48,7 @@ class InferenceBreakdownTest {
     @Test
     fun `analyze line carries backend tier total and output size`() {
         assertEquals(
-            "[ANALYZE-BREAKDOWN] backend=CPU tier=TIER_3 total=40180ms " +
+            "[ANALYZE-BREAKDOWN] backend=CPU tier=TIER_3 thermal=MODERATE total=40180ms " +
                 "preprocess=12ms jpeg=34ms payload=5ms lane-wait=6ms " +
                 "prefill(firstToken)=38123ms decode=2000ms " +
                 "prompt=1400chars out=96chars",
@@ -57,7 +60,7 @@ class InferenceBreakdownTest {
     fun `analyze line marks the no-streamed-token case honestly`() {
         val line = sample().copy(streamedFirstToken = false, decodeMs = 0L).formatAnalyze()
         assertEquals(
-            "[ANALYZE-BREAKDOWN] backend=CPU tier=TIER_3 total=40180ms " +
+            "[ANALYZE-BREAKDOWN] backend=CPU tier=TIER_3 thermal=MODERATE total=40180ms " +
                 "preprocess=12ms jpeg=34ms payload=5ms lane-wait=6ms " +
                 "prefill(firstToken)=38123ms decode=0ms " +
                 "(no streamed token — single-message response) " +
@@ -69,7 +72,7 @@ class InferenceBreakdownTest {
     @Test
     fun `text lane line carries backend tier and prefill-decode split`() {
         assertEquals(
-            "[TEXT-BREAKDOWN] backend=CPU tier=TIER_3 total=40180ms " +
+            "[TEXT-BREAKDOWN] backend=CPU tier=TIER_3 thermal=MODERATE total=40180ms " +
                 "prefill(firstToken)=38123ms decode=2000ms " +
                 "prompt=1400chars out=96chars",
             sample().formatText()
@@ -143,5 +146,14 @@ class InferenceBreakdownTest {
         assertEquals(500L, split.laneMs)
         assertEquals(0L, split.prefillMs)
         assertEquals(0L, split.decodeMs)
+    }
+
+    @Test
+    fun `thermal defaults to UNKNOWN and still formats inline`() {
+        val line = sample().copy(thermal = "UNKNOWN").formatAnalyze()
+        assertTrue(
+            "expected thermal=UNKNOWN inline, got: $line",
+            line.contains("tier=TIER_3 thermal=UNKNOWN total=")
+        )
     }
 }

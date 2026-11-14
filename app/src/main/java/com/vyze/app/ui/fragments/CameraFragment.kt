@@ -790,19 +790,7 @@ class CameraFragment : Fragment() {
         // Long press  → check ambient light + flashlight status.
         // Triple tap  → color analysis. Triple tap + hold → SOS.
         gestureRouter.onSingleTapAction = { x, y ->
-            bargeInAndCapture(
-                "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
-                "Describe what is in front of me and around me for navigation, in 1-2 " +
-                "complete, natural spoken sentences with a subject and a verb — the way " +
-                "you would tell a person standing next to me. For each key object include " +
-                "color, size, material, and state. " +
-                "If the tapped object is a packaged product (packet, box, bottle, can), " +
-                "first say its BRAND name and product type exactly as printed " +
-                "(for example: Maggi instant noodle packet), then its details, then continue. " +
-                "If the tapped object has text on it (a label, box, or sign), " +
-                "read it aloud verbatim as whole words and sentences, never spelling letter by letter. " +
-                "Read the ENTIRE text on the object in reading order; do not stop halfway."
-            )
+            bargeInAndCapture(companionTapQuery(x.toInt(), y.toInt()))
         }
 
         gestureRouter.onDoubleTapAction = {
@@ -3029,6 +3017,23 @@ class CameraFragment : Fragment() {
     }
 
     companion object {
+        /**
+         * Single-tap query builder (companion: JVM-testable). The tap
+         * prompt rides EVERY tap turn's prefill (~2.6-6 ms per token on
+         * CPU), so it carries ONLY the tap-position marker (which
+         * [VyzeCoreController] classifies on), a one-line task, and one
+         * read verb (which keeps taps read-active for the refusal swap,
+         * the CJK coverage net and the recital contract) — the
+         * DIRECT/NAV rule prose already owns every other instruction the
+         * old ~800-char prompt duplicated (brand-first, verbatim reads,
+         * color/size/material/state). Pinned by
+         * [CameraFragmentTapQueryTest]: marker + read verb present,
+         * length bounded.
+         */
+        internal fun companionTapQuery(x: Int, y: Int): String =
+            "User tapped at position ($x, $y). Describe the tapped object and what is around it " +
+                "for navigation. Read any visible text aloud."
+
         /**
          * Grace period (ms) after all pending utterances complete before
          * releasing audio focus. Compensates for Android AudioTrack

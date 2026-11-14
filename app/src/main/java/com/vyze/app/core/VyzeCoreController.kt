@@ -262,6 +262,18 @@ class VyzeCoreController(
     @Volatile
     private var firstChunkSent = false
 
+    /**
+     * Set on the first streamed token of the live turn — disarms the
+     * interim-progress speech (which only fires when prefill runs past
+     * the first-token grace with nothing to show yet). Reset by
+     * [armInterimProgress], so every VLM call site is covered uniformly.
+     */
+    @Volatile
+    private var firstTokenArrived = false
+
+    /** Pending interim-progress callback, so destroy() drops it with the controller. */
+    private var interimRunnable: Runnable? = null
+
     // ── Local performance telemetry (privacy-safe; V1) ────────────
     // One row per completed/failed VLM inference: task-type bucket,
     // active backend, latency, failure kind. NO task text, NO image or
@@ -514,6 +526,9 @@ class VyzeCoreController(
                     // ── WATCHDOG PROGRESS: tokens are flowing — reset the
                     //    stall clock so long generations are never killed.
                     lastInferenceActivityMs = System.currentTimeMillis()
+                    // First live token — the answer exists; interim progress
+                    // speech stands down.
+                    firstTokenArrived = true
 
                     // ── CONFIDENCE CHECK: abort if model is hedging ──────
                     // Track the first few tokens. If the model starts with
@@ -1618,6 +1633,38 @@ class VyzeCoreController(
 
     // ── Snapshot Trigger ───────────────────────────────────────────
 
+    /**
+     * Arms the interim-progress speech for one VLM call: if prefill runs
+     * past the first-token grace with no token yet, a short localized
+     * "still working" cue speaks (QUEUE_ADD — never clips the dead-air
+     * filler or the answer) so a 40 s CPU prefill is not silence. The
+     * guard ([companionShouldSpeakInterim]) self-skips stale timers, and
+     * the cue rides the dead-air exclusion so first-audio measurement
+     * still spans frame → ANSWER audio. One-shot per arm; re-arming
+     * replaces the pending timer.
+     */
+    private fun armInterimProgress(sessionId: String) {
+        firstTokenArrived = false
+        interimRunnable?.let { mainHandler.removeCallbacks(it) }
+        val locale = activeUserLocale.language
+        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
+        val runnable = Runnable {
+            if (!fired.compareAndSet(false, true)) return@Runnable
+            if (companionShouldSpeakInterim(activeSessionId, sessionId, firstTokenArrived, isInferring.get())) {
+                CrashLogFile.log(TAG, "Interim progress spoken (no token in grace window)")
+                ttsManager.speakQueued(
+                    com.vyze.app.performance.VyzePerformanceConfig.interimPhrase(locale),
+                    deadAirFiller = true
+                )
+            }
+        }
+        interimRunnable = runnable
+        mainHandler.postDelayed(
+            runnable,
+            com.vyze.app.performance.VyzePerformanceConfig.VLM_FIRST_TOKEN_GRACE_MS
+        )
+    }
+
     fun triggerSnapshot(bitmap: Bitmap, query: String? = null, continuousMode: Boolean = false) {
         if (!engineReady) {
             Log.w(TAG, "triggerSnapshot called but engine not ready")
@@ -2404,6 +2451,7 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
+                armInterimProgress(currentSessionId)
                 // Scene queries are concise (25 words max). Text queries get an
                 // ADAPTIVE budget sized to the OCR text actually found — the
                 // model mostly echoes it back, so a dense back-panel gets a
@@ -2435,7 +2483,8 @@ class VyzeCoreController(
                     similarInteractions = emptyList(),
                     sessionId = currentSessionId,
                     targetDimension = targetDimension,
-                    maxTokens = localeMaxTokens
+                    maxTokens = localeMaxTokens,
+                    thermalLabel = thermalPolicy.label
                 )
 
                 // ── CANCELLATION CHECK: bail out after VLM call if cancelled ──
@@ -2931,6 +2980,7 @@ class VyzeCoreController(
                 // cap (same per-trigger read the snapshot lane does).
                 val expansionPolicy = (context.applicationContext as? VyzeApplication)
                     ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
+                armInterimProgress(currentSessionId)
                 val response = vlmEngine.analyzeImage(
                     bitmap = frame,
                     prompt = basePrompt,
@@ -2948,7 +2998,8 @@ class VyzeCoreController(
                             SCENE_QUERY_MAX_TOKENS, expansionPolicy.sceneTokenCap
                         ),
                         activeUserLocale.language
-                    )
+                    ),
+                    thermalLabel = expansionPolicy.label
                 )
                 if (!isActive) {
                     Log.d(TAG, "Expansion job cancelled after VLM call — discarding")
@@ -3218,12 +3269,16 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeText()...")
+                armInterimProgress(currentSessionId)
+                val textPolicy = (context.applicationContext as? VyzeApplication)
+                    ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
                 val response = vlmEngine.analyzeText(
                     prompt = basePrompt,
                     sessionId = currentSessionId,
                     maxTokens = companionLocaleTokenHeadroom(
                         TEXT_ONLY_MAX_TOKENS, activeUserLocale.language
-                    )
+                    ),
+                    thermalLabel = textPolicy.label
                 )
 
                 if (!isActive) {
@@ -3640,6 +3695,8 @@ class VyzeCoreController(
     }
 
     fun destroy() {
+        interimRunnable?.let { mainHandler.removeCallbacks(it) }
+        interimRunnable = null
         vlmEngine.close()
         ocrHelper.close()
         barcodeHelper.close()
@@ -4450,6 +4507,22 @@ class VyzeCoreController(
          */
         fun companionLocaleTokenHeadroom(baseTokens: Int, language: String): Int =
             if (language == "ms") (baseTokens * 4) / 3 else baseTokens
+
+        /**
+         * Interim-progress guard (pure — JVM-tested in
+         * VyzeCoreControllerRouteTest): speak only while the armed turn is
+         * still the live inferring turn with no token yet. Stale timers
+         * (session moved on, inference ended, first token already flowed)
+         * self-skip, so no explicit disarm is needed on the completion,
+         * cancel, or error paths.
+         */
+        fun companionShouldSpeakInterim(
+            liveSessionId: String,
+            armedSessionId: String,
+            tokenArrived: Boolean,
+            inferring: Boolean
+        ): Boolean = liveSessionId.isNotEmpty() &&
+            liveSessionId == armedSessionId && !tokenArrived && inferring
 
         /**
          * Thermal token cap (audit P3 #72, 2026-11-09): MODERATE+ heat

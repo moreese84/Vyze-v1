@@ -1,6 +1,7 @@
 package com.vyze.app.core
 import com.vyze.app.performance.VyzeAdaptiveBackend
 import com.vyze.app.util.CrashLogFile
+import com.vyze.app.util.SingleFlight
 
 import android.app.ActivityManager
 import android.content.ComponentCallbacks2
@@ -232,7 +233,21 @@ class VlmEngineManager(
     private class EngineBuildResult {
         @Volatile var engine: Engine? = null
         @Volatile var error: Throwable? = null
+        /** Backend this build attempted — set at park time so a late completion can be adopted under its true name. */
+        @Volatile var backendName: String = ""
     }
+
+    /**
+     * A finished engine build plus the backend it ACTUALLY serves. Differs
+     * from the requested step when a timed-out build materialized late and
+     * was adopted (its budget miss is history; the engine itself is
+     * healthy and still earns the normal warm-up + calibration verdict).
+     */
+    private data class BuiltEngine(
+        val engine: Engine,
+        val backendName: String,
+        val adoptedLate: Boolean
+    )
 
     @Volatile
     private var pendingBuild: EngineBuildResult? = null
@@ -520,7 +535,17 @@ class VlmEngineManager(
      * it can never cancel the parent CoroutineScope or break non-VLM
      * features (standalone OCR, Light Check, Color Analysis).
      */
-    suspend fun initialize(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun initialize(): Boolean {
+        // Fast path first — no gate traffic once serving.
+        if (isInitialized) return true
+        return initSingleFlight.run {
+            // Recheck inside the flight: the winner may have finished
+            // while this caller queued — never rebuild a live engine.
+            if (isInitialized) true else doInitialize()
+        }
+    }
+
+    private suspend fun doInitialize(): Boolean = withContext(Dispatchers.IO) {
         if (isInitialized) return@withContext true
 
         // P2 #34: every init starts unflagged; only the missing-file branch sets it.
@@ -673,11 +698,16 @@ class VlmEngineManager(
                     continue
                 }
                 onStepProgress?.invoke(30 + index * 10, progressMessageFor(step))
-                val ok = createEngineGuarded(brain, modelFile, step, tier)
-                if (ok) {
+                val built = createEngineGuarded(brain, modelFile, step, tier)
+                if (built != null) {
+                    // The serving backend can differ from the requested step
+                    // when a timed-out build materialized late and was
+                    // adopted — warm-up, verdict, telemetry and logs below
+                    // all use the ACTUAL backend, never the step's.
+                    val servingBackend = built.backendName
                     // Warm-up — pre-compile GPU kernels / warm the CPU decoder
                     onStepProgress?.invoke(75, "Sharpening my focus (this takes a moment)...")
-                    CrashLogFile.log(TAG, "Step 3: Engine warm-up (dummy inference) [${step.backendName}]...")
+                    CrashLogFile.log(TAG, "Step 3: Engine warm-up (dummy inference) [$servingBackend]...")
                     val warmupLatencyMs = warmUp()
 
                     // ── STARTUP CALIBRATION VERDICT ───────────────────
@@ -697,7 +727,7 @@ class VlmEngineManager(
                         val ramMB = runCatching { availableHeapMB() }.getOrDefault(0L)
                         val healthy = VyzeAdaptiveBackend.warmupHealthy(warmupLatencyMs)
                         when {
-                            step.backendName.equals("GPU", true) && healthy -> {
+                            servingBackend.equals("GPU", true) && healthy -> {
                                 // GPU passed: persist it as this device's best config.
                                 VyzeAdaptiveBackend.saveBestBackend(context, "GPU")
                                 // Clear the failure memory — the device just
@@ -709,7 +739,7 @@ class VlmEngineManager(
                                     VyzeAdaptiveBackend.GPU_WARMUP_ROUNDS_BEFORE_JUDGMENT,
                                 )
                             }
-                            step.backendName.equals("GPU", true) -> {
+                            servingBackend.equals("GPU", true) -> {
                                 // Built but unhealthy: serves NO session and
                                 // never becomes the persisted preference.
                                 // Track this as a device-level GPU memory.
@@ -729,11 +759,11 @@ class VlmEngineManager(
                                 // the next init's re-validation, not this CPU win.
                             }
                         }
-                        CrashLogFile.log(TAG, "Calibration verdict: backend=${step.backendName}, warmup=${warmupLatencyMs}ms, healthy=$healthy, freeRam=${ramMB}MB")
+                        CrashLogFile.log(TAG, "Calibration verdict: backend=$servingBackend, warmup=${warmupLatencyMs}ms, healthy=$healthy, freeRam=${ramMB}MB")
                         com.vyze.app.performance.VyzeLocalTelemetry.record(
                             context = context,
                             taskType = com.vyze.app.performance.VyzePerformanceConfig.TelemetryTaskType.BACKEND_SELECTION,
-                            backend = step.backendName.lowercase(),
+                            backend = servingBackend.lowercase(),
                             latencyMs = warmupLatencyMs,
                             success = healthy,
                         )
@@ -754,8 +784,8 @@ class VlmEngineManager(
                     }
 
                     onStepProgress?.invoke(95, "Finalizing...")
-                    CrashLogFile.log(TAG, "=== INIT SUCCESS [${step.backendName}, $tier] ===")
-                    Log.i(TAG, "${brain.displayName} loaded successfully [backend=${step.backendName}, tier=$tier]")
+                    CrashLogFile.log(TAG, "=== INIT SUCCESS [$servingBackend, $tier] ===")
+                    Log.i(TAG, "${brain.displayName} loaded successfully [backend=$servingBackend, tier=$tier]")
                     if (deferredGpu) {
                         // CPU now serves. Start the background GPU build +
                         // quiet-point swap (owner option 1).
@@ -940,23 +970,19 @@ class VlmEngineManager(
      * affects the plan, the deferral and its log line together.
      *
      * "Nothing learned yet" (never calibrated) deliberately reads as
-     * ALLOWED — see the plan-gate comment above.
+     * ALLOWED — unless a failure backoff is active, which suppresses the
+     * retry even before any successful calibration (see the plan-gate
+     * comment above and [companionAdaptiveGpuGate]).
      */
     private fun adaptiveGpuGate(): Pair<Boolean, String> = try {
         val state = VyzeAdaptiveBackend.loadPersistentState(context)
-        val calibrated = state.lastValidatedMs > 0L
-        when {
-            VyzeAdaptiveBackend.deviceLooksCpuOnly(deviceProfile.hardware) ->
-                true to "known-bad GPU driver (hardware heuristic)"
-            state.overtempCount >= VyzeAdaptiveBackend.OVERTEMP_FALLBACK_THRESHOLD ->
-                true to "overtemp CPU fallback active"
-            !calibrated -> false to ""
-            state.preferredBackend.uppercase() == "CPU" ->
-                true to "calibrated device memory (CPU verdict)"
-            VyzeAdaptiveBackend.gpuBackoffActive(context) ->
-                true to "calibrated device memory (24h GPU-failure backoff)"
-            else -> false to ""
-        }
+        companionAdaptiveGpuGate(
+            cpuOnlyHardware = VyzeAdaptiveBackend.deviceLooksCpuOnly(deviceProfile.hardware),
+            overtempCount = state.overtempCount,
+            lastValidatedMs = state.lastValidatedMs,
+            preferredBackend = state.preferredBackend,
+            backoffActive = VyzeAdaptiveBackend.gpuBackoffActive(context)
+        )
     } catch (_: Throwable) {
         // Policy reads are advisory and the GPU attempt itself is
         // crash-guarded — on any read failure, let the trial happen.
@@ -1134,28 +1160,37 @@ class VlmEngineManager(
      *    — nothing propagates as an uncaught Job cancellation,
      *  - external caller cancellation is rethrown untouched.
      *
-     * @return true when the engine is ready on this backend.
+     * @return the wired engine plus the backend it actually serves (see
+     *   [BuiltEngine]), or null on failure.
      */
     private suspend fun createEngineGuarded(
         brain: BrainModel,
         modelFile: File,
         step: TierBackendPlan,
         tier: DeviceTier
-    ): Boolean {
+    ): BuiltEngine? {
         // WIRING WRAPPER: the guarded build lives in [buildEngineForBackend]
         // (mutex / timers / crash-guards identical, so one code path owns the
         // build discipline). The CPU-first path also uses that builder —
         // WITHOUT the wiring — to hold a background GPU engine.
-        val eng = buildEngineForBackend(brain, modelFile, step, tier)
-        return if (eng != null) {
+        // The foreground chain adopts a late completion of ANY backend: a
+        // late GPU engine serving honors the plan's GPU-first preference
+        // better than burning a fresh CPU build.
+        val built = buildEngineForBackend(brain, modelFile, step, tier, adoptLateBuild = true)
+        return if (built != null) {
             onStepProgress?.invoke(45, "Getting my vision ready...")
-            CrashLogFile.log(TAG, "Engine created + initialized [${step.backendName}]")
-            engine = eng
-            activeBackend = step.backendName
+            val servingBackend = built.backendName
+            CrashLogFile.log(
+                TAG,
+                "Engine created + initialized [$servingBackend]" +
+                    if (built.adoptedLate) " (adopted late build)" else ""
+            )
+            engine = built.engine
+            activeBackend = servingBackend
             isInitialized = true
-            true
+            built
         } else {
-            false
+            null
         }
     }
 
@@ -1172,7 +1207,13 @@ class VlmEngineManager(
      *    an uncaught Job cancellation,
      *  - external caller cancellation is rethrown untouched.
      *
-     * @return the ready engine, or null on failure (build error, timeout).
+     * @return the ready engine plus the backend it actually serves (which
+     *   differs from [step] when a timed-out build materialized late and was
+     *   adopted), or null on failure (build error, timeout).
+     * @param adoptLateBuild adopt a late completion of ANY backend (the
+     *   foreground chain: serving a late GPU engine honors the plan's
+     *   GPU-first preference). Background builders keep the default strict
+     *   match — a parked CPU build must never be adopted as a GPU engine.
      * @see createEngineGuarded for the wiring behavior.
      * @see launchBackgroundGpuBuild for the CPU-first consumer.
      */
@@ -1181,8 +1222,9 @@ class VlmEngineManager(
         modelFile: File,
         step: TierBackendPlan,
         tier: DeviceTier,
-        timeoutOverrideMs: Long? = null
-    ): Engine? {
+        timeoutOverrideMs: Long? = null,
+        adoptLateBuild: Boolean = false
+    ): BuiltEngine? {
         return engineInitMutex.withLock {
             CrashLogFile.log(
                 TAG,
@@ -1202,7 +1244,7 @@ class VlmEngineManager(
             try {
                 applyTierExperimentalFlags(brain, tier)
 
-                val eng = buildEngineTimed(
+                val built = buildEngineTimed(
                     EngineConfig(
                         modelPath = modelFile.absolutePath,
                         backend = step.backend,
@@ -1265,10 +1307,12 @@ class VlmEngineManager(
                         maxNumTokens = step.contextTokens,
                         cacheDir = context.cacheDir.path
                     ),
-                    timeoutMs
+                    timeoutMs,
+                    step.backendName,
+                    adoptLateBuild
                 )
 
-                if (eng == null) {
+                if (built == null) {
                     lastEngineBuildTimedOut = true
                     CrashLogFile.logError(
                         TAG,
@@ -1281,7 +1325,7 @@ class VlmEngineManager(
                 // Success — the CALLER decides whether this engine becomes
                 // the active serving engine ([createEngineGuarded]) or stays
                 // parked for a background swap ([launchBackgroundGpuBuild]).
-                eng
+                built
 
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // External cancellation (caller scope) — rethrow untouched;
@@ -1309,14 +1353,30 @@ class VlmEngineManager(
      * build runs on the dedicated single-thread init lane while the caller
      * polls. On completion within budget the engine is returned; on timeout
      * the result holder is parked in [pendingBuild] so the NEXT attempt can
-     * drain-wait for the (uninterruptible) build and close it properly
-     * instead of leaking it or racing a second native init against it.
+     * drain-wait for the (uninterruptible) build and ADOPT it if it
+     * materialized healthy instead of racing a second native init against
+     * it — or re-park it if it is still running.
      */
-    private suspend fun buildEngineTimed(engineConfig: EngineConfig, timeoutMs: Long): Engine? {
-        // Drain + close any previous timed-out build still materializing.
-        awaitAndClosePendingBuild(PENDING_BUILD_DRAIN_MS)
+    private suspend fun buildEngineTimed(
+        engineConfig: EngineConfig,
+        timeoutMs: Long,
+        backendName: String,
+        adoptAnyBackend: Boolean
+    ): BuiltEngine? {
+        // Drain the previous timed-out build: adopt a healthy late
+        // completion under its true backend instead of building over it.
+        awaitPendingBuild(
+            PENDING_BUILD_DRAIN_MS,
+            acceptBackend = if (adoptAnyBackend) null else backendName
+        )?.let { adopted ->
+            val engine = adopted.engine
+            if (engine != null) {
+                return BuiltEngine(engine, adopted.backendName, adoptedLate = true)
+            }
+        }
 
         val result = EngineBuildResult()
+        result.backendName = backendName
         val deadline = System.currentTimeMillis() + timeoutMs
 
         scope.launch(engineInitDispatcher) {
@@ -1336,13 +1396,16 @@ class VlmEngineManager(
         }
 
         result.engine?.let {
-            pendingBuild = null
-            return it
+            // NOTE: pendingBuild is deliberately NOT cleared here — the
+            // pre-drain above may have re-parked a still-running older
+            // build, and clearing would orphan it. The next drain reaps it.
+            return BuiltEngine(it, backendName, adoptedLate = false)
         }
         result.error?.let { throw it }
 
         // Timed out — the native build may STILL complete later (it cannot be
-        // interrupted). Park the holder for the next attempt to drain + close.
+        // interrupted). Park the holder for the next attempt to drain: adopt
+        // if it materializes, re-park if it is still running.
         pendingBuild = result
         CrashLogFile.log(TAG, "Engine build timed out after ${timeoutMs / 1000}s — parked for drain")
         return null
@@ -1490,8 +1553,9 @@ class VlmEngineManager(
                     modelFile,
                     step,
                     tier,
-                    timeoutOverrideMs = backgroundEngineCreateTimeoutMs
-                )
+                    timeoutOverrideMs = backgroundEngineCreateTimeoutMs,
+                    adoptLateBuild = false
+                )?.engine
                 if (gpuEngine == null) {
                     // Timeout ≠ fault (2026-10-19): a build that merely ran
                     // past the budget (slow under down-clocked cores with the
@@ -1738,8 +1802,9 @@ class VlmEngineManager(
                     modelFile,
                     step,
                     deviceProfile.tier,
-                    timeoutOverrideMs = if (backendName.equals("GPU", true)) backgroundEngineCreateTimeoutMs else null
-                ) ?: run {
+                    timeoutOverrideMs = if (backendName.equals("GPU", true)) backgroundEngineCreateTimeoutMs else null,
+                    adoptLateBuild = false
+                )?.engine ?: run {
                     CrashLogFile.log(TAG, "Fresh-state rotation: clean $backendName build failed — keeping current (dirty) engine, next answer re-arms")
                     return@launch
                 }
@@ -1846,8 +1911,24 @@ class VlmEngineManager(
      * this guarantees it is drained and released before another backend
      * attempt starts, instead of two native inits fighting for RAM/GPU.
      */
-    private suspend fun awaitAndClosePendingBuild(maxWaitMs: Long) {
-        val pending = pendingBuild ?: return
+    /**
+     * Drain-wait for a parked timed-out build still materializing.
+     *
+     * A healthy late completion is ADOPTED, not closed (device evidence
+     * 2026-11-12, X6891: the GPU build finished at ~114 s, 24 s past its
+     * budget, and was thrown away — the budget miss is history, the engine
+     * itself is healthy and still earns the normal warm-up + verdict).
+     *
+     * @param acceptBackend adopt only a completion for this backend; null
+     *   adopts any backend (the foreground chain: a late GPU engine serving
+     *   honors the plan's GPU-first preference better than building CPU).
+     *   A backend mismatch is closed to free RAM for the build about to
+     *   start. A build still running past the window is RE-PARKED for the
+     *   next drain instead of orphaned (native builds are uninterruptible).
+     * @return the materialized holder for adoption, or null.
+     */
+    private suspend fun awaitPendingBuild(maxWaitMs: Long, acceptBackend: String?): EngineBuildResult? {
+        val pending = pendingBuild ?: return null
         pendingBuild = null
 
         val deadline = System.currentTimeMillis() + maxWaitMs
@@ -1857,14 +1938,30 @@ class VlmEngineManager(
             delay(100)
         }
 
-        pending.engine?.let { zombie ->
-            CrashLogFile.log(TAG, "Closing timed-out engine build (late completion)")
+        val late = pending.engine
+        if (late != null && pending.error == null) {
+            if (acceptBackend == null || pending.backendName == acceptBackend) {
+                CrashLogFile.log(TAG, "Adopted late engine build [${pending.backendName}] — budget miss, healthy engine")
+                return pending
+            }
+            CrashLogFile.log(TAG, "Closing parked ${pending.backendName} build (backend mismatch for $acceptBackend request)")
             try {
-                zombie.close()
+                late.close()
             } catch (_: Throwable) {}
+            pending.engine = null
+            pending.error = null
+            return null
         }
+        if (pending.engine == null && pending.error == null) {
+            pendingBuild = pending
+            return null
+        }
+        try {
+            pending.engine?.close()
+        } catch (_: Throwable) {}
         pending.engine = null
         pending.error = null
+        return null
     }
 
     /**
@@ -2001,7 +2098,8 @@ class VlmEngineManager(
         similarInteractions: List<SimilarInteraction> = emptyList(),
         sessionId: String = "",
         targetDimension: Int = MAX_INPUT_DIMENSION,
-        maxTokens: Int = MAX_TOKENS
+        maxTokens: Int = MAX_TOKENS,
+        thermalLabel: String = "UNKNOWN"
     ): String? = withContext(Dispatchers.Default) {
         val eng = engine
         if (eng == null || !isInitialized) {
@@ -2115,6 +2213,7 @@ class VlmEngineManager(
                             streamedFirstToken = true,
                             promptChars = 0,
                             outChars = 0,
+                            thermal = thermalLabel,
                         ).formatPipeline()
                     )
                 }
@@ -2155,6 +2254,7 @@ class VlmEngineManager(
                     streamedFirstToken = firstTokenFlag[0],
                     promptChars = formattedPrompt.length,
                     outChars = response?.length ?: 0,
+                    thermal = thermalLabel,
                 ).formatAnalyze()
             )
             CrashLogFile.log(TAG, "analyzeImage total: ${elapsed}ms")
@@ -2200,7 +2300,8 @@ class VlmEngineManager(
     suspend fun analyzeText(
         prompt: String,
         sessionId: String = "",
-        maxTokens: Int = TEXT_ONLY_MAX_TOKENS
+        maxTokens: Int = TEXT_ONLY_MAX_TOKENS,
+        thermalLabel: String = "UNKNOWN"
     ): String? = withContext(Dispatchers.Default) {
         CrashLogFile.log(TAG, "=== ANALYZE TEXT (no image) [brain=${brainForTurn().displayName}] ===")
         val formattedPrompt = buildTurnPrompt(
@@ -2257,6 +2358,7 @@ class VlmEngineManager(
                     streamedFirstToken = textFirstTokenFlag[0],
                     promptChars = formattedPrompt.length,
                     outChars = textResponse?.length ?: 0,
+                    thermal = thermalLabel,
                 ).formatText()
             )
             textResponse
@@ -3028,10 +3130,11 @@ class VlmEngineManager(
                         CrashLogFile.log(TAG, "resetSession: GPU deferred to background build")
                         continue
                     }
-                    if (createEngineGuarded(brain, modelFile, step, tier)) {
-                        Log.i(TAG, "resetSession: reinitialized on ${step.backendName} [tier=$tier]")
+                    val rebuilt = createEngineGuarded(brain, modelFile, step, tier)
+                    if (rebuilt != null) {
+                        Log.i(TAG, "resetSession: reinitialized on ${rebuilt.backendName} [tier=$tier]")
                         warmUp()
-                        if (rememberedGpu && step.backendName.equals("CPU", true)) {
+                        if (rememberedGpu && rebuilt.backendName.equals("CPU", true)) {
                             launchBackgroundGpuBuild(brain, modelFile, tier)
                         }
                         return@launch
@@ -3059,6 +3162,17 @@ class VlmEngineManager(
     fun isSessionResetting(): Boolean = sessionResetInProgress
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * Single-flight gate for [initialize] (device evidence 2026-11-12,
+     * X6891): the LoadingFragment 60 s safety timeout navigates away while
+     * init still builds, and the recreated fragment starts a SECOND
+     * initialize() — two overlapping inits, two backend plans, double
+     * builds and double program-cache churn. Joiners await the one flight
+     * instead; a caller arriving after completion starts a fresh one, so
+     * init retries still work.
+     */
+    private val initSingleFlight = SingleFlight<Boolean>(scope)
 
     /**
      * Dedicated single-thread inference lane (Q3). A limitedParallelism(1)
@@ -3166,6 +3280,16 @@ class VlmEngineManager(
             Log.w(TAG, "Error closing parked fresh-state engine: ${e.message}")
         }
         pendingFreshEngine = null
+        // And a parked timed-out build (adopt-or-repark holder): close a
+        // materialized engine so teardown never leaks native tensors. A
+        // build still running completes into the orphaned holder and is
+        // dropped — native builds are uninterruptible.
+        try {
+            pendingBuild?.engine?.close()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error closing parked timed-out build: ${e.message}")
+        }
+        pendingBuild = null
     }
 
     // ── Companion ──────────────────────────────────────────────────
@@ -3641,6 +3765,41 @@ class VlmEngineManager(
             return if (tier == DeviceTier.TIER_3) base + MIN_RAM_TIER3_EXTRA_MB else base
         }
 
+        /**
+         * Pure adaptive GPU gate (companion: JVM-testable). Returns
+         * (disallowed?, reason-why-disallowed). [adaptiveGpuGate] loads the
+         * persisted inputs and delegates here so the branch ORDER is pinned
+         * by [AdaptiveGpuGateTest], not by code review.
+         *
+         * Order is the whole contract: the failure backoff is checked BEFORE
+         * the calibrated check. Device evidence (2026-11-12, X6891): the old
+         * order returned ALLOWED for a never-calibrated device even with an
+         * active 24 h backoff, so a restart 70 s after a recorded 90 s GPU
+         * timeout re-attempted GPU — burning a second 90 s budget plus
+         * ~243 MB of unrestorable program-cache garbage.
+         */
+        internal fun companionAdaptiveGpuGate(
+            cpuOnlyHardware: Boolean,
+            overtempCount: Int,
+            lastValidatedMs: Long,
+            preferredBackend: String,
+            backoffActive: Boolean
+        ): Pair<Boolean, String> {
+            val calibrated = lastValidatedMs > 0L
+            return when {
+                cpuOnlyHardware ->
+                    true to "known-bad GPU driver (hardware heuristic)"
+                overtempCount >= VyzeAdaptiveBackend.OVERTEMP_FALLBACK_THRESHOLD ->
+                    true to "overtemp CPU fallback active"
+                backoffActive ->
+                    true to "calibrated device memory (24h GPU-failure backoff)"
+                !calibrated -> false to ""
+                preferredBackend.uppercase() == "CPU" ->
+                    true to "calibrated device memory (CPU verdict)"
+                else -> false to ""
+            }
+        }
+
         /** Engine context window (EngineConfig.maxNumTokens) per tier. */
         private const val CONTEXT_TOKENS_TIER1 = 4096
         private const val CONTEXT_TOKENS_TIER2 = 3072
@@ -3777,11 +3936,19 @@ class VlmEngineManager(
  * engine call sites only fill the fields. Field order and spelling are
  * pinned by [InferenceBreakdownTest]: Tier-3 latency analysis greps
  * these lines, so every run must carry its serving backend (CPU vs a
- * landed GPU swap) and device tier inline — no cross-line correlation.
+ * landed GPU swap), device tier, and thermal policy inline — no
+ * cross-line correlation.
  */
 internal data class InferenceBreakdown(
     val backend: String,
     val tier: String,
+    /**
+     * Thermal policy label at dispatch (NORMAL/MODERATE/...) — prefill
+     * climbs under throttling, so every timing line carries the run's
+     * thermal inline, same no-correlation rule as backend/tier. UNKNOWN
+     * when the caller did not resolve a policy (agent lanes).
+     */
+    val thermal: String = "UNKNOWN",
     val threads: Int,
     val totalMs: Long,
     val tPreprocess: Long,
@@ -3802,20 +3969,20 @@ internal data class InferenceBreakdown(
     val outChars: Int,
 ) {
     fun formatPipeline(): String =
-        "[PIPELINE-BREAKDOWN] backend=$backend tier=$tier threads=$threads " +
+        "[PIPELINE-BREAKDOWN] backend=$backend tier=$tier thermal=$thermal threads=$threads " +
             "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
             "payload=${tPayload}ms lane-wait=${tLane}ms " +
             "PREFILL=${tPrefill}ms DECODE=${decodeSoFarMs}ms-so-far"
 
     fun formatAnalyze(): String =
-        "[ANALYZE-BREAKDOWN] backend=$backend tier=$tier total=${totalMs}ms " +
+        "[ANALYZE-BREAKDOWN] backend=$backend tier=$tier thermal=$thermal total=${totalMs}ms " +
             "preprocess=${tPreprocess}ms jpeg=${tJpeg}ms " +
             "payload=${tPayload}ms lane-wait=${tLane}ms " +
             "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${noStreamNote()} " +
             "prompt=${promptChars}chars out=${outChars}chars"
 
     fun formatText(): String =
-        "[TEXT-BREAKDOWN] backend=$backend tier=$tier total=${totalMs}ms " +
+        "[TEXT-BREAKDOWN] backend=$backend tier=$tier thermal=$thermal total=${totalMs}ms " +
             "prefill(firstToken)=${tPrefill}ms decode=${decodeMs}ms${noStreamNote()} " +
             "prompt=${promptChars}chars out=${outChars}chars"
 
