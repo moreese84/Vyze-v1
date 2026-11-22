@@ -153,6 +153,17 @@
             android:exported="true" />
 
         <!--
+            Voice-query injector (debug only): replays a transcript through
+            the fragment's speech-result path so voice lanes (detector
+            bypasses, barcode speech, repeat replay, text-only routing)
+            can be verified on-device without a human speaker. Requires
+            the camera screen resumed. Does not exist in release builds.
+        -->
+        <receiver
+            android:name="com.vyze.app.debug.VoiceQueryReceiver"
+            android:exported="true" />
+
+        <!--
             Sticky brain override restore (debug only): same discipline as
             the pre-gate/gemma-always sticky providers — survives OEM kills
             during test cycles. Stub provider; does not exist in release

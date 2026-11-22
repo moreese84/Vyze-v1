@@ -383,17 +383,17 @@ class ResponseCleanupTest {
     // ── verbatim block match (live leak 2026-10-26 08:30:24) ────
 
     /**
-     * The three DIRECT_RULES_PROSE sentences that REACHED TTS verbatim on
-     * the new build this morning: 941-char response, markers/tags stripped
-     * 720 chars, the remaining 221 chars of rule prose were spoken (user
-     * report: "it still speak the prompt"). No fingerprint matched them —
-     * the block match exists because of exactly this.
+     * Three DIRECT_RULES_PROSE sentences, as recited verbatim (live leak
+     * 2026-10-26 08:30:24: 941-char response, markers/tags stripped 720
+     * chars, the remaining 221 chars of rule prose were spoken — user
+     * report: "it still speak the prompt"). Re-pinned to the November
+     * diet prose: the fixture must always mirror the CURRENT consts,
+     * since the block match fingerprints the prompt's own bytes.
      */
     private val liveLeakTriple =
-        "Answer directly in the first sentence. " +
-            "Write in complete, natural spoken sentences with a subject and a verb — NEVER a " +
-            "list of attributes separated by commas. " +
-            "Name the object and give compact, useful details — size, color."
+        "Lead with the answer in the first sentence. " +
+            "No location preamble — spatial position only for WHERE questions. " +
+            "Name the object with compact visible details (size, color."
 
     @Test
     fun `the three rule-prose sentences that leaked to TTS are dropped`() {
@@ -403,13 +403,13 @@ class ResponseCleanupTest {
 
     @Test
     fun `a rule sentence truncated at a clause still matches its block`() {
-        // The live third sentence stopped at "— size, color." while the
-        // block continues "…, material, state …" — equals/contains on the
+        // The live third sentence stopped at "(size, color." while the
+        // block continues "…, material, state)" — equals/contains on the
         // full string would miss it; symmetric substring must not.
         assertEquals(
             "",
             ResponseCleanup.stripInstructionEcho(
-                "Name the object and give compact, useful details — size, color."
+                "Name the object with compact visible details (size, color."
             )
         )
     }

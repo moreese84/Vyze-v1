@@ -71,4 +71,30 @@ class InitFailureMessageTest {
             assertFalse(s.contains(".litertlm"))
         }
     }
+
+    @Test
+    fun `generic engine failure never blames the connection`() {
+        // The old line ("check your connection") was wrong for an
+        // offline-first app — and the audit had already removed that
+        // sentence from the model-missing branch. The generic branch
+        // names the real fix instead: tap to retry.
+        val (en, ms, zh) = VyzeCoreController.companionEngineFailedSpeech()
+        assertEquals(
+            "AI engine setup failed. Tap anywhere to try again.",
+            en
+        )
+        assertEquals(
+            "Persediaan enjin AI gagal. Sila ketuk di mana-mana dan cuba lagi.",
+            ms
+        )
+        assertEquals(
+            "AI引擎设置失败。请点击任意位置重试。",
+            zh
+        )
+        for (s in listOf(en, ms, zh)) {
+            assertFalse(s.contains("connection"))
+            assertFalse(s.contains("/"))
+            assertFalse(s.contains("adb"))
+        }
+    }
 }

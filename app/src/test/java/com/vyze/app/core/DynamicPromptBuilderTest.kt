@@ -793,9 +793,14 @@ class DynamicPromptBuilderTest {
         // anything new. MEASURED at calibration (2026-10-24):
         // rich=3431 lean=2638 narration=1069 → gap 2362. Pin at 1,700 so
         // a full re-entry of any stripped block (~450 worst case) trips it.
+        // RECALIBRATED for the November prefill diet (2026-11-14): the
+        // diet deliberately shrank rich (3431 → 2537) while narration is
+        // byte-identical (1069) — the gap narrowed from the ruler side,
+        // not from narration bloat. Same trip-wire, new baseline:
+        // gap 1468 − 450 worst-case re-entry → pin at 1,000.
         assertTrue(
             "rich=${rich.length} narration=${narration.length} — gap collapsed",
-            rich.length - narration.length >= 1_700,
+            rich.length - narration.length >= 1_000,
         )
         // Class ceiling: hard cap for the ambient budget in EN.
         assertTrue("narration=${narration.length} exceeds class budget", narration.length <= 1_500)
@@ -860,5 +865,18 @@ class DynamicPromptBuilderTest {
         assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, sensitiveIdMode = true).contains("READ ALOUD"))
         assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, medicineMissMode = true).contains("READ ALOUD"))
         assertFalse(builder().buildPrompt(queryOverride = "read this", ocrText = ocr, readRecitalMode = true, dateRulesMode = true).contains("READ ALOUD"))
+    }
+
+    @Test
+    fun `detected barcode rides as citable prompt context`() = runBlocking {
+        // Taps on barcoded products used to describe around a value the
+        // app had already scanned — the value now rides the prompt.
+        val withCode = builder().buildPrompt(
+            queryOverride = "what is this",
+            barcodeContext = "EAN_13: 9556852683461"
+        )
+        assertTrue(withCode.contains("Barcode detected (EAN_13: 9556852683461)"))
+        val withoutCode = builder().buildPrompt(queryOverride = "what is this")
+        assertFalse(withoutCode.contains("Barcode detected"))
     }
 }

@@ -125,12 +125,12 @@ object ResponseCleanup {
      *
      * WHY (live leak 2026-10-26 08:30:24): the fingerprint list above only
      * catches instruction sentences we anticipated. The model recited three
-     * DIRECT_RULES_PROSE sentences ("Answer directly in the first sentence."
-     * …) — 941-char response, 720 chars stripped by markers/tags, and the
-     * remaining 221 chars of rule prose still SPOKEN. Matching against the
-     * prompt's own bytes closes the whole class: any rule sentence the model
-     * recites — full, embedded, or truncated at a clause — is dropped before
-     * TTS, memory or storage see it.
+     * DIRECT_RULES_PROSE sentences ("Lead with the answer in the first
+     * sentence." …) — 941-char response, 720 chars stripped by markers/tags,
+     * and the remaining 221 chars of rule prose still SPOKEN. Matching
+     * against the prompt's own bytes closes the whole class: any rule
+     * sentence the model recites — full, embedded, or truncated at a
+     * clause — is dropped before TTS, memory or storage see it.
      *
      * Tags are stripped HERE (not only by the caller) because the two call
      * sites differ in order: clean() tag-strips first, sanitizeForTts runs

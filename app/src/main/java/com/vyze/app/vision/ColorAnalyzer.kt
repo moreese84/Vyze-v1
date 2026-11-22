@@ -47,40 +47,103 @@ class ColorAnalyzer {
 
         val roiBitmap = Bitmap.createBitmap(bitmap, startX, startY, roiWidth, roiHeight)
 
+        // DEBUG evidence capture (2026-11-14): device reports every color
+        // wrong (black→orange/blue, yellow→dark blue, white→grey) — persist
+        // the exact input + sampled ROI so calibration reads pixels, not
+        // theories (stale pin? mis-aim? exposure?). Ring of 3, PNG, best
+        // effort, release builds skip entirely.
+        if (com.vyze.app.util.CrashLogFile.isDebugBuild()) {
+            try {
+                debugSaveIndex = (debugSaveIndex + 1) % 3
+                val dir = java.io.File(context.cacheDir, "color_debug")
+                dir.mkdirs()
+                java.io.FileOutputStream(java.io.File(dir, "color_in_${debugSaveIndex}.png")).use {
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+                }
+                java.io.FileOutputStream(java.io.File(dir, "color_roi_${debugSaveIndex}.png")).use {
+                    roiBitmap.compress(Bitmap.CompressFormat.PNG, 100, it)
+                }
+            } catch (_: Throwable) { /* evidence is optional */
+            }
+        }
+
         try {
-            // ── Step 2: Sample pixels and accumulate RGB ───────────────────
-            var totalR = 0L
-            var totalG = 0L
-            var totalB = 0L
-            var pixelCount = 0
+            // ── Step 2: Sample ROI (median) + frame (illuminant) ─────────
+            // MEDIAN, not mean (2026-11-14): a black notebook next to a
+            // light table averages to grey — median reports the dominant
+            // region instead. The full-frame sparse mean estimates the
+            // scene illuminant for gray-world correction below.
+            val reds = mutableListOf<Int>()
+            val greens = mutableListOf<Int>()
+            val blues = mutableListOf<Int>()
+            var illumR = 0L
+            var illumG = 0L
+            var illumB = 0L
+            var illumCount = 0
 
             val step = max(1, min(roiWidth, roiHeight) / SAMPLE_GRID)
-
             for (y in 0 until roiHeight step step) {
                 for (x in 0 until roiWidth step step) {
                     val pixel = roiBitmap.getPixel(x, y)
-                    totalR += Color.red(pixel)
-                    totalG += Color.green(pixel)
-                    totalB += Color.blue(pixel)
-                    pixelCount++
+                    reds.add(Color.red(pixel))
+                    greens.add(Color.green(pixel))
+                    blues.add(Color.blue(pixel))
+                }
+            }
+            val frameStep = max(1, min(bitmap.width, bitmap.height) / (SAMPLE_GRID * 2))
+            for (y in 0 until bitmap.height step frameStep) {
+                for (x in 0 until bitmap.width step frameStep) {
+                    val pixel = bitmap.getPixel(x, y)
+                    illumR += Color.red(pixel)
+                    illumG += Color.green(pixel)
+                    illumB += Color.blue(pixel)
+                    illumCount++
                 }
             }
 
-            if (pixelCount == 0) return context.getString(R.string.color_unknown)
+            if (reds.isEmpty() || illumCount == 0) return context.getString(R.string.color_unknown)
 
-            val avgR = (totalR / pixelCount).toInt()
-            val avgG = (totalG / pixelCount).toInt()
-            val avgB = (totalB / pixelCount).toInt()
+            val medR = companionMedian(reds)
+            val medG = companionMedian(greens)
+            val medB = companionMedian(blues)
+            // ── Step 2b: Capped gray-world white balance ───────────────
+            // Indoor warm light tints dark neutrals orange (device-proven:
+            // black notebook read ORANGE). Normalize by the scene
+            // illuminant with capped gains so strongly colored scenes
+            // (all-red room) only partially correct instead of graying.
+            val balanced = companionWhiteBalance(
+                medR, medG, medB,
+                (illumR / illumCount).toInt(),
+                (illumG / illumCount).toInt(),
+                (illumB / illumCount).toInt()
+            )
+            val balR = balanced.first
+            val balG = balanced.second
+            val balB = balanced.third
 
             // ── Step 3: Convert RGB → HSV ──────────────────────────────────
             val hsv = FloatArray(3)
-            Color.RGBToHSV(avgR, avgG, avgB, hsv)
+            Color.RGBToHSV(balR, balG, balB, hsv)
             val hue = hsv[0]        // 0–360
             val saturation = hsv[1] // 0–1
             val value = hsv[2]      // 0–1
 
             // ── Step 4: Classify ───────────────────────────────────────────
-            return classifyColor(context, hue, saturation, value)
+            val verdict = classifyColor(context, hue, saturation, value)
+            // Calibration trace (2026-11-14): PERSISTED (CrashLogFile —
+            // logcat rotates in ~2 min on Transsion devices) so black/
+            // white threshold tuning reads device numbers, not guesses.
+            // One line per analysis; negligible volume.
+            com.vyze.app.util.CrashLogFile.log(
+                TAG,
+                "color verdict=$verdict rgb=($balR,$balG,$balB) " +
+                    "raw=($medR,$medG,$medB) " +
+                    "hsv=(${hsv[0].toInt()}," +
+                    "${"%.2f".format(java.util.Locale.US, hsv[1])}," +
+                    "${"%.2f".format(java.util.Locale.US, hsv[2])}) " +
+                    "roi=${roiWidth}x${roiHeight}@($startX,$startY)"
+            )
+            return verdict
         } finally {
             // Security: recycle temporary bitmap to prevent memory leaks
             if (!roiBitmap.isRecycled) roiBitmap.recycle()
@@ -126,8 +189,15 @@ class ColorAnalyzer {
         const val ROI_FRACTION = 0.20f
         const val SAMPLE_GRID = 20
         const val SATURATION_THRESHOLD = 0.12f
-        const val BLACK_MAX_VALUE = 0.15f
-        const val WHITE_MIN_VALUE = 0.85f
+        // Indoor calibration (2026-11-14, GT50, well-lit living room):
+        // a black notebook reads value≈0.29 (auto-exposure lifts blacks)
+        // and a white mouse reads value≈0.70 (indoor whites never reach
+        // lab 0.85). Old bounds (0.15/0.85) classified both as grey —
+        // and warm tint pushed the notebook to orange. Bounds now hug
+        // measured indoor values; dark-gray/light-gray confusions at the
+        // seams are acceptable approximations for spoken use.
+        const val BLACK_MAX_VALUE = 0.32f
+        const val WHITE_MIN_VALUE = 0.65f
         const val DARK_MAX_VALUE = 0.35f
         const val BRIGHT_MIN_VALUE = 0.75f
 
@@ -185,6 +255,49 @@ class ColorAnalyzer {
                 else -> ColorShade.NORMAL
             }
             return ColorVerdict(name, shade)
+        }
+
+        /** Gain clamp for gray-world correction (see [companionWhiteBalance]). */
+        const val WHITE_BALANCE_MAX_GAIN = 2.0f
+        const val WHITE_BALANCE_MIN_GAIN = 0.5f
+
+        /** Ring index for debug evidence captures (shared: instances are per-call). */
+        @Volatile
+        private var debugSaveIndex = 0
+
+        /**
+         * Median of sampled channel values. Pure — JVM-tested.
+         * Median beats mean for ROI color: a black notebook beside a
+         * light table averages to grey, while the median reports the
+         * dominant region. Empty input yields 0 (caller guards first).
+         */
+        internal fun companionMedian(values: List<Int>): Int {
+            if (values.isEmpty()) return 0
+            val sorted = values.sorted()
+            val mid = sorted.size / 2
+            return if (sorted.size % 2 == 1) sorted[mid]
+            else (sorted[mid - 1] + sorted[mid]) / 2
+        }
+
+        /**
+         * Capped gray-world white balance (von Kries). Pure — JVM-tested.
+         * Corrects each ROI channel by the scene illuminant estimate
+         * (full-frame mean): `out = median * mean(illum) / illum_c`, gains
+         * clamped to [0.5, 2.0] so strongly colored scenes only partially
+         * correct instead of graying out. Zero illuminant channels pass
+         * through unscaled (no divide-by-zero). Returns (R, G, B).
+         */
+        internal fun companionWhiteBalance(
+            r: Int, g: Int, b: Int,
+            illumR: Int, illumG: Int, illumB: Int
+        ): Triple<Int, Int, Int> {
+            val avg = (illumR + illumG + illumB) / 3.0f
+            fun correct(v: Int, illum: Int): Int {
+                if (illum <= 0) return v.coerceIn(0, 255)
+                val gain = (avg / illum).coerceIn(WHITE_BALANCE_MIN_GAIN, WHITE_BALANCE_MAX_GAIN)
+                return (v * gain).toInt().coerceIn(0, 255)
+            }
+            return Triple(correct(r, illumR), correct(g, illumG), correct(b, illumB))
         }
 
         /** Render a verdict in English (the legacy overload's output). */

@@ -88,4 +88,25 @@ class SingleFlightTest {
             scope.cancel()
         }
     }
+
+    @Test
+    fun `hasActiveFlight tracks the flight window`() = runBlocking {
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val gate = SingleFlight<Boolean>(scope)
+            assertEquals(false, gate.hasActiveFlight())
+            val flight = async {
+                gate.run {
+                    delay(150)
+                    true
+                }
+            }
+            delay(50)
+            assertEquals(true, gate.hasActiveFlight())
+            assertEquals(true, flight.await())
+            assertEquals(false, gate.hasActiveFlight())
+        } finally {
+            scope.cancel()
+        }
+    }
 }

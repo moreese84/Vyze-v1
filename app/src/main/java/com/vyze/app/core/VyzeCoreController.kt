@@ -262,17 +262,33 @@ class VyzeCoreController(
     @Volatile
     private var firstChunkSent = false
 
+    /** Last user-demand init retry (ms) — backs off tap-spam after a failure. */
+    private var lastInitRetryMs = 0L
+
     /**
-     * Set on the first streamed token of the live turn — disarms the
-     * interim-progress speech (which only fires when prefill runs past
-     * the first-token grace with nothing to show yet). Reset by
-     * [armInterimProgress], so every VLM call site is covered uniformly.
+     * Last delivered answer text + timestamp (repeat memory). Recorded at
+     * every answer-delivery site (VLM lanes via shared onComplete, fast
+     * path, barcode, OCR fallback, thermal, refusals, direct reads) so
+     * "say again" replays exactly what was heard — taps included
+     * (dialogue history never records taps) and engine-independent
+     * (replay is pure TTS). Deliberately excluded: instant answers
+     * (replaying a stale clock/battery reading would speak wrong facts)
+     * and mid-stream abort fallbacks (rare; a re-ask there honestly
+     * reports nothing to repeat).
      */
     @Volatile
-    private var firstTokenArrived = false
+    private var lastReplayableAnswer = ""
+    @Volatile
+    private var lastReplayableAt = 0L
 
-    /** Pending interim-progress callback, so destroy() drops it with the controller. */
-    private var interimRunnable: Runnable? = null
+    private fun recordReplayableAnswer(text: String) {
+        if (text.isBlank()) return
+        lastReplayableAnswer = text
+        lastReplayableAt = System.currentTimeMillis()
+    }
+
+    /** In-flight demand retry, if any (single retry at a time). */
+    private var initRetryJob: kotlinx.coroutines.Job? = null
 
     // ── Local performance telemetry (privacy-safe; V1) ────────────
     // One row per completed/failed VLM inference: task-type bucket,
@@ -526,9 +542,6 @@ class VyzeCoreController(
                     // ── WATCHDOG PROGRESS: tokens are flowing — reset the
                     //    stall clock so long generations are never killed.
                     lastInferenceActivityMs = System.currentTimeMillis()
-                    // First live token — the answer exists; interim progress
-                    // speech stands down.
-                    firstTokenArrived = true
 
                     // ── CONFIDENCE CHECK: abort if model is hedging ──────
                     // Track the first few tokens. If the model starts with
@@ -800,6 +813,7 @@ class VyzeCoreController(
                     }
                     isInferring.set(false)
                     CrashLogFile.log(TAG, "isInferring set to false")
+                    recordReplayableAnswer(spokenResponse)
                     mainHandler.post {
                         try {
                             onInferenceComplete?.invoke(spokenResponse)
@@ -889,9 +903,8 @@ class VyzeCoreController(
                             val (en, ms, zh) = companionMissingModelSpeech()
                             ttsManager.speakImmediate(ttsManager.localized(en, ms, zh))
                         } else {
-                            ttsManager.speakImmediate(
-                                "AI engine setup failed. Please check your connection and try again."
-                            )
+                            val (en, ms, zh) = companionEngineFailedSpeech()
+                            ttsManager.speakImmediate(ttsManager.localized(en, ms, zh))
                         }
                         } catch (_: Throwable) {}
                         onStatusUpdate?.invoke(
@@ -1634,40 +1647,64 @@ class VyzeCoreController(
     // ── Snapshot Trigger ───────────────────────────────────────────
 
     /**
-     * Arms the interim-progress speech for one VLM call: if prefill runs
-     * past the first-token grace with no token yet, a short localized
-     * "still working" cue speaks (QUEUE_ADD — never clips the dead-air
-     * filler or the answer) so a 40 s CPU prefill is not silence. The
-     * guard ([companionShouldSpeakInterim]) self-skips stale timers, and
-     * the cue rides the dead-air exclusion so first-audio measurement
-     * still spans frame → ANSWER audio. One-shot per arm; re-arming
-     * replaces the pending timer.
+     * Retries engine init on user demand when the engine is down (a tap,
+     * voice query, or expansion arrived while not ready). Without this, a
+     * failed cold init leaves taps dead forever — the LoadingFragment
+     * retry is unreachable once the safety timeout navigates to camera
+     * (mt6768, 2026-11-14). Called from the controller's own not-ready
+     * exits AND from CameraFragment's not-ready gate (which returns
+     * before reaching the controller lanes). Guarded by
+     * [companionShouldRetryInit]: single-flighted (joins a running init,
+     * never duplicates), backed off, breaker-aware, and skipped for
+     * missing-model / Tier-0 states a retry cannot fix. The retry drains
+     * first, so a late build from the failed attempt is adopted instead
+     * of rebuilt. On success the controller binds exactly like
+     * cold-start readiness, plus one short spoken "Ready" (mid-session
+     * joins get no onboarding chime).
      */
-    private fun armInterimProgress(sessionId: String) {
-        firstTokenArrived = false
-        interimRunnable?.let { mainHandler.removeCallbacks(it) }
-        val locale = activeUserLocale.language
-        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
-        val runnable = Runnable {
-            if (!fired.compareAndSet(false, true)) return@Runnable
-            if (companionShouldSpeakInterim(activeSessionId, sessionId, firstTokenArrived, isInferring.get())) {
-                CrashLogFile.log(TAG, "Interim progress spoken (no token in grace window)")
-                ttsManager.speakQueued(
-                    com.vyze.app.performance.VyzePerformanceConfig.interimPhrase(locale),
-                    deadAirFiller = true
-                )
+    fun requestInitRetry() {
+        if (!companionShouldRetryInit(
+                engineReady = engineReady,
+                bypassed = vlmEngine.isVlmBypassed(),
+                initializing = vlmEngine.isInitializing(),
+                canRetry = vlmEngine.canRetryInit(),
+                modelMissing = vlmEngine.didLastInitMissModelFile(),
+                nowMs = System.currentTimeMillis(),
+                lastRetryMs = lastInitRetryMs,
+                backoffMs = INIT_RETRY_BACKOFF_MS
+            )
+        ) return
+        if (initRetryJob?.isActive == true) return
+        lastInitRetryMs = System.currentTimeMillis()
+        CrashLogFile.log(TAG, "Init retry triggered by user demand (engine not ready)")
+        initRetryJob = scope.launch {
+            try {
+                val ok = vlmEngine.initialize()
+                if (ok && !engineReady) {
+                    engineReady = true
+                    Log.i(TAG, "VLM ready after retry [${vlmEngine.getActiveBackend()}]")
+                    onStatusUpdate("VLM ready [${vlmEngine.getActiveBackend()}]")
+                    bindMasterAgentLane()
+                    mainHandler.post {
+                        try {
+                            ttsManager.speakQueued(
+                                ttsManager.localized("Ready.", "Sedia.", "准备好了。")
+                            )
+                        } catch (_: Throwable) {}
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                Log.w(TAG, "Init retry failed: ${e.message}")
             }
         }
-        interimRunnable = runnable
-        mainHandler.postDelayed(
-            runnable,
-            com.vyze.app.performance.VyzePerformanceConfig.VLM_FIRST_TOKEN_GRACE_MS
-        )
     }
 
     fun triggerSnapshot(bitmap: Bitmap, query: String? = null, continuousMode: Boolean = false) {
         if (!engineReady) {
             Log.w(TAG, "triggerSnapshot called but engine not ready")
+            requestInitRetry()
             return
         }
 
@@ -1722,6 +1759,7 @@ class VyzeCoreController(
         val isVoiceFollowUpCandidate = !isTapQuery && !query.isNullOrBlank()
         val currencyQuery = isCurrencyQuery(query)
         val bankCardQuery = isBankCardQuery(query)
+        val barcodeQuery = isBarcodeQuery(query)
         // PRIVACY BRANCH (deterministic, owner: the router — the model never
         // self-decides): identity-card / account-number asks get the pinned
         // refusal contract regardless of which lane dispatches.
@@ -1773,6 +1811,7 @@ class VyzeCoreController(
             // completed as specified, so success (#64).
             recordTelemetry(success = true)
             val refusal = SensitiveIdPolicy.refusalPhrase(activeUserLocale.language)
+            recordReplayableAnswer(refusal)
             mainHandler.post {
                 onInferenceComplete?.invoke(refusal)
                 onStatusUpdate?.invoke("Ready [sensitive-id refusal]")
@@ -1813,7 +1852,7 @@ class VyzeCoreController(
         // high-resolution + OCR pre-pass so the brand and text are read from
         // ground truth instead of a 256px guess.
         val isTextQuery = isTextExtractionQuery(query) || isTapQuery || currencyQuery ||
-            bankCardQuery || isPointingQuery(query)
+            bankCardQuery || barcodeQuery || isPointingQuery(query)
 
         // ── CONTINUOUS-MODE SCENE GATING (battery) ────────────────
         // A tap/voice query must ALWAYS run. Continuous auto-captures run
@@ -2150,6 +2189,47 @@ class VyzeCoreController(
                     }
                 }
 
+                // ── BARCODE SPOKEN VALUE (voice bypass, 2026-11-14) ──
+                // An explicit barcode ask ("scan the barcode" / "imbas kod
+                // bar" / "扫码") whose pre-pass found a 1D retail code speaks
+                // the decoded digits directly (~1 s) instead of routing a
+                // 45 s VLM call the model cannot answer reliably (vision
+                // models paraphrase around digits they half-read). Disclosure
+                // class == OCR fast-path reads (user-pointed content spoken
+                // back), NOT the sensitive-ID branch: 2D codes (QR/Data
+                // Matrix: URLs, WiFi credentials) stay excluded and fall
+                // through to the VLM, which summarizes instead of reciting.
+                val scanned = barcodeResult
+                if (barcodeQuery && scanned != null &&
+                    companionIsSpokenBarcodeFormat(scanned.second)
+                ) {
+                    val (rawValue, format) = scanned
+                    val spaced = companionSpacedBarcodeValue(rawValue)
+                    if (spaced.isNotBlank()) {
+                        CrashLogFile.log(TAG, "BARCODE SPOKEN VALUE: $format — skipping Gemma")
+                        mainHandler.removeCallbacks(watchdogRunnable)
+                        // Language-NEUTRAL by design (2026-11-14): a
+                        // localized wrapper follows the TTS voice locale,
+                        // but ASR mistags English-as-Malay often enough
+                        // ("say it again" tagged ms_MY) that the wrapper
+                        // lands in the wrong language. Format code + digits
+                        // need no words — digits pronounce in any voice.
+                        val barcodeSpeech = "$format: $spaced."
+                        if (currentSessionId == activeSessionId) {
+                            if (isVoiceFollowUpCandidate && !isPreciseRead) {
+                                recordDialogueTurn(query ?: "", barcodeSpeech)
+                            }
+                            recordReplayableAnswer(barcodeSpeech)
+                            mainHandler.post {
+                                onInferenceComplete?.invoke(barcodeSpeech)
+                                onStatusUpdate?.invoke("Ready [barcode]")
+                            }
+                        }
+                        recordTelemetry(success = true)
+                        return@launch
+                    }
+                }
+
                 // ── VLM DIMENSION — decided AFTER OCR ────────────
                 // Pay the full 512px prefill only when OCR actually found text
                 // for the model to echo; a tap/pointing query with no readable
@@ -2215,6 +2295,7 @@ class VyzeCoreController(
                         if (isVoiceFollowUpCandidate && !isPreciseRead) {
                             recordDialogueTurn(query ?: "", ocrResponse)
                         }
+                        recordReplayableAnswer(ocrResponse)
                         mainHandler.post {
                             onInferenceComplete?.invoke(ocrResponse)
                             onStatusUpdate?.invoke("Ready [OCR fast-path]")
@@ -2265,6 +2346,7 @@ class VyzeCoreController(
                                     "长文档。正在朗读。"
                                 )
                             )
+                            recordReplayableAnswer(fullText)
                             ttsManager.speakQueued(fullText)
                         } catch (t: Throwable) {
                             CrashLogFile.logError(TAG, "Direct-read TTS failed: ${t.message}", t)
@@ -2395,6 +2477,9 @@ class VyzeCoreController(
                     continuousMode = continuousMode,
                     userLocale = activeUserLocale,
                     ocrText = ocrText,
+                    barcodeContext = barcodeResult?.let { (rawValue, format) ->
+                        "$format: ${rawValue.take(200)}"
+                    },
                     currencyMode = currencyModeActive,
                     bankCardMode = bankCardModeActive,
                     sensitiveIdMode = sensitiveIdModeActive,
@@ -2436,6 +2521,10 @@ class VyzeCoreController(
                     val usableFallback =
                         if (ocrConfidence >= OCR_FAST_PATH_CONFIDENCE) ocrText else null
                     if (currentSessionId == activeSessionId) {
+                        recordReplayableAnswer(
+                            if (!usableFallback.isNullOrBlank()) usableFallback
+                            else "Device is too hot. Try again after it cools."
+                        )
                         mainHandler.post {
                             if (!usableFallback.isNullOrBlank()) {
                                 onInferenceComplete?.invoke(usableFallback)
@@ -2451,7 +2540,6 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeImage()...")
-                armInterimProgress(currentSessionId)
                 // Scene queries are concise (25 words max). Text queries get an
                 // ADAPTIVE budget sized to the OCR text actually found — the
                 // model mostly echoes it back, so a dense back-panel gets a
@@ -2508,6 +2596,7 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "VLM response blank but OCR text exists — using OCR fallback")
                     if (currentSessionId == activeSessionId) {
                         mainHandler.post {
+                            recordReplayableAnswer(ocrText)
                             onInferenceComplete?.invoke(ocrText)
                             onStatusUpdate?.invoke("Ready [OCR fallback]")
                         }
@@ -2845,15 +2934,15 @@ class VyzeCoreController(
     private val EXPANSION_VERBS = listOf(
         // English
         "more detail", "more details", "tell me more", "expand", "elaborate",
-        "go on", "say again", "repeat that", "repeat it", "what did you say",
+        "go on",
         "in detail", "more about", "describe more", "what else",
         // Malay
         "lebih detail", "lebih terperinci", "terangkan lagi", "cerita lagi",
-        "lagi detail", "bagitahu lagi", "cakap lagi", "ulang", "sebut lagi",
+        "lagi detail", "bagitahu lagi", "cakap lagi",
         "lebih banyak", "lagi banyak", "apa lagi",
         // Chinese
-        "详细一点", "再详细", "详细说明", "多说一点", "再说一遍", "再说一次",
-        "再讲一遍", "重复", "多一点", "还有什么"
+        "详细一点", "再详细", "详细说明", "多说一点",
+        "多一点", "还有什么"
     )
 
     /**
@@ -2874,6 +2963,44 @@ class VyzeCoreController(
     }
 
     /**
+     * True for an unambiguous replay ask ("say again" / "ulang" /
+     * "再说一遍"). Phrases only — NO anchor, frame, or engine requirement:
+     * replay speaks from delivery memory, so it works after taps (which
+     * record no dialogue), with the engine down, or the frame gone. (The
+     * first cut gated on the expansion anchor — but double-tap wipes it
+     * at session start, so gated repeats could never fire. Device-proven
+     * 2026-11-14: "say it again" fell through to full VLM re-inference.)
+     */
+    fun detectRepeatRequest(query: String?): Boolean = companionIsRepeatRequest(query)
+
+    /**
+     * Replays the last delivered answer for an unambiguous repeat ask —
+     * zero inference, instant TTS. Always speaks: the fresh answer when
+     * one exists, otherwise an honest nothing-to-repeat (re-running
+     * inference for "say again" answers a question nobody asked).
+     */
+    fun triggerRepeatAnswer() {
+        val answer = lastReplayableAnswer
+        if (companionIsReplayFresh(System.currentTimeMillis(), lastReplayableAt) &&
+            answer.isNotBlank()
+        ) {
+            CrashLogFile.logContent(TAG, "Repeat request — replaying last answer, inference skipped: \"${answer.take(60)}\"")
+            ttsManager.speakImmediate(answer)
+            onStatusUpdate?.invoke("Ready [repeat]")
+        } else {
+            CrashLogFile.log(TAG, "Repeat request — nothing fresh to replay")
+            ttsManager.speakImmediate(
+                ttsManager.localized(
+                    "Nothing to repeat yet.",
+                    "Tiada apa untuk diulang.",
+                    "没有什么可重复。"
+                )
+            )
+            onStatusUpdate?.invoke("Ready [repeat-empty]")
+        }
+    }
+
+    /**
      * Expand the PREVIOUS answer on the RETAINED frame — no re-capture, so
      * zero camera latency and the detail describes exactly what the user just
      * heard about. Learned brevity is overridden on purpose: the user asked
@@ -2885,6 +3012,7 @@ class VyzeCoreController(
         if (frame == null || frame.isRecycled) return
         if (!engineReady) {
             Log.w(TAG, "triggerExpandedAnswer called but engine not ready")
+            requestInitRetry()
             return
         }
         if (!isInferring.compareAndSet(false, true)) {
@@ -2980,7 +3108,6 @@ class VyzeCoreController(
                 // cap (same per-trigger read the snapshot lane does).
                 val expansionPolicy = (context.applicationContext as? VyzeApplication)
                     ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
-                armInterimProgress(currentSessionId)
                 val response = vlmEngine.analyzeImage(
                     bitmap = frame,
                     prompt = basePrompt,
@@ -3111,6 +3238,7 @@ class VyzeCoreController(
     fun triggerTextQuery(query: String) {
         if (!engineReady) {
             Log.w(TAG, "triggerTextQuery called but engine not ready")
+            requestInitRetry()
             return
         }
         if (!isInferring.compareAndSet(false, true)) {
@@ -3176,6 +3304,7 @@ class VyzeCoreController(
                     CrashLogFile.log(TAG, "SENSITIVE-ID: pinned refusal delivered (text lane) — inference skipped")
                     if (currentSessionId == activeSessionId) {
                         val refusal = SensitiveIdPolicy.refusalPhrase(activeUserLocale.language)
+                        recordReplayableAnswer(refusal)
                         mainHandler.post {
                             onInferenceComplete?.invoke(refusal)
                             onStatusUpdate?.invoke("Ready [sensitive-id refusal]")
@@ -3269,7 +3398,6 @@ class VyzeCoreController(
                 }
 
                 CrashLogFile.log(TAG, "Calling vlmEngine.analyzeText()...")
-                armInterimProgress(currentSessionId)
                 val textPolicy = (context.applicationContext as? VyzeApplication)
                     ?.thermalPowerController?.policy ?: ThermalPolicy.NORMAL
                 val response = vlmEngine.analyzeText(
@@ -3695,8 +3823,6 @@ class VyzeCoreController(
     }
 
     fun destroy() {
-        interimRunnable?.let { mainHandler.removeCallbacks(it) }
-        interimRunnable = null
         vlmEngine.close()
         ocrHelper.close()
         barcodeHelper.close()
@@ -3733,6 +3859,10 @@ class VyzeCoreController(
      */
     fun isTextReadQuery(query: String?): Boolean = isOcrFastPathQuery(query)
 
+    /** Voice color/light asks (instant detector lanes, no VLM). */
+    fun detectColorQuery(query: String?): Boolean = companionIsColorQuery(query)
+    fun detectLightQuery(query: String?): Boolean = companionIsLightQuery(query)
+
     /**
      * Returns true if the query contains keywords indicating the user wants
      * to read text, labels, signs, or documents.
@@ -3766,6 +3896,7 @@ class VyzeCoreController(
      * text path and add no-guessing money rules to the prompt.
      */
     private fun isCurrencyQuery(query: String?): Boolean = companionIsCurrencyQuery(query)
+    private fun isBarcodeQuery(query: String?): Boolean = companionIsBarcodeQuery(query)
 
     /**
      * Detect if the query is asking to identify a bank card.
@@ -4248,6 +4379,9 @@ class VyzeCoreController(
         )
 
         /** Marker in tap queries — "User tapped at position (x, y)". */
+        /** Minimum gap between user-demand init retries (tap-spam guard). */
+        private const val INIT_RETRY_BACKOFF_MS = 30_000L
+
         private const val TAP_POSITION_MARKER = "tapped at position"
 
         /** Age limit (ms) for "tell me more" on the retained frame. */
@@ -4257,6 +4391,84 @@ class VyzeCoreController(
         private const val RETAINED_FRAME_DIM = 512
 
         /** Keywords that trigger currency reading (banknotes + coins). */
+        /**
+         * Detector-lane keywords (voice bypasses, 2026-11-14): color/light
+         * asks answered by the instant detectors instead of the VLM (~1 s
+         * vs ~45 s on weak CPUs). Latin entries ride [companionBankHit]
+         * word boundaries — bare "dark"/"bright"/"light" are deliberately
+         * ABSENT ("dark chocolate" and "light blue" are object questions,
+         * not ambient asks); context phrases only. "turn on the light" is
+         * deliberately INCLUDED (closest available action: the check
+         * switches the torch on when dark). Bare "color"/"colour"/
+         * "warna" are boundary-safe ("pewarna" blocked) and kept.
+         */
+        private val COLOR_KEYWORDS = listOf(
+            // English
+            "color", "colour", "what color", "which color",
+            "what colour", "which colour",
+            // Malay / Bahasa Melayu
+            "warna", "apa warna", "warna apa", "warna ini",
+            // Chinese
+            "颜色", "什么颜色",
+            // Traditional (ASR parity)
+            "顏色", "什麼顏色"
+        )
+        private val LIGHT_KEYWORDS = listOf(
+            // English (phrases only — see bank KDoc)
+            "is it dark", "is it bright", "is it too dark", "is it too bright",
+            "too dark here", "too bright here", "how dark is", "how bright is",
+            "very dark here", "is there light", "enough light", "light level",
+            "too much light", "no light", "need light",
+            "turn on the light", "switch on the light", "dark in here",
+            // Malay / Bahasa Melayu
+            "gelap ke", "gelap tak", "gelapkah", "terlalu gelap",
+            "sangat gelap", "bilik gelap", "keadaan gelap",
+            "terang ke", "terang tak", "cukup terang", "kurang terang",
+            "terlalu terang", "cerah ke", "cerah tak", "terlalu cerah",
+            "hari cerah", "cahaya",
+            // Chinese
+            "黑吗", "暗吗", "亮吗", "太暗", "太亮", "很暗", "很亮",
+            "光线", "够亮",
+            // Traditional (ASR parity)
+            "黑嗎", "暗嗎", "亮嗎", "光線", "夠亮"
+        )
+        /**
+         * Barcode-intent keywords (2026-11-14). Joining the OCR-stage gate:
+         * a barcode ask needs the scan the stage runs; over-matching is
+         * harmless (no barcode found → normal flow continues). "scan" is
+         * deliberately broad ("scan this document" already routes text).
+         * NOTE: no "kad"/"card" — those belong to bank-card precise mode.
+         */
+        private val BARCODE_KEYWORDS = listOf(
+            // English
+            "barcode", "bar code", "qr", "qr code", "scan", "scanning",
+            // Malay / Bahasa Melayu
+            "imbas", "imbasan", "kod bar", "kod qr",
+            // Chinese
+            "条码", "二维码", "扫码", "扫描",
+            // Traditional (ASR parity)
+            "條碼", "二維碼", "掃碼", "掃描"
+        )
+        /**
+         * Verbs that ask Vyze to REPLAY the previous answer (2026-11-14):
+         * unambiguous repeat asks re-speak the last delivered answer via
+         * TTS with zero inference (~instant vs ~45 s re-analysis). Split
+         * out of [EXPANSION_VERBS], which keeps everything ambiguous
+         * ("cakap lagi", "more about") on the re-inference side — when in
+         * doubt, re-analyze. Matched with word boundaries.
+         */
+        private val REPEAT_VERBS = listOf(
+            // English ("say it again" added 2026-11-14: the system
+            // recognizer emits it for "say again" — the variant gap
+            // sent a repeat ask to full VLM re-inference on device)
+            "say again", "say that again", "say it again", "repeat that",
+            "repeat it", "repeat please", "please repeat",
+            "what did you say",
+            // Malay / Bahasa Melayu
+            "ulang", "sebut lagi", "ulangi", "sebutkan",
+            // Chinese
+            "再说一遍", "再说一次", "再讲一遍", "重复"
+        )
         private val CURRENCY_KEYWORDS = listOf(
             // English
             "money", "banknote", "bank note", "banknotes", "cash",
@@ -4483,12 +4695,75 @@ class VyzeCoreController(
         fun companionIsMedicineQuery(query: String?): Boolean =
             companionBankHit(query, MEDICINE_KEYWORDS)
 
+        /**
+         * Detector-lane + barcode-intent classifiers (pure — JVM-tested in
+         * VyzeCoreControllerRouteTest). Voice asks matching these skip the
+         * VLM: color/light answered by the instant detectors, barcode
+         * values spoken from the pre-pass scan.
+         */
+        fun companionIsColorQuery(query: String?): Boolean =
+            companionBankHit(query, COLOR_KEYWORDS)
+
+        fun companionIsLightQuery(query: String?): Boolean =
+            companionBankHit(query, LIGHT_KEYWORDS)
+
+        fun companionIsBarcodeQuery(query: String?): Boolean =
+            companionBankHit(query, BARCODE_KEYWORDS)
+
+        /**
+         * Repeat-request classifier (pure — JVM-tested): unambiguous
+         * replay asks ("say again" / "ulang" / "再说一遍") replay the last
+         * delivered answer via TTS with zero inference. Word boundaries
+         * (not the expansion list's bare contains): "ulang" must not fire
+         * on "berulang" (recurring). Ambiguous "more"-family asks stay on
+         * the expansion (re-inference) side — when in doubt, re-analyze.
+         */
+        fun companionIsRepeatRequest(query: String?): Boolean =
+            companionBankHit(query, REPEAT_VERBS)
+
+        /**
+         * Replay freshness (pure — JVM-tested): a delivered answer stays
+         * replayable for [EXPANSION_MAX_AGE_MS], the same "recent answer"
+         * horizon expansions use. Zero stamp (nothing ever delivered)
+         * never counts as fresh.
+         */
+        fun companionIsReplayFresh(nowMs: Long, deliveredAtMs: Long): Boolean =
+            deliveredAtMs > 0L && (nowMs - deliveredAtMs) <= EXPANSION_MAX_AGE_MS
+
+        /**
+         * 1D retail barcodes speak their value aloud; 2D codes (QR/Data
+         * Matrix/PDF417/Aztec) carry arbitrary payloads (URLs, WiFi
+         * credentials) and fall through to the VLM lane, which summarizes
+         * instead of reciting. Pure — JVM-tested.
+         */
+        fun companionIsSpokenBarcodeFormat(formatName: String): Boolean = formatName in setOf(
+            "EAN_13", "EAN_8", "UPC_A", "UPC_E", "CODE_39", "CODE_93",
+            "CODE_128", "ITF", "CODABAR"
+        )
+
+        /**
+         * Shapes a barcode value for speech: every letter/digit isolated
+         * ("9556" → "9 5 5 6") so TTS spells instead of numbering —
+         * the plate doctrine, applied to retail codes. Non-alphanumerics
+         * dropped (separators add nothing spoken). Pure — JVM-tested.
+         */
+        fun companionSpacedBarcodeValue(rawValue: String): String =
+            rawValue.filter { it.isLetterOrDigit() }.toCharArray().joinToString(" ")
+
         private fun companionBankHit(query: String?, keywords: List<String>): Boolean {
             if (query.isNullOrBlank()) return false
             val lower = query.lowercase()
             return keywords.any { keyword ->
                 if (keyword.all { it == ' ' || it in 'a'..'z' }) {
-                    Regex("(?<!\\p{L})${Regex.escape(keyword)}(?:s|nya|ku|mu)?(?!\\p{L})")
+                    // Malay particle suffixes (2026-11-14): ASR glues
+                    // particles onto the stem ("warna apa ini" →
+                    // "warna apaini", "imbas kan" → "imbaskan") — without
+                    // these the boundary lookahead rejects real queries.
+                    // Device-proven: a glued color ask fell through to a
+                    // mixed-language VLM answer. Deliberately NOT "i"
+                    // alone: "wang"+"i" would fire currency on "wangi"
+                    // (perfume) — "-i" imperatives join as full keywords.
+                    Regex("(?<!\\p{L})${Regex.escape(keyword)}(?:s|nya|ku|mu|lah|kah|ini|itu|kan)?(?!\\p{L})")
                         .containsMatchIn(lower)
                 } else {
                     lower.contains(keyword)
@@ -4509,20 +4784,25 @@ class VyzeCoreController(
             if (language == "ms") (baseTokens * 4) / 3 else baseTokens
 
         /**
-         * Interim-progress guard (pure — JVM-tested in
-         * VyzeCoreControllerRouteTest): speak only while the armed turn is
-         * still the live inferring turn with no token yet. Stale timers
-         * (session moved on, inference ended, first token already flowed)
-         * self-skip, so no explicit disarm is needed on the completion,
-         * cancel, or error paths.
+         * Init-retry guard (pure — JVM-tested in
+         * VyzeCoreControllerRouteTest): retry only when the engine is down
+         * AND a retry could help — not while a flight runs, not past the
+         * breaker, not for a missing model file (retry can't sideload),
+         * not on Tier 0, and not more often than the backoff. Stops the
+         * mt6768 dead-end (2026-11-14): failed cold init + no retry path =
+         * dead taps forever.
          */
-        fun companionShouldSpeakInterim(
-            liveSessionId: String,
-            armedSessionId: String,
-            tokenArrived: Boolean,
-            inferring: Boolean
-        ): Boolean = liveSessionId.isNotEmpty() &&
-            liveSessionId == armedSessionId && !tokenArrived && inferring
+        fun companionShouldRetryInit(
+            engineReady: Boolean,
+            bypassed: Boolean,
+            initializing: Boolean,
+            canRetry: Boolean,
+            modelMissing: Boolean,
+            nowMs: Long,
+            lastRetryMs: Long,
+            backoffMs: Long
+        ): Boolean = !engineReady && !bypassed && !initializing && canRetry &&
+            !modelMissing && (nowMs - lastRetryMs) >= backoffMs
 
         /**
          * Thermal token cap (audit P3 #72, 2026-11-09): MODERATE+ heat
@@ -4988,6 +5268,21 @@ class VyzeCoreController(
             "AI model file not found. Please place the model file in Downloads and try again.",
             "Fail model AI tidak dijumpai. Sila letakkan fail model dalam folder Downloads dan cuba lagi.",
             "找不到AI模型文件。请把模型文件放入下载文件夹，然后重试。"
+        )
+
+        /**
+         * Spoken line for a generic engine-build failure (pure — pinned in
+         * InitFailureMessageTest). The old line blamed the connection
+         * ("check your connection") — wrong for an offline-first app whose
+         * failure is a timed-out native build, and the audit had already
+         * removed that sentence from the model-missing branch for the same
+         * reason. This names the real fix: tap to retry (LoadingFragment
+         * retries on any tap; camera taps auto-retry via maybeRetryInit).
+         */
+        fun companionEngineFailedSpeech(): Triple<String, String, String> = Triple(
+            "AI engine setup failed. Tap anywhere to try again.",
+            "Persediaan enjin AI gagal. Sila ketuk di mana-mana dan cuba lagi.",
+            "AI引擎设置失败。请点击任意位置重试。"
         )
 
         fun companionIsTextOnlyQuery(query: String?): Boolean {

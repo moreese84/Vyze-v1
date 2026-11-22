@@ -287,4 +287,38 @@ class ColorAnalyzerTest {
         assertTrue(ColorAnalyzer.BLACK_MAX_VALUE < ColorAnalyzer.WHITE_MIN_VALUE)
         assertTrue(ColorAnalyzer.DARK_MAX_VALUE < ColorAnalyzer.BRIGHT_MIN_VALUE)
     }
+
+    @Test
+    fun `median reports the dominant region not the average`() {
+        // Black notebook beside a light table: mean drifts grey, median
+        // holds the notebook.
+        assertEquals(20, ColorAnalyzer.companionMedian(listOf(10, 15, 20, 25, 200)))
+        assertEquals(17, ColorAnalyzer.companionMedian(listOf(10, 20, 15, 200)))
+        assertEquals(0, ColorAnalyzer.companionMedian(emptyList()))
+    }
+
+    @Test
+    fun `white balance neutralizes a warm illuminant`() {
+        // Warm indoor light (frame averaging warm): red gain < 1 cools
+        // the cast while green/blue lift toward neutral.
+        val (r, g, b) = ColorAnalyzer.companionWhiteBalance(60, 45, 30, 200, 170, 140)
+        assertTrue("red should cool: $r", r < 60)
+        assertTrue("blue should lift: $b", b > 30)
+        assertEquals(Triple(51, 45, 36), Triple(r, g, b))
+    }
+
+    @Test
+    fun `white balance gains clamp on strongly colored scenes`() {
+        // All-red room must not gray out: gains clamp to [0.5, 2.0], so
+        // red drops only to 100 while green/blue lift only to 60.
+        assertEquals(
+            Triple(100, 60, 60),
+            ColorAnalyzer.companionWhiteBalance(200, 30, 30, 220, 20, 20)
+        )
+    }
+
+    @Test
+    fun `white balance passes through on zero illuminant`() {
+        assertEquals(Triple(10, 20, 30), ColorAnalyzer.companionWhiteBalance(10, 20, 30, 0, 0, 0))
+    }
 }

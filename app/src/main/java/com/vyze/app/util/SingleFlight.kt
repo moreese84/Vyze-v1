@@ -23,7 +23,11 @@ import kotlinx.coroutines.sync.withLock
 internal class SingleFlight<T>(private val scope: CoroutineScope) {
 
     private val mutex = Mutex()
+    @Volatile
     private var ongoing: Deferred<T>? = null
+
+    /** True while a flight is running (started, not yet settled). Volatile read — safe without the mutex. */
+    fun hasActiveFlight(): Boolean = ongoing?.isActive == true
 
     suspend fun run(block: suspend () -> T): T {
         val flight = mutex.withLock {

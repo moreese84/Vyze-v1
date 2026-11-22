@@ -44,6 +44,7 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
         continuousMode: Boolean = false,
         userLocale: Locale = Locale.US,
         ocrText: String? = null,
+        barcodeContext: String? = null,
         currencyMode: Boolean = false,
         bankCardMode: Boolean = false,
         sensitiveIdMode: Boolean = false,
@@ -142,12 +143,18 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             //     is ground-truth playback — the conversational sentence cap
             //     in the system directive must never truncate it, so reading
             //     tasks explicitly override the cap here.
-            sb.appendLine("The OCR text above is the ground truth. Read it as whole words and " +
-                "continuous sentences — never spell it letter by letter. When asked to read " +
-                "text, read ALL of it in reading order; do not summarize, skip, or stop early. " +
-                "When reading text aloud, the sentence limits above do NOT apply — read every " +
-                "word of the OCR text completely. Output plain spoken text only: never " +
-                "markdown symbols, bullets, dashes, asterisks, or emoji.")
+            // PREFILL DIET, ROUND 2 (2026-11-14): same five rules
+            // (ground truth, read-all, no-spell, cap override, plain
+            // text) in ~220 chars. The opening ("The OCR text above is
+            // the ground truth") and the override ("sentence limits
+            // above do NOT apply") stay VERBATIM: placement tests and
+            // the read-recital exemption pin those exact strings, and
+            // they encode a device-evidenced summarization fix. The
+            // grounding-license block below is untouched —
+            // confabulation guards are not diet material.
+            sb.appendLine("The OCR text above is the ground truth: read ALL of it in order as whole " +
+                "words — never spell, summarize, or stop early. The sentence limits above " +
+                "do NOT apply to reads. Plain spoken text only.")
             // 2c-text. GROUNDING LICENSE (fix #4, 2026-10-01): when OCR text
             //     exists but is sparse — tiny glyphs at 256-384px sit below ML
             //     Kit's floor even though the eye-level model can see shapes —
@@ -165,6 +172,17 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
                     "describe the object by its visible features instead — a wrong name is " +
                     "worse than an honest description.")
             }
+            }
+
+            // 2c-qr. BARCODE CONTEXT (2026-11-14): a detected barcode's
+            // value rides as citable ground truth (same disclosure class
+            // as OCR text: debug-gated content logs only). Without this
+            // the value was scanned, saved, and then invisible to both
+            // speech and the model — taps on barcoded products described
+            // around a value the app already knew. Renders outside the
+            // OCR block: barcodes scan without OCR text too.
+            if (!barcodeContext.isNullOrBlank()) {
+                sb.appendLine("Barcode detected ($barcodeContext). You may cite its value when relevant.")
             }
 
             // 2b-bis. LEARNED BREVITY — silently adapted answer length.
@@ -527,28 +545,31 @@ class DynamicPromptBuilder(private val memoryDao: MemoryDao) {
             "If unsure about an object, say 'not clearly visible'. Do NOT guess or hallucinate. " +
             "Mirrors/glass: describe the surface itself.\n"
 
+        // PREFILL DIET, ROUND 2 (2026-11-14, mt6768 at ~45 s/answer):
+        // every rule below keeps its meaning from the October prose in
+        // roughly half the bytes. Deliberately dropped (each survives
+        // elsewhere in the stack): the comma-list lecture (ResponseCleanup
+        // + "complete spoken sentences" carry it), the template-opener
+        // lecture (PERSPECTIVE_EN "vary sentence openings"), the full
+        // plain-text enumeration (SYSTEM_DIRECTIVE's compressed line +
+        // ResponseCleanup net), and "Only what you see" (folded into
+        // "only what you can ACTUALLY see" + NEVER guess). Device-gated:
+        // if reads/descriptions regress on real hardware, restore from
+        // git history — bytes are cheap, trust is not.
         private const val DIRECT_RULES_PROSE =
-            "Answer directly in the first sentence. " +
-            "Write in complete, natural spoken sentences with a subject and a verb — NEVER a " +
-            "list of attributes separated by commas. " +
-            "Name the object and give compact, useful details — size, color, material, " +
-            "state (open/closed, full/empty) — only what you can ACTUALLY see, never long prose. " +
-            "If it is a packaged product (packet, box, bottle, can), first say its BRAND name and product type " +
-            "exactly as printed on it, then its details. " +
-            "Read text verbatim in ORIGINAL language as whole words and sentences — never spell letter by letter. " +
-            "Vehicle plates, codes, serial and phone numbers are read CHARACTER BY CHARACTER — letters one by one, digits one by one ('QLB 3469' is spoken 'Q L B, three four six nine'), never as a quantity. " +
-            "When asked to read text, read the ENTIRE text in reading order; never stop halfway or summarize. " +
-            "Unless reading text aloud, keep the whole answer to 1-3 short spoken sentences. " +
-            "If text is blurry or unreadable, say 'Text is unclear' — NEVER guess. " +
-            "If no text visible, say 'No text visible'. " +
-            "LEAD WITH THE ANSWER: reply with what was asked, with no location preamble — the " +
-            "object itself (its color and name) or the printed text itself — and only give spatial " +
-            "position when the question asks WHERE. NEVER begin every sentence with the same " +
-            "template phrase such as 'In front of you is'. " +
-            "Your reply is read aloud by text to speech, so it must be pure plain text: " +
-            "NEVER output markdown symbols, never output bullets, dashes, asterisks, " +
-            "number signs, underscores, or emoji, and never use lists or headings. " +
-            "Only what you see in THIS image.\n"
+            "Lead with the answer in the first sentence. " +
+            "No location preamble — spatial position only for WHERE questions. " +
+            "Complete spoken sentences with subject and verb. " +
+            "Name the object with compact visible details (size, color, material, state). " +
+            "Only what you can ACTUALLY see. " +
+            "Packaged products: BRAND name and type exactly as printed first, then details. " +
+            "Read text verbatim in ORIGINAL language as whole words — never spell letter by letter. " +
+            "Plates, codes, serials, phone numbers: CHARACTER BY CHARACTER, never as a quantity " +
+            "('QLB 3469' is spoken 'Q L B, three four six nine'). " +
+            "Read ALL text in reading order — never stop halfway or summarize. " +
+            "Unless reading text aloud, keep to 1-3 short spoken sentences. " +
+            "Blurry text: say 'Text is unclear'. " +
+            "No text: say 'No text visible' — NEVER guess.\n"
 
         // ── Language-matched few-shot examples ────────────────────────
         // For a small on-device model, in-context examples dominate abstract
@@ -809,6 +830,13 @@ Output 1 to 2 spoken sentences with spatial positioning. Your reply is read alou
          * query, "the user's language" re-invoked exactly the query-text
          * reading the mandate fix removes.
          */
+        // NOT dieted (round-2 lesson, GT50 2026-11-14): this block sits
+        // directly under the query — the last words before the generation
+        // boundary, where echo behavior triggers. A compressed variant
+        // ("Respond with the answer only: never restate the task.") caused
+        // a 2-in-6 prompt-echo relapse reciting the language-tag block
+        // (caught by the echo net, fallback spoken). The longer form
+        // stays: ~180 chars buys echo suppression at the boundary.
         private const val TASK_OUTPUT_CONTRACT =
             "Respond with the answer only: never repeat, echo, or quote the question, " +
             "never restate the task, and write every word in the language named in " +

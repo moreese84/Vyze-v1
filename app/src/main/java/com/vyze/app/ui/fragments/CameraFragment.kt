@@ -8,9 +8,11 @@ import com.vyze.app.agent.student.PreGatePolicy
 import com.vyze.app.core.ThermalPolicy
 import com.vyze.app.core.ThermalPowerController
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.vyze.app.R
 import com.vyze.app.util.CrashLogFile
 import com.vyze.app.ui.MainViewModel
@@ -33,7 +35,10 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.os.VibrationEffect
+import android.speech.tts.TextToSpeech
 import android.os.Vibrator
 import android.os.VibratorManager
 import android.util.Log
@@ -449,6 +454,10 @@ class CameraFragment : Fragment() {
     @Volatile private var pinnedVoiceFrameAtMs = 0L
     @Volatile private var pinCaptureInFlight = false
 
+    /** Realtime clock at the last snapshot trigger (fast-lane filler grace). */
+    @Volatile
+    private var triggerStartMs = 0L
+
     // ── Continuous Auto-Snapshot Mode ────────────────────────────
     // When enabled, automatically captures and describes the scene
     // every AUTO_SNAPSHOT_INTERVAL_MS — similar to Gemini Live.
@@ -617,12 +626,13 @@ class CameraFragment : Fragment() {
                                 // return before this branch (stay silent).
                                 // Session-guarded: a barge-in starts a new
                                 // session and the stale chain stays silent.
-                                val postAnswer: () -> Unit = {
+                                val turnSession = coreController.getActiveSessionId()
+                                val postAnswer: () -> Unit = postAnswer@{
+                                    if (coreController.getActiveSessionId() != turnSession) return@postAnswer
                                     appState = AppState.IDLE
                                     Log.d(TAG, "Response spoken — post-answer state")
                                     maybeOpenFollowUpWindow()
                                 }
-                                val turnSession = coreController.getActiveSessionId()
                                 val coverage = coreController.coverageForTurn()
                                 val zhVoice = coverage?.let { coreController.zhVoiceOrNull() }
                                 if (coverage != null && zhVoice != null) {
@@ -640,7 +650,21 @@ class CameraFragment : Fragment() {
                                     if (coverage != null) {
                                         Log.d(TAG, "CJK coverage skipped: no offline zh voice")
                                     }
-                                    mainActivity.speakThenCallback(response) { postAnswer() }
+                                    // Fast-lane grace: when the answer lands
+                                    // within ~2.5 s of the trigger (fast path,
+                                    // barcode, instant detectors), the dead-air
+                                    // filler is still playing — QUEUE behind it
+                                    // instead of flushing (speakThenCallback
+                                    // stops all speech first, which used to
+                                    // clip "Let me look" mid-word on every
+                                    // sub-second answer). Slower answers keep
+                                    // the flush (stale speech may linger).
+                                    val freshTurn = android.os.SystemClock.elapsedRealtime() - triggerStartMs < FILLER_GRACE_MS
+                                    if (freshTurn) {
+                                        speakQueuedThenCallback(response) { postAnswer() }
+                                    } else {
+                                        mainActivity.speakThenCallback(response) { postAnswer() }
+                                    }
                                 }
                             }
                         } else {
@@ -1102,24 +1126,13 @@ class CameraFragment : Fragment() {
     private fun performTalkbackLook() {
         systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
         Log.i(TAG, "TalkBack action: look (single-tap equivalent)")
-        // Same prompt as the physical single-tap; coordinates are the view
-        // center since a screen-reader activation carries no touch position.
+        // Same prompt as the physical single-tap (shared builder, so the
+        // prefill diet applies here too); coordinates are the view center
+        // since a screen-reader activation carries no touch position.
         val container = _fragmentCameraBinding?.cameraContainer
         val x = (container?.width ?: 0) / 2f
         val y = (container?.height ?: 0) / 2f
-        bargeInAndCapture(
-            "User tapped at position (${x.toInt()}, ${y.toInt()}). " +
-            "Describe what is in front of me and around me for navigation, in 1-2 " +
-            "complete, natural spoken sentences with a subject and a verb — the way " +
-            "you would tell a person standing next to me. For each key object include " +
-            "color, size, material, and state. " +
-            "If the tapped object is a packaged product (packet, box, bottle, can), " +
-            "first say its BRAND name and product type exactly as printed " +
-            "(for example: Maggi instant noodle packet), then its details, then continue. " +
-            "If the tapped object has text on it (a label, box, or sign), " +
-            "read it aloud verbatim as whole words and sentences, never spelling letter by letter. " +
-            "Read the ENTIRE text on the object in reading order; do not stop halfway."
-        )
+        bargeInAndCapture(companionTapQuery(x.toInt(), y.toInt()))
     }
 
     private fun performTalkbackVoiceQuery() {
@@ -1190,6 +1203,52 @@ class CameraFragment : Fragment() {
                     "颜色分析失败。"
                 )
             )
+        }
+    }
+
+    /**
+     * Voice color ask ("what color is this"): runs the same center-color
+     * analyzer as triple-tap over a fresh camera frame — ~1 s, no VLM.
+     * Owns the bitmap lifecycle (recycled after analysis); announces and
+     * persists identically to the gesture path, then settles through the
+     * standard SPEAKING → drain → follow-up window flow.
+     */
+    private fun analyzeVoiceColor(bitmap: Bitmap) {
+        systemVibrator?.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        lifecycleScope.launch(Dispatchers.Default) {
+            try {
+                val mainActivity = activity as? MainActivity ?: return@launch
+                val colorName = ColorAnalyzer().analyzeCenterColor(mainActivity, bitmap)
+                withContext(Dispatchers.Main) {
+                    ttsManager.speak(
+                        mainActivity.getString(R.string.color_result, colorName)
+                    )
+                    appState = AppState.SPEAKING
+                    updateStatus("Ready [color]")
+                    waitForTtsDrain {
+                        appState = AppState.IDLE
+                        maybeOpenFollowUpWindow()
+                    }
+                }
+                talkbackScanRepository.saveColorScan(colorName)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.e(TAG, "Voice color analysis failed", e)
+                withContext(Dispatchers.Main) {
+                    ttsManager.speakImmediate(
+                        ttsManager.localized(
+                            "Color analysis failed.",
+                            "Analisis warna gagal.",
+                            "颜色分析失败。"
+                        )
+                    )
+                    appState = AppState.IDLE
+                }
+            } finally {
+                try {
+                    bitmap.recycle()
+                } catch (_: Throwable) {}
+            }
         }
     }
 
@@ -1399,6 +1458,12 @@ class CameraFragment : Fragment() {
             Log.d(TAG, "VLM not ready yet")
             isCapturing.set(false)
             updateStatus("Model still loading...")
+            // Recovery: a tap on a dead engine retriggers init (guarded,
+            // backed off, single-flighted inside the controller) — without
+            // this, a failed cold init is never retried from camera and
+            // taps stay dead forever (mt6768, 2026-11-14). This gate
+            // returns before the controller lanes, so it must ask too.
+            coreController.requestInitRetry()
             // BLIND-FIRST RULE: updateStatus is visual-only, so a silently
             // dropped tap reads as a dead app to a blind user (reported:
             // "engine wakes only after the third tap" with the new brain —
@@ -1409,6 +1474,7 @@ class CameraFragment : Fragment() {
             if (appState == AppState.ANALYZING) appState = AppState.IDLE
             return
         }
+        triggerStartMs = android.os.SystemClock.elapsedRealtime()
 
         if (coreController.isCurrentlyInferring()) {
             Log.d(TAG, "Engine busy — ignoring")
@@ -1554,6 +1620,29 @@ class CameraFragment : Fragment() {
         activity.onNoiseDetected = null
     }
 
+    /**
+     * DEBUG-ONLY voice injection (device verification without a human
+     * speaker): replays a transcript through the installed speech-result
+     * callback — the full noise gate + routing chain runs exactly as for
+     * a recognizer result, minus the recognizer (which is Google's to
+     * test, not ours). Confidence is pinned at 1.0 so confirmation
+     * never intercepts scripted turns. Release builds ignore every call.
+     * Reachable via the debug VoiceQueryReceiver broadcast.
+     */
+    fun debugInjectVoiceResult(query: String, localeTag: String = "en-US") {
+        if (!com.vyze.app.util.CrashLogFile.isDebugBuild()) return
+        val activity = activity as? MainActivity ?: return
+        val locale = try {
+            java.util.Locale.forLanguageTag(localeTag)
+        } catch (_: Throwable) {
+            java.util.Locale.US
+        }
+        activity.runOnUiThread {
+            Log.i(TAG, "DEBUG inject voice result: \"$query\" lang=$localeTag")
+            activity.onSpeechResult?.invoke(query, locale, 1.0f)
+        }
+    }
+
     private fun wireSpeechCallbacks() {
         val activity = requireActivity() as? MainActivity ?: return
 
@@ -1661,8 +1750,14 @@ class CameraFragment : Fragment() {
                                 //    reuse the retained frame, no re-capture.
                                 //    MUST be checked before resetForNewCapture:
                                 //    the reset wipes the prior-answer anchor.
+                                //    1b. Repeat asks ("say again") split out:
+                                //    fresh dialogue replays via TTS with zero
+                                //    inference; otherwise falls back to
+                                //    expansion (or the normal pipeline).
                                 // 2. Instant answers (time/date/battery) —
                                 //    local, no capture, no inference.
+                                //    2b. Detector asks (color/light) — instant
+                                //    local analysis, no VLM (~1 s vs ~45 s).
                                 // 3. VLM PRE-GATE (latency lever #1, ships
                                 //    dark): when enabled, high-confidence
                                 //    IGNORE families (app-cue echo / greeting
@@ -1701,6 +1796,50 @@ class CameraFragment : Fragment() {
                                     consecutiveConfirmationAsks < MAX_CONFIRMATION_ASKS
                                 ) {
                                     askQueryConfirmation(spokenText, detectedLocale)
+                                } else if (coreController.detectRepeatRequest(spokenText)) {
+                                    // Replay always speaks (the last answer,
+                                    // or an honest nothing-to-repeat) — no
+                                    // inference, no capture, no fallthrough.
+                                    Log.d(TAG, "Repeat request: \"$spokenText\" — replaying, no inference")
+                                    consecutiveConfirmationAsks = 0
+                                    coreController.triggerRepeatAnswer()
+                                    appState = AppState.SPEAKING
+                                    updateStatus("Ready [repeat]")
+                                    waitForTtsDrain {
+                                        appState = AppState.IDLE
+                                        maybeOpenFollowUpWindow()
+                                    }
+                                } else if (coreController.detectLightQuery(spokenText)) {
+                                    Log.d(TAG, "Light query: \"$spokenText\" — instant detector, no VLM")
+                                    performLightCheck()
+                                    appState = AppState.SPEAKING
+                                    updateStatus("Ready [light]")
+                                    consecutiveConfirmationAsks = 0
+                                    waitForTtsDrain {
+                                        appState = AppState.IDLE
+                                        maybeOpenFollowUpWindow()
+                                    }
+                                } else if (coreController.detectColorQuery(spokenText)) {
+                                    Log.d(TAG, "Color query: \"$spokenText\" — instant detector, no VLM")
+                                    consecutiveConfirmationAsks = 0
+                                    appState = AppState.ANALYZING
+                                    updateStatus("Checking color...")
+                                    captureFrameForQuery(
+                                        spokenText,
+                                        onBitmap = { bitmap -> analyzeVoiceColor(bitmap) },
+                                        onError = { error ->
+                                            Log.w(TAG, "Voice color capture failed: $error")
+                                            appState = AppState.IDLE
+                                            ttsManager.speakImmediate(
+                                                ttsManager.localized(
+                                                    "Color analysis failed.",
+                                                    "Analisis warna gagal.",
+                                                    "颜色分析失败。"
+                                                )
+                                            )
+                                            maybeOpenFollowUpWindow()
+                                        }
+                                    )
                                 } else if (coreController.isTextOnlyQuery(spokenText)) {
                                     // ── TEXT-ONLY Q&A ────────────────────
                                     // General-knowledge question ("what is
@@ -1943,6 +2082,36 @@ class CameraFragment : Fragment() {
      * The 500ms initial delay gives the TTS engine time to transition
      * from "queued" to "active playback" before we start polling.
      */
+    /**
+     * QUEUE_ADD twin of MainActivity.speakThenCallback: appends behind
+     * in-flight speech instead of stopping it. Used ONLY for fast-lane
+     * completions landing inside [FILLER_GRACE_MS] (sub-second barcode /
+     * fast-path answers while the dead-air filler still plays) — the
+     * flush twin would clip "Let me look" mid-word. Same exactly-once
+     * delivery contract; pre-init speech buffers inside [TTSManager].
+     */
+    private fun speakQueuedThenCallback(text: String, onDone: () -> Unit) {
+        if (text.isBlank()) {
+            onDone()
+            return
+        }
+        var fired = false
+        val deliver: () -> Unit = {
+            if (!fired) {
+                fired = true
+                activity?.runOnUiThread { onDone() }
+            }
+        }
+        val accepted = ttsManager.speak(
+            text,
+            TextToSpeech.QUEUE_ADD,
+            onDone = deliver,
+            onError = deliver
+        )
+        if (!accepted) deliver()
+        Log.d(TAG, "speakQueuedThenCallback: submission ${if (accepted) "OK" else "REJECTED (onDone already delivered)"}")
+    }
+
     private fun waitForTtsDrain(onDone: () -> Unit) {
         // Use deterministic utterance ID tracking instead of isSpeaking() polling.
         // hasPendingSpeech() returns true iff pendingUtteranceIds is non-empty.
@@ -2166,7 +2335,7 @@ class CameraFragment : Fragment() {
         mainActivity.interruptTts()
         mainActivity.resumeAfterNoisePause()
 
-        // Open a fresh conversation session with a spoken cue. Answers to
+        // Open a fresh conversation session with a mic-ready beep. Answers to
         // voice queries reopen the mic automatically (maybeOpenFollowUpWindow)
         // so follow-ups flow hands-free until the user goes quiet. Single taps
         // flip this flag back to false — tap answers stay quiet at IDLE.
@@ -2919,17 +3088,20 @@ class CameraFragment : Fragment() {
                 // noisy-room rescue runs, and disabled during the audition).
                 mainActivity.resetModelAsrBudget()
                 mainActivity.modelAsrRescueAllowed = true
-                // Short spoken cue, then the mic opens right after it ends so
-                // the cue is never captured. Kept to one word on purpose: a
-                // long cue (e.g. the old "...or say voice settings..." hint)
-                // delayed the mic by ~5s, so users who spoke early lost their
-                // query and heard nothing back.
-                mainActivity.speakThenCallback(
-                    ttsManager.localized("Analyzing.", "Menganalisis.", "分析中。")
-                ) {
-                    // Open the mic AFTER the cue finishes so it is never captured.
-                    mainHandler.postDelayed({ startVoiceListening() }, VOICE_SESSION_OPEN_DELAY_MS)
-                }
+                // Mic-ready signal: a short TONE, not a spoken cue. The old
+                // spoken "Analyzing." + 500 ms left a ~1.5-2 s dead zone in
+                // which early speech was physically lost (the mic cannot
+                // buffer pre-start audio) — device rows show clipped first
+                // words ("what color is this" → "color is this") plus "no
+                // speech" errors when users spoke into the void. Worse, the
+                // word read as *working*, not *speak now*. A 150 ms beep
+                // ends fast, can't be mistimed as instruction, and can never
+                // transcribe as a query the way cue speech could; the mic
+                // opens 100 ms after it ends (~400 ms after the tap with
+                // dispatch). Siri convention: vibrate confirms the tap,
+                // beep means talk.
+                playMicReadyTone()
+                mainHandler.postDelayed({ startVoiceListening() }, MIC_OPEN_AFTER_CUE_MS)
                 return
             }
         }
@@ -2939,6 +3111,24 @@ class CameraFragment : Fragment() {
             { startVoiceListening() },
             FOLLOW_UP_OPEN_DELAY_MS
         )
+    }
+
+    /**
+     * Mic-ready beep (Siri convention): a short tone the user speaks
+     * after. Best-effort — if tone playback fails the vibrate already
+     * confirmed the tap and the mic still opens on schedule, so this
+     * must never throw or block.
+     */
+    private fun playMicReadyTone() {
+        try {
+            val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP, MIC_CUE_TONE_MS)
+            mainHandler.postDelayed(
+                { try { tone.release() } catch (_: Throwable) {} },
+                MIC_CUE_TONE_MS + 500L
+            )
+        } catch (_: Throwable) { /* vibrate already confirmed; mic opens anyway */
+        }
     }
 
     /** Close the conversation window and the mic (stays closed at IDLE). */
@@ -3129,6 +3319,24 @@ class CameraFragment : Fragment() {
 
         /** Delay (ms) between the "Listening" cue and opening the mic. */
         private const val VOICE_SESSION_OPEN_DELAY_MS = 500L
+
+        /**
+         * Fast-lane filler grace (ms): completions landing inside it queue
+         * behind the dead-air filler instead of flushing it mid-word
+         * (sub-second barcode/fast-path answers vs ~1 s of filler speech).
+         */
+        private const val FILLER_GRACE_MS = 2500L
+
+        /** Mic-ready beep length (ms). */
+        internal const val MIC_CUE_TONE_MS = 150
+
+        /**
+         * Delay (ms) between tone start and mic open. Exceeds the tone so
+         * the mic opens after the beep ends, not into it — yet keeps the
+         * tap-to-live window near ~400 ms with dispatch. Pinned against
+         * the tone length in CameraFragmentTimingTest.
+         */
+        internal const val MIC_OPEN_AFTER_CUE_MS = 250L
 
         /** Window (ms) for the user to confirm/reject a low-confidence query. */
         private const val CONFIRMATION_WINDOW_MS = 6_000L

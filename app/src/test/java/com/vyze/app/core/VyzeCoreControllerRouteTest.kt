@@ -824,51 +824,170 @@ class VyzeCoreControllerRouteTest {
         assertFalse(VyzeCoreController.companionShouldReadDirectly(null, 0.95f))
     }
 
-    // ── Interim-progress guard (latency round, 2026-11-14) ──
-    // Long CPU prefills speak a "still working" cue past the first-token
-    // grace — but only while the armed turn is still the live inferring
-    // turn with no token yet. Stale timers self-skip, so completion,
-    // cancel and error paths need no explicit disarm.
+    // ── Init-retry guard (low-end dead-end fix, 2026-11-14) ──
+    // A failed cold init left taps dead forever — the LoadingFragment
+    // retry is unreachable once the safety timeout navigates to
+    // camera. User demand now retriggers init, but only when a retry
+    // could help: not while a flight runs, not past the breaker, not
+    // for a missing model file, not on Tier 0, and not inside the
+    // backoff window.
 
     @Test
-    fun `live tokenless inferring turn speaks interim`() {
+    fun `dead engine with budget retries`() {
         assertTrue(
-            VyzeCoreController.companionShouldSpeakInterim(
-                liveSessionId = "s1", armedSessionId = "s1",
-                tokenArrived = false, inferring = true
+            VyzeCoreController.companionShouldRetryInit(
+                engineReady = false, bypassed = false, initializing = false,
+                canRetry = true, modelMissing = false,
+                nowMs = 100_000L, lastRetryMs = 0L, backoffMs = 30_000L
             )
         )
     }
 
     @Test
-    fun `stale moved-on or idle timers stay silent`() {
-        // Session moved on (new turn armed its own timer).
+    fun `no retry when ready initializing wedged or hopeless`() {
+        fun gate(
+            ready: Boolean = false, bypassed: Boolean = false,
+            initializing: Boolean = false, canRetry: Boolean = true,
+            modelMissing: Boolean = false
+        ) = VyzeCoreController.companionShouldRetryInit(
+            engineReady = ready, bypassed = bypassed,
+            initializing = initializing, canRetry = canRetry,
+            modelMissing = modelMissing,
+            nowMs = 100_000L, lastRetryMs = 0L, backoffMs = 30_000L
+        )
+        assertFalse(gate(ready = true))
+        assertFalse(gate(initializing = true))
+        assertFalse(gate(canRetry = false))
+        assertFalse(gate(modelMissing = true))
+        assertFalse(gate(bypassed = true))
+    }
+
+    @Test
+    fun `backoff blocks tap-spam then releases`() {
         assertFalse(
-            VyzeCoreController.companionShouldSpeakInterim(
-                liveSessionId = "s2", armedSessionId = "s1",
-                tokenArrived = false, inferring = true
+            VyzeCoreController.companionShouldRetryInit(
+                engineReady = false, bypassed = false, initializing = false,
+                canRetry = true, modelMissing = false,
+                nowMs = 110_000L, lastRetryMs = 100_000L, backoffMs = 30_000L
             )
         )
-        // First token already flowed — the answer exists.
-        assertFalse(
-            VyzeCoreController.companionShouldSpeakInterim(
-                liveSessionId = "s1", armedSessionId = "s1",
-                tokenArrived = true, inferring = true
+        assertTrue(
+            VyzeCoreController.companionShouldRetryInit(
+                engineReady = false, bypassed = false, initializing = false,
+                canRetry = true, modelMissing = false,
+                nowMs = 130_000L, lastRetryMs = 100_000L, backoffMs = 30_000L
             )
         )
-        // Inference ended (completed, cancelled, errored).
-        assertFalse(
-            VyzeCoreController.companionShouldSpeakInterim(
-                liveSessionId = "s1", armedSessionId = "s1",
-                tokenArrived = false, inferring = false
-            )
+    }
+
+    // ── Voice bypass lanes (2026-11-14) ──
+    // Color/light asks route to the instant detectors, barcode asks speak
+    // the pre-pass value, and unambiguous repeats replay the last answer —
+    // ~1 s instead of ~45 s on weak CPUs. Latin banks ride word
+    // boundaries; the traps below are the reason bare "dark"/"light"
+    // and any "card" keyword were left out.
+
+    @Test
+    fun `color asks match in three languages`() {
+        assertTrue(VyzeCoreController.companionIsColorQuery("what color is this shirt"))
+        assertTrue(VyzeCoreController.companionIsColorQuery("which colour is the box"))
+        assertTrue(VyzeCoreController.companionIsColorQuery("apa warna baju ini"))
+        assertTrue(VyzeCoreController.companionIsColorQuery("warna apa ini"))
+        assertTrue(VyzeCoreController.companionIsColorQuery("这是什么颜色"))
+        assertFalse(VyzeCoreController.companionIsColorQuery("what is this"))
+        assertFalse(VyzeCoreController.companionIsColorQuery("is it dark here"))
+        // Boundary traps: mid-word matches must not fire.
+        assertFalse(VyzeCoreController.companionIsColorQuery("a watercolor painting"))
+        assertFalse(VyzeCoreController.companionIsColorQuery("pewarna makanan ini"))
+    }
+
+    @Test
+    fun `light asks match phrases not bare words`() {
+        assertTrue(VyzeCoreController.companionIsLightQuery("is it dark here"))
+        assertTrue(VyzeCoreController.companionIsLightQuery("is there enough light"))
+        assertTrue(VyzeCoreController.companionIsLightQuery("turn on the light"))
+        assertTrue(VyzeCoreController.companionIsLightQuery("bilik gelap ke"))
+        assertTrue(VyzeCoreController.companionIsLightQuery("cukup terang tak"))
+        assertTrue(VyzeCoreController.companionIsLightQuery("这里光线够亮吗"))
+        assertFalse(VyzeCoreController.companionIsLightQuery("what is this"))
+        // Object questions containing light/color adjectives stay VLM.
+        assertFalse(VyzeCoreController.companionIsLightQuery("is this dark chocolate"))
+        assertFalse(VyzeCoreController.companionIsLightQuery("light blue box"))
+        assertFalse(VyzeCoreController.companionIsLightQuery("where is the lamp"))
+    }
+
+    @Test
+    fun `barcode intent matches without touching bank cards`() {
+        assertTrue(VyzeCoreController.companionIsBarcodeQuery("scan the barcode"))
+        assertTrue(VyzeCoreController.companionIsBarcodeQuery("read this qr code"))
+        assertTrue(VyzeCoreController.companionIsBarcodeQuery("imbas kod bar ini"))
+        assertTrue(VyzeCoreController.companionIsBarcodeQuery("扫一下这个二维码"))
+        assertFalse(VyzeCoreController.companionIsBarcodeQuery("what is this"))
+        // Bank-card lane owns "card" — never route payment cards here.
+        assertFalse(VyzeCoreController.companionIsBarcodeQuery("my bank card"))
+        assertFalse(VyzeCoreController.companionIsBarcodeQuery("cardboard box"))
+    }
+
+    @Test
+    fun `only 1D retail formats speak their value`() {
+        assertTrue(VyzeCoreController.companionIsSpokenBarcodeFormat("EAN_13"))
+        assertTrue(VyzeCoreController.companionIsSpokenBarcodeFormat("UPC_A"))
+        assertTrue(VyzeCoreController.companionIsSpokenBarcodeFormat("CODE_128"))
+        assertFalse(VyzeCoreController.companionIsSpokenBarcodeFormat("QR_CODE"))
+        assertFalse(VyzeCoreController.companionIsSpokenBarcodeFormat("DATA_MATRIX"))
+        assertFalse(VyzeCoreController.companionIsSpokenBarcodeFormat("PDF417"))
+        assertFalse(VyzeCoreController.companionIsSpokenBarcodeFormat("AZTEC"))
+        assertFalse(VyzeCoreController.companionIsSpokenBarcodeFormat("UNKNOWN"))
+    }
+
+    @Test
+    fun `barcode values space out for speech`() {
+        assertEquals(
+            "9 5 5 6 8 5 2 6 8 3 4 6 1",
+            VyzeCoreController.companionSpacedBarcodeValue("9556852683461")
         )
-        // No live session at all.
-        assertFalse(
-            VyzeCoreController.companionShouldSpeakInterim(
-                liveSessionId = "", armedSessionId = "s1",
-                tokenArrived = false, inferring = true
-            )
-        )
+        assertEquals("A B 1 2", VyzeCoreController.companionSpacedBarcodeValue("AB12"))
+        assertEquals("1 2 3 4", VyzeCoreController.companionSpacedBarcodeValue("12-34"))
+        assertEquals("", VyzeCoreController.companionSpacedBarcodeValue("---"))
+    }
+
+    @Test
+    fun `repeat asks split from expansion asks`() {
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("say again"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("say it again"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("repeat please"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("please repeat that"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("tolong ulang"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("sebut lagi"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("再说一遍"))
+        // Expansion stays on re-inference — never replayed.
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("tell me more"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("terangkan lagi"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("详细一点"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("what else is there"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("apa lagi"))
+        // Bare ambiguity + boundary trap stay out.
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("lagi"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("jadual berulang"))
+        assertFalse(VyzeCoreController.companionIsRepeatRequest(null))
+    }
+
+    @Test
+    fun `glued malay particles still match`() {
+        // System-ASR glues particles ("warna apa ini" → "warna
+        // apaini") — the boundary lookahead must tolerate them.
+        assertTrue(VyzeCoreController.companionIsColorQuery("warna apaini"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("tolong ulanglah"))
+        assertTrue(VyzeCoreController.companionIsRepeatRequest("ulangi"))
+        assertTrue(VyzeCoreController.companionIsBarcodeQuery("imbaskan kod ini"))
+        // Lookbehind still guards mid-word stems.
+        assertFalse(VyzeCoreController.companionIsRepeatRequest("jadual berulang"))
+    }
+
+    @Test
+    fun `replay freshness follows the recent-answer horizon`() {
+        assertTrue(VyzeCoreController.companionIsReplayFresh(100_000L, 50_000L))
+        assertFalse(VyzeCoreController.companionIsReplayFresh(100_000L, 0L))
+        assertFalse(VyzeCoreController.companionIsReplayFresh(1_000_000L, 50_000L))
     }
 }

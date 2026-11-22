@@ -13,7 +13,7 @@
     <!-- ── Onboarding ────────────────────────────────────────────────── -->
     <string name="onboarding_welcome">Welcome to Vyze. I am your eyes. Let me teach you how to use me.</string>
     <string name="onboarding_single_tap">Tap once anywhere to see what is around you. I will describe the scene and what is in front of you.</string>
-    <string name="onboarding_double_tap">Double tap anywhere and ask me a question by voice, for example: what is this, or read this label. I will answer out loud.</string>
+    <string name="onboarding_double_tap">Double tap anywhere, wait for the beep, then ask me a question by voice, for example: what is this, or read this label. I will answer out loud.</string>
     <string name="onboarding_long_press">Press and hold to check the light level. I will turn on the flashlight if it is dark.</string>
     <string name="onboarding_swipe">Swipe left or right to switch between camera and gallery modes.</string>
     <string name="onboarding_complete">That is everything. You are ready to go. I am always here to help.</string>

@@ -36,6 +36,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -235,6 +236,8 @@ class VlmEngineManager(
         @Volatile var error: Throwable? = null
         /** Backend this build attempted — set at park time so a late completion can be adopted under its true name. */
         @Volatile var backendName: String = ""
+        /** When this holder was parked (ms) — bounds orphan lifetime (see sweeper). */
+        @Volatile var parkedAtMs: Long = 0L
     }
 
     /**
@@ -784,6 +787,10 @@ class VlmEngineManager(
                     }
 
                     onStepProgress?.invoke(95, "Finalizing...")
+                    // The breaker counts CONSECUTIVE failures (field KDoc):
+                    // a success clears the streak so later retries start
+                    // fresh instead of wedging on ancient history.
+                    initFailureCount = 0
                     CrashLogFile.log(TAG, "=== INIT SUCCESS [$servingBackend, $tier] ===")
                     Log.i(TAG, "${brain.displayName} loaded successfully [backend=$servingBackend, tier=$tier]")
                     if (deferredGpu) {
@@ -1238,7 +1245,7 @@ class VlmEngineManager(
             reclaimMemoryBeforeTensorAllocation(aggressive = tier != DeviceTier.TIER_1)
 
             val timeoutMs = timeoutOverrideMs
-                ?: if (step.backend is Backend.CPU) CPU_ENGINE_CREATE_TIMEOUT_MS
+                ?: if (step.backend is Backend.CPU) companionCpuBuildBudgetMs(tier)
                 else ENGINE_CREATE_TIMEOUT_MS
 
             try {
@@ -1406,7 +1413,9 @@ class VlmEngineManager(
         // Timed out — the native build may STILL complete later (it cannot be
         // interrupted). Park the holder for the next attempt to drain: adopt
         // if it materializes, re-park if it is still running.
+        result.parkedAtMs = System.currentTimeMillis()
         pendingBuild = result
+        startPendingSweeper()
         CrashLogFile.log(TAG, "Engine build timed out after ${timeoutMs / 1000}s — parked for drain")
         return null
     }
@@ -1962,6 +1971,61 @@ class VlmEngineManager(
         pending.engine = null
         pending.error = null
         return null
+    }
+
+    /** Starts the parked-build sweeper once (idempotent; dies with scope). */
+    private val pendingSweeperStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun startPendingSweeper() {
+        if (!pendingSweeperStarted.compareAndSet(false, true)) return
+        scope.launch {
+            try {
+                while (true) {
+                    delay(PENDING_SWEEP_INTERVAL_MS)
+                    sweepExpiredPendingBuild()
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                pendingSweeperStarted.set(false)
+            }
+        }
+    }
+
+    /**
+     * Closes a parked timed-out build nobody adopted inside its TTL —
+     * without this, a failed BACKGROUND build (rotation/GPU-swap) that no
+     * later attempt drains sits resident forever (the mt6768 3.3 GB PSS
+     * case). Runs under tryLock so it never blocks or races a live drain;
+     * a still-building holder is left for the next tick (dropping it
+     * would orphan the uninterruptible native thread instead).
+     */
+    private suspend fun sweepExpiredPendingBuild() {
+        if (!engineInitMutex.tryLock()) return
+        try {
+            val pending = pendingBuild ?: return
+            if (pending.engine == null && pending.error == null) return
+            if (!companionPendingBuildExpired(
+                    pending.parkedAtMs,
+                    System.currentTimeMillis(),
+                    PENDING_BUILD_TTL_MS
+                )
+            ) return
+            pendingBuild = null
+            pending.engine?.let { orphan ->
+                CrashLogFile.log(
+                    TAG,
+                    "Sweeper: closed expired parked ${pending.backendName} build (no attempt adopted it)"
+                )
+                try {
+                    orphan.close()
+                } catch (_: Throwable) {}
+            }
+            pending.engine = null
+            pending.error = null
+        } finally {
+            engineInitMutex.unlock()
+        }
     }
 
     /**
@@ -2903,6 +2967,17 @@ class VlmEngineManager(
     fun isReady(): Boolean = isInitialized && engine != null
     fun getActiveBackend(): String = activeBackend
 
+    /** True while an initialize() flight is running (started, not yet settled). */
+    fun isInitializing(): Boolean = initSingleFlight.hasActiveFlight()
+
+    /**
+     * True when a fresh initialize() attempt is still allowed — the
+     * circuit breaker ([initFailureCount] vs [MAX_INIT_FAILURES]) has not
+     * opened. Lets the controller retry a dead engine from user demand
+     * instead of leaving taps dead forever (mt6768, 2026-11-14).
+     */
+    fun canRetryInit(): Boolean = initFailureCount < MAX_INIT_FAILURES
+
     /** True when VLM generation is usable — always false on Tier 0 devices. */
     fun isVlmAvailable(): Boolean = isReady()
 
@@ -3190,8 +3265,26 @@ class VlmEngineManager(
      * runs here — structurally isolated from the inference lane so a native
      * build can never interleave with a live generation on the same thread,
      * and never competes with inference for a pooled worker.
+     *
+     * BACKGROUND priority (mt6768, 2026-11-14): a 3-minute rotation build
+     * at normal priority stole the same weak cores as the next query and
+     * inflated its prefill ~+11 s. Background builds now yield to
+     * inference under contention (they just take longer — nothing waits
+     * on them); foreground cold init is unaffected (nothing competes
+     * with it). Shut down in [close].
      */
-    private val engineInitDispatcher = Dispatchers.IO.limitedParallelism(1)
+    private val engineInitExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { target ->
+        object : Thread(target, "vyze-engine-init") {
+            override fun run() {
+                try {
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                } catch (_: Throwable) { /* best effort — default priority still correct */
+                }
+                super.run()
+            }
+        }
+    }
+    private val engineInitDispatcher = engineInitExecutor.asCoroutineDispatcher()
 
     /**
      * Run [block] on the single-thread inference lane. Used by
@@ -3254,6 +3347,14 @@ class VlmEngineManager(
             scope.cancel()
         } catch (e: Throwable) {
             Log.w(TAG, "Error cancelling engine scope: ${e.message}")
+        }
+        // Stop the init lane: no new native builds may start after
+        // teardown (an in-flight build is uninterruptible; its holder is
+        // swept with the parked builds below).
+        try {
+            engineInitExecutor.shutdownNow()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Error shutting down init executor: ${e.message}")
         }
         try {
             engine?.close()
@@ -3800,6 +3901,28 @@ class VlmEngineManager(
             }
         }
 
+        /**
+         * CPU engine-build budget for a tier (companion: JVM-testable).
+         * Tier 1 keeps 60 s; Tier 2/3 get 180 s — a cold low-end build
+         * provably completes inside (120 s, 157 s] (mt6768, 2026-11-14)
+         * and must not fail a healthy-but-slow device. Pinned by
+         * [CpuBuildBudgetTest].
+         */
+        internal fun companionCpuBuildBudgetMs(tier: DeviceTier): Long =
+            if (tier == DeviceTier.TIER_1) CPU_ENGINE_CREATE_TIMEOUT_TIER1_MS
+            else CPU_ENGINE_CREATE_TIMEOUT_LOWTIER_MS
+
+        /**
+         * Parked-build expiry (companion: JVM-testable): true once the
+         * holder has sat past its adoption window. A zero park stamp
+         * (never parked) never expires. Pinned by [PendingBuildExpiryTest].
+         */
+        internal fun companionPendingBuildExpired(
+            parkedAtMs: Long,
+            nowMs: Long,
+            ttlMs: Long
+        ): Boolean = parkedAtMs > 0L && (nowMs - parkedAtMs) >= ttlMs
+
         /** Engine context window (EngineConfig.maxNumTokens) per tier. */
         private const val CONTEXT_TOKENS_TIER1 = 4096
         private const val CONTEXT_TOKENS_TIER2 = 3072
@@ -3864,10 +3987,31 @@ class VlmEngineManager(
 
         /** Hard budget for ONE GPU Engine build + initialize() (2.59 GB model mmap needs time). */
         private const val ENGINE_CREATE_TIMEOUT_MS = 90_000L
-        /** CPU-backend builds get a shorter budget (no GPU driver stall is possible). */
-        private const val CPU_ENGINE_CREATE_TIMEOUT_MS = 60_000L
+        /** CPU-backend build budget on Tier 1 (fast SoC — a cold build lands in ~seconds). */
+        private const val CPU_ENGINE_CREATE_TIMEOUT_TIER1_MS = 60_000L
+        /**
+         * CPU-backend build budget on Tier 2/3. Device evidence (2026-11-14,
+         * mt6768): a cold 1.6 GB mmap + KV-tensor alloc exceeds 60 s, so a
+         * short budget fails cold low-end inits; the follow-up run then
+         * measured the true cold completion inside (120 s, 157 s] (parked
+         * at 120 s, adopted healthy 37 s later). 180 s covers it with
+         * headroom; anything still running past that is adopted late by
+         * the next attempt rather than discarded.
+         */
+        private const val CPU_ENGINE_CREATE_TIMEOUT_LOWTIER_MS = 180_000L
         /** Max wait for a timed-out engine build to materialize before it is closed. */
         private const val PENDING_BUILD_DRAIN_MS = 60_000L
+        /**
+         * Adoption window for a parked timed-out build. A retry that drains
+         * inside the window adopts a healthy late completion; past it, the
+         * periodic sweeper closes the orphan (device evidence 2026-11-14,
+         * mt6768: a failed background rotation build was never drained and
+         * sat resident — app PSS 3.3 GB with 812 MB swapped). 180 s covers
+         * tap-driven retries with margin.
+         */
+        private const val PENDING_BUILD_TTL_MS = 180_000L
+        /** Parked-build sweeper cadence (one volatile read per tick when idle). */
+        private const val PENDING_SWEEP_INTERVAL_MS = 60_000L
 
         /** One-time first-image-inference grace (vision-kernel compile on Mali GPUs). */
         private const val FIRST_IMAGE_INFERENCE_BUDGET_MS = 90_000L
