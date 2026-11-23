@@ -39,8 +39,9 @@
         <!--
             VLM pre-gate toggle (debug only): flips the in-process pre-gate
             flag so IGNORE-family traffic can be verified as VLM-skipping on
-            device via logcat ("VLM pre-gate:" lines). Process-local — every
-            app restart restores default-dark.
+            device via logcat ("VLM pre-gate:" lines). The flag ships lit
+            (2026-11-14 promotion) — this toggle is the kill switch for
+            testing the dark path. Sticky within debug builds.
         -->
         <receiver
             android:name="com.vyze.app.debug.PreGateToggleReceiver"
@@ -50,7 +51,7 @@
             Sticky pre-gate restore (debug only): runs at process start,
             before Application.onCreate, and restores the last toggled
             pre-gate state so the OEM memory manager killing the app between
-            test cycles doesn't re-darken the flag. Stub provider — no
+            test cycles doesn't reset the flag. Stub provider — no
             tables, no queries. Does not exist in release builds.
         -->
         <provider

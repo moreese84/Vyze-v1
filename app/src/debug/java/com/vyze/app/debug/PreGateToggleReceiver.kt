@@ -13,11 +13,10 @@ import com.vyze.app.agent.VyzeAgentRuntime
  * lever #1) can be exercised on a real device: with the flag on,
  * high-confidence IGNORE families (app-cue echo / greeting garble /
  * filler-only) skip capture + Gemma entirely and log
- * "VLM pre-gate: ... (VLM skipped)". The flag ships dark; the promotion
- * flow that flips it permanently is a deliberate manual act — this
- * receiver only affects the CURRENT process, so the default-dark contract
- * is restored on every restart. The runtime never enables itself; neither
- * does this receiver persist anything.
+ * "VLM pre-gate: ... (VLM skipped)". The flag ships LIT (promoted
+ * 2026-11-14) — this receiver is the kill switch for testing the dark
+ * path, and the permanent flip back would be the same kind of deliberate
+ * manual act as the promotion. The runtime never flips the flag itself.
  *
  * adb trigger (debug build, from a development machine):
  *
@@ -27,8 +26,8 @@ import com.vyze.app.agent.VyzeAgentRuntime
  * (Omitting --ez toggles: on → off → on. The state is STICKY within
  * debug builds — [PreGateStickyProvider] persists it and restores it at
  * process start, so the OEM memory manager killing the app between test
- * cycles no longer re-darkens the flag mid-testing. Release builds have
- * no such components and always start dark.)
+ * cycles no longer resets the flag mid-testing. Release builds have no
+ * such components and always start at the code default.)
  *
  * Exported=true is intentional and safe: the component exists ONLY in
  * debug builds and its sole effect is flipping an in-memory boolean that

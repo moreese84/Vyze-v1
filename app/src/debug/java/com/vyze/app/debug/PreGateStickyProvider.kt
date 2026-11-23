@@ -12,10 +12,11 @@ import android.net.Uri
  *
  * WHY: the test device's OEM memory manager (TRANSSION reclaim) kills the
  * app between test cycles, and every new process starts with the in-memory
- * pre-gate flag DARK (the ships-dark contract). That forced re-toggling
- * via adb before every single test — three test cycles were blocked by it
- * on 2026-09-22. This provider restores the last toggled state at process
- * start, so the flag survives kills/restarts DURING DEBUG TESTING.
+ * pre-gate flag at its code default. Before promotion that forced
+ * re-toggling via adb before every single test — three test cycles were
+ * blocked by it on 2026-09-22. This provider restores the last toggled
+ * state at process start, so the flag survives kills/restarts DURING
+ * DEBUG TESTING, including deliberate kill-switch toggles.
  *
  * WHY A PROVIDER: ContentProviders are instantiated by the framework
  * BEFORE Application.onCreate — the only component that runs at cold
@@ -24,8 +25,8 @@ import android.net.Uri
  *
  * SAFETY / CONTRACT:
  *  - DEBUG ONLY: this class does not exist in release builds, so the
- *    release app always starts with the flag dark — the promotion flow
- *    (a deliberate manual code change) is untouched.
+ *    release app always starts at the code default (lit since the
+ *    2026-11-14 promotion; the kill switch is a one-line default flip).
  *  - Storage is a two-line SharedPreferences file local to the app;
  *    nothing leaves the device.
  *  - onCreate is a synchronous SharedPreferences read + boolean assign
@@ -36,10 +37,14 @@ class PreGateStickyProvider : ContentProvider() {
     override fun onCreate(): Boolean {
         val appContext = context?.applicationContext ?: return true
         try {
-            val saved = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getBoolean(KEY_PRE_GATE, false)
+            val prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            val saved = prefs.getBoolean(KEY_PRE_GATE, true)
             com.vyze.app.agent.VyzeAgentRuntime.preGateEnabled = saved
-            if (saved) {
+            // Log RESTORED only for a genuine persisted value — a missing
+            // key means the lit code default applied, not a restore
+            // (live-caught 2026-11-23: the line fired on a prefs-wiped
+            // restart and misled the verification read).
+            if (saved && prefs.contains(KEY_PRE_GATE)) {
                 android.util.Log.i(TAG, "Sticky pre-gate flag RESTORED at process start (debug)")
             }
         } catch (t: Throwable) {

@@ -35,19 +35,18 @@ object VyzeAgentRuntime {
     var shadowEnabled: Boolean = false
 
     /**
-     * VLM pre-gate flag ([PreGatePolicy]). Ships FALSE — when dark, every
-     * transcript takes the exact legacy dispatch (zero behavior change).
-     * Like [shadowEnabled], the runtime never enables itself. Default-dark
-     * on every app start holds for RELEASE by construction (no toggle
-     * component exists); DEBUG builds additionally persist the last
-     * toggled state (PreGateStickyProvider) so the OEM memory manager
-     * killing the app between test cycles doesn't re-darken it mid-test.
-     * When enabled, only the three high-confidence IGNORE families
-     * (app-cue echo / greeting garble / filler-only) bypass the VLM; all
-     * positive intents and the catch-all pass through untouched.
+     * VLM pre-gate flag ([PreGatePolicy]). PROMOTED 2026-11-14: ships TRUE
+     * — junk transcripts (app-cue echo / greeting garble / filler-only)
+     * skip the VLM instead of burning a full inference each. Only the
+     * three high-confidence IGNORE families bypass; all positive intents
+     * and the catch-all pass through untouched. Kill switch: flip this
+     * default (deliberate manual code change, same as promotion).
+     * DEBUG builds persist the last toggled state (PreGateStickyProvider)
+     * so the OEM memory manager killing the app between test cycles
+     * doesn't reset it mid-test.
      */
     @Volatile
-    var preGateEnabled: Boolean = false
+    var preGateEnabled: Boolean = true
 
     /**
      * DESIGN A "Gemma always" flag ([com.vyze.app.speech.VoiceEnginePolicy]).
@@ -341,13 +340,17 @@ object VyzeAgentRuntime {
         AdkAgentManager.resetForTests()
     }
 
-    /** Full release of the lane state — test isolation only. */
+    /**
+     * Full release of the lane state — test isolation only. Restores the
+     * SHIPPED defaults (pre-gate ships lit since 2026-11-14) so no state
+     * leaks across tests.
+     */
     @Synchronized
     fun releaseForTests() {
         AdkAgentManager.resetForTests()
         evalRecorder.clear()
         shadowEnabled = false
-        preGateEnabled = false
+        preGateEnabled = true
         gemmaAlwaysEnabled = false
     }
 }

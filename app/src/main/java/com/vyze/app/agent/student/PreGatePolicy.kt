@@ -34,10 +34,10 @@ import com.vyze.app.agent.RouterDecision
  *    device gate). VLM_VOICE_QUERY and positive intents always pass
  *    through (PASS_THROUGH) — the pre-gate NEVER touches traffic that
  *    needs the camera or the model.
- *  - SHIPS DARK: gated behind [VyzeAgentRuntime.preGateEnabled] (default
- *    false). The runtime never enables itself; toggling is debug-only and
- *    process-local, restoring default-dark on every restart. This policy
- *    class itself is unconditionally safe to construct anywhere.
+ *  - SHIPPED LIT 2026-11-14: gated behind
+ *    [VyzeAgentRuntime.preGateEnabled] (default true). Kill switch is a
+ *    one-line default flip. This policy class itself is unconditionally
+ *    safe to construct anywhere.
  */
 object PreGatePolicy {
 

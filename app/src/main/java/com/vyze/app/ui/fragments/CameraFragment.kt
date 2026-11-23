@@ -202,7 +202,7 @@ class CameraFragment : Fragment() {
 
     /**
      * VLM PRE-GATE (latency lever #1) — flag-gated by
-     * [VyzeAgentRuntime.preGateEnabled], ships dark.
+     * [VyzeAgentRuntime.preGateEnabled], shipped lit 2026-11-14.
      *
      * Returns true ONLY when the transcript is in a high-confidence IGNORE
      * family the student classifies (app-cue echo / greeting garble /
@@ -1758,10 +1758,10 @@ class CameraFragment : Fragment() {
                                 //    local, no capture, no inference.
                                 //    2b. Detector asks (color/light) — instant
                                 //    local analysis, no VLM (~1 s vs ~45 s).
-                                // 3. VLM PRE-GATE (latency lever #1, ships
-                                //    dark): when enabled, high-confidence
-                                //    IGNORE families (app-cue echo / greeting
-                                //    garble / filler-only) skip the VLM — see
+                                // 3. VLM PRE-GATE (latency lever #1, shipped
+                                //    lit 2026-11-14): high-confidence IGNORE
+                                //    families (app-cue echo / greeting garble /
+                                //    filler-only) skip the VLM — see
                                 //    PreGatePolicy. Deliberately INSIDE this
                                 //    branch: the settings/noise-gate/
                                 //    confirmation handling above must never be
